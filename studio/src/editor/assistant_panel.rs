@@ -38,9 +38,9 @@ impl Editor {
         if !self.agent.available() {
             return widgets::empty_state(
                 code::BOT,
-                "Connect Claude Code",
-                "The assistant uses your own Claude Code — no API key needed. Install it from claude.com/claude-code, sign in once, then check again.",
-                Some(widgets::secondary_button(Some(code::REFRESH_CW), "Check again", Some(Message::ChatRecheck)).into()),
+                "Connect an AI",
+                "Choose the AI that edits with you. It works through the same tools you use, and everything it does can be undone.",
+                Some(widgets::primary_button(Some(code::LINK), "Connect AI", Some(Message::OpenAiConnect)).into()),
             );
         }
         let transcript: Element<'_, Message> = if self.chat.is_empty() {

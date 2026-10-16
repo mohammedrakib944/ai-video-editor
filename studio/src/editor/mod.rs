@@ -141,7 +141,8 @@ pub enum Message {
     ChatStop,
     ChatNew,
     ChatPoll,
-    ChatRecheck,
+    /// Ask the app to open the Connect AI dialog.
+    OpenAiConnect,
     ToolImported(crate::mcp::Call, Vec<(PathBuf, Result<ProbeInfo, String>)>, bool),
     ToolSound(crate::mcp::Call, &'static str, Result<(PathBuf, ProbeInfo), String>),
     Track(Id, TrackAction),
@@ -259,6 +260,15 @@ impl Editor {
             agent: crate::assistant::Agent::default(),
             chat: Vec::new(),
             chat_input: String::new(),
+        }
+    }
+
+    /// Turns the assistant on or off when the user connects or disconnects an AI.
+    pub fn set_ai(&mut self, provider: Option<crate::settings::AiProvider>) {
+        self.agent.enabled = provider.is_some();
+        self.agent.recheck();
+        if provider.is_none() {
+            self.agent.reset();
         }
     }
 
@@ -795,7 +805,7 @@ impl Editor {
                 self.agent.reset();
                 self.chat.clear();
             }
-            Message::ChatRecheck => self.agent.recheck(),
+            Message::OpenAiConnect => {}
             Message::ChatPoll => {
                 use assistant_panel::{ChatItem, ToolState};
                 let events = self.agent.poll();
@@ -1234,7 +1244,6 @@ impl Editor {
         .spacing(6)
         .align_y(Alignment::Center);
         let tools = row![
-            text(self.doc.project.canvas.summary()).size(T_CAPTION).color(TEXT_4),
             widgets::tip(widgets::icon_toggle(if self.muted { code::VOLUME_X } else { code::VOLUME_2 }, self.muted, Message::ToggleMute), if self.muted { "Unmute preview" } else { "Mute preview" }, Some("M"), tip_pos()),
         ]
         .spacing(8)

@@ -45,6 +45,9 @@ pub enum Message {
     Mcp(crate::mcp::Call),
     /// Debug builds: `STUDIO_SNAPSHOT=out.png` saves a picture of the window (only this app's pixels).
     Snapshot(window::Screenshot),
+    Ai(crate::ai_connect::Message),
+    OpenAi,
+    AiChecked(crate::settings::AiProvider, Result<String, String>),
 }
 
 pub struct App {
@@ -53,6 +56,9 @@ pub struct App {
     maximized: bool,
     app_menu: bool,
     format_menu: bool,
+    ai_dialog: bool,
+    ai_checking: bool,
+    ai_detail: Option<Result<String, String>>,
     error: Option<String>,
 }
 
@@ -62,7 +68,7 @@ impl App {
             eprintln!("assistant server: {e}");
         }
         let error = (!crate::ffmpeg::is_available()).then(|| format!("FFmpeg was not found, so media can't be imported or previewed. {}", crate::ffmpeg::missing_hint()));
-        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, error };
+        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, ai_dialog: false, ai_checking: false, ai_detail: None, error };
         let path = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file());
         let task = match path {
             Some(p) => Task::done(Message::OpenPicked(Some(p))),
@@ -109,6 +115,35 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            Message::Editor(editor::Message::OpenAiConnect) | Message::OpenAi => self.ai_dialog = true,
+            Message::Ai(msg) => match msg {
+                crate::ai_connect::Message::Close => self.ai_dialog = false,
+                crate::ai_connect::Message::Connect(provider) => {
+                    self.ai_checking = true;
+                    self.ai_detail = None;
+                    return Task::perform(async move { tokio::task::spawn_blocking(crate::assistant::claude_version).await.unwrap_or_else(|e| Err(e.to_string())) }, move |r| Message::AiChecked(provider, r));
+                }
+                crate::ai_connect::Message::Disconnect => {
+                    self.settings.ai = None;
+                    self.settings.save();
+                    self.ai_detail = None;
+                    if let Screen::Editor(e) = &mut self.screen {
+                        e.set_ai(None);
+                    }
+                }
+                crate::ai_connect::Message::CopyUrl => return iced::clipboard::write(crate::mcp::url()),
+            },
+            Message::AiChecked(provider, result) => {
+                self.ai_checking = false;
+                if result.is_ok() {
+                    self.settings.ai = Some(provider);
+                    self.settings.save();
+                    if let Screen::Editor(e) = &mut self.screen {
+                        e.set_ai(Some(provider));
+                    }
+                }
+                self.ai_detail = Some(result);
             }
             Message::Editor(msg) => {
                 if let Screen::Editor(e) = &mut self.screen {
@@ -246,6 +281,7 @@ impl App {
 
     fn show_editor(&mut self, project: Project, path: Option<PathBuf>) -> Task<Message> {
         let mut editor = Editor::new(project, path, self.settings.layout);
+        editor.set_ai(self.settings.ai);
         let task = editor.boot().map(Message::Editor);
         self.screen = Screen::Editor(Box::new(editor));
         task
@@ -293,7 +329,7 @@ impl App {
             Screen::Start(_) => (
                 row![chrome::logo(), text("AI Video Editor").font(INTER_SEMIBOLD).size(T_BODY)].spacing(S2 + 2.0).align_y(Alignment::Center).into(),
                 space().into(),
-                space().into(),
+                crate::ai_connect::chip(self.settings.ai, Message::OpenAi),
             ),
             Screen::Editor(e) => self.editor_title(e),
         };
@@ -322,6 +358,16 @@ impl App {
                 ]
                 .into();
             }
+        }
+        if self.ai_dialog {
+            let dialog = crate::ai_connect::view(crate::ai_connect::State {
+                connected: self.settings.ai,
+                checking: self.ai_checking,
+                detail: self.ai_detail.as_ref(),
+                mcp_url: crate::mcp::url(),
+            })
+            .map(Message::Ai);
+            window_content = iced::widget::stack![window_content, dialog].into();
         }
         chrome::frame(window_content, self.maximized, Message::Window)
     }
@@ -397,6 +443,8 @@ impl App {
             widgets::tip(widgets::icon_button(code::UNDO_2, e.doc.can_undo().then_some(Message::Editor(editor::Message::Undo))), e.doc.undo_label().unwrap_or("Undo"), Some("Ctrl+Z"), pos),
             widgets::tip(widgets::icon_button(code::REDO_2, e.doc.can_redo().then_some(Message::Editor(editor::Message::Redo))), e.doc.redo_label().unwrap_or("Redo"), Some("Ctrl+Shift+Z"), pos),
             container(widgets::vdivider(18.0)).padding([0, 6]),
+            widgets::tip(crate::ai_connect::chip(self.settings.ai, Message::OpenAi), "AI connection", None, pos),
+            space().width(4),
             widgets::tip(widgets::icon_toggle(code::SPARKLES, e.side_tab == SideTab::Assistant, Message::ToggleAssistant), "Assistant", Some("Ctrl+K"), pos),
             space().width(6),
             widgets::tip(widgets::primary_button(Some(code::DOWNLOAD), "Export", Some(Message::Editor(editor::Message::OpenExport))), "Export video", Some("Ctrl+E"), pos),
@@ -417,7 +465,9 @@ fn snapshot_task() -> Task<Message> {
     let scroll: f32 = std::env::var("STUDIO_SNAPSHOT_SCROLL").ok().and_then(|d| d.parse().ok()).unwrap_or(0.0);
     let scroll_first = Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay)), move |_| Message::Editor(editor::Message::ScrollTracks(scroll)));
     let shot = Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay + 0.5)), |_| ()).then(|_| window::latest()).and_then(window::screenshot).map(Message::Snapshot);
-    Task::batch([scroll_first, shot])
+    // `STUDIO_SNAPSHOT_OPEN=ai` opens the Connect AI dialog first.
+    let open = if std::env::var("STUDIO_SNAPSHOT_OPEN").as_deref() == Ok("ai") { Task::done(Message::OpenAi) } else { Task::none() };
+    Task::batch([open, scroll_first, shot])
 }
 
 fn window_task(action: WindowAction) -> Task<Message> {

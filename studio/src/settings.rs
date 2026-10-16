@@ -27,12 +27,28 @@ impl Default for Layout {
     }
 }
 
+/// The AI service the assistant uses. Nothing is used until the user connects one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AiProvider {
+    ClaudeCode,
+}
+
+impl AiProvider {
+    pub fn name(self) -> &'static str {
+        match self {
+            AiProvider::ClaudeCode => "Claude Code",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub recent: Vec<RecentProject>,
     #[serde(default)]
     pub layout: Layout,
+    #[serde(default)]
+    pub ai: Option<AiProvider>,
 }
 
 const MAX_RECENT: usize = 12;

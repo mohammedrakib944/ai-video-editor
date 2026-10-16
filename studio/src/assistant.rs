@@ -98,6 +98,29 @@ pub fn describe_tool(name: &str, input: &Value) -> String {
     }
 }
 
+/// Checks that Claude Code runs, without using any tokens. Returns its version line.
+pub fn claude_version() -> Result<String, String> {
+    let claude = find_claude().ok_or("Claude Code isn't installed. Install it from claude.com/claude-code and sign in once.")?;
+    let mut cmd = if claude.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd")) {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg(&claude);
+        c
+    } else {
+        std::process::Command::new(&claude)
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd.arg("--version").output().map_err(|e| format!("Couldn't run Claude Code: {e}"))?;
+    let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || version.is_empty() {
+        return Err("Claude Code didn't respond. Open a terminal, run `claude` once to sign in, then try again.".into());
+    }
+    Ok(version.split_whitespace().next().unwrap_or(&version).to_string())
+}
+
 struct Running {
     child: Child,
     stdin: ChildStdin,
@@ -109,6 +132,8 @@ pub struct Agent {
     session: Arc<Mutex<Option<String>>>,
     events: Arc<Mutex<Vec<Event>>>,
     pub busy: bool,
+    /// The user connected an AI service in settings.
+    pub enabled: bool,
 }
 
 impl Drop for Agent {
@@ -121,13 +146,14 @@ impl Drop for Agent {
 
 impl Default for Agent {
     fn default() -> Self {
-        Agent { claude: find_claude(), running: None, session: Arc::default(), events: Arc::default(), busy: false }
+        Agent { claude: find_claude(), running: None, session: Arc::default(), events: Arc::default(), busy: false, enabled: false }
     }
 }
 
 impl Agent {
+    /// Connected by the user and installed.
     pub fn available(&self) -> bool {
-        self.claude.is_some()
+        self.enabled && self.claude.is_some()
     }
 
     pub fn recheck(&mut self) {
