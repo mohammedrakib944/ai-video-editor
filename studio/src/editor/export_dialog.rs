@@ -64,7 +64,7 @@ impl ExportDialog {
         let valid = !self.path.trim().is_empty() && PathBuf::from(self.path.trim()).parent().is_some_and(|d| d.as_os_str().is_empty() || d.is_dir());
         column![
             row![
-                container(icon(code::DOWNLOAD, 16).color(iced::Color::WHITE)).center(34).style(style::logo),
+                container(icon(code::DOWNLOAD, 16).color(ON_ACCENT)).center(34).style(style::logo),
                 column![text("Export video").font(INTER_SEMIBOLD).size(T_TITLE), text("MP4 · H.264 video with AAC audio").size(T_SMALL).color(TEXT_3)].spacing(2),
             ]
             .spacing(S3)

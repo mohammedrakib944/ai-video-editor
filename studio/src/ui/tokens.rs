@@ -11,35 +11,39 @@ const fn alpha(c: Color, a: f32) -> Color {
     Color { a, ..c }
 }
 
-// Surfaces, darkest to lightest.
-pub const WINDOW: Color = hex(0x09090C);
-pub const SURFACE_0: Color = hex(0x0E0F13);
-pub const SURFACE_1: Color = hex(0x131419);
-pub const SURFACE_2: Color = hex(0x191A20);
-pub const SURFACE_3: Color = hex(0x202229);
-pub const SURFACE_4: Color = hex(0x292C35);
+// Surfaces, darkest to lightest. `WINDOW` is the workspace (and the hairlines
+// between panels); `SURFACE_1` is every panel.
+pub const WINDOW: Color = hex(0x050605);
+pub const SURFACE_0: Color = hex(0x0B0C09);
+pub const SURFACE_1: Color = hex(0x171914);
+pub const SURFACE_2: Color = hex(0x1F221B);
+pub const SURFACE_3: Color = hex(0x282C23);
+pub const SURFACE_4: Color = hex(0x33382D);
 
 // Hairlines are translucent so they read the same on every surface.
-pub const LINE: Color = alpha(Color::WHITE, 0.06);
+pub const LINE: Color = alpha(Color::WHITE, 0.055);
 pub const LINE_STRONG: Color = alpha(Color::WHITE, 0.10);
-pub const LINE_FOCUS: Color = alpha(ACCENT, 0.9);
+pub const LINE_FOCUS: Color = alpha(ACCENT, 0.85);
 
-pub const TEXT_1: Color = hex(0xEDEEF2);
-pub const TEXT_2: Color = hex(0xA4AAB6);
-pub const TEXT_3: Color = hex(0x6E7482);
-pub const TEXT_4: Color = hex(0x4A4F5B);
+pub const TEXT_1: Color = hex(0xF3F5EF);
+pub const TEXT_2: Color = hex(0xA9AE9F);
+pub const TEXT_3: Color = hex(0x74796B);
+pub const TEXT_4: Color = hex(0x4E5247);
 
-pub const ACCENT: Color = hex(0x7C6DFF);
-pub const ACCENT_HOVER: Color = hex(0x8F83FF);
-pub const ACCENT_PRESS: Color = hex(0x6A5BF2);
-pub const ACCENT_SOFT: Color = alpha(ACCENT, 0.16);
-pub const ACCENT_GLOW: Color = alpha(ACCENT, 0.38);
-/// Second stop of the brand gradient.
-pub const BRAND_2: Color = hex(0xC56BFF);
+/// Lime: primary buttons, selection, active tools.
+pub const ACCENT: Color = hex(0xD6FF00);
+pub const ACCENT_HOVER: Color = hex(0xE3FF4F);
+pub const ACCENT_PRESS: Color = hex(0xB9DC00);
+pub const ACCENT_SOFT: Color = alpha(ACCENT, 0.13);
+pub const ACCENT_GLOW: Color = alpha(ACCENT, 0.28);
+/// Text and icons on lime.
+pub const ON_ACCENT: Color = hex(0x0A0B07);
+/// Second stop of the brand gradient (lime → mint).
+pub const BRAND_2: Color = hex(0x2EF2A2);
 
-pub const SUCCESS: Color = hex(0x34D399);
-pub const WARNING: Color = hex(0xFBBF24);
-pub const DANGER: Color = hex(0xF26B6B);
+pub const SUCCESS: Color = hex(0x3DDC97);
+pub const WARNING: Color = hex(0xFFB547);
+pub const DANGER: Color = hex(0xFF6363);
 pub const DANGER_SOFT: Color = alpha(DANGER, 0.14);
 
 pub const SHADOW: Color = alpha(Color::BLACK, 0.55);

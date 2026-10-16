@@ -25,6 +25,9 @@ pub struct Overlay<'a> {
     pub selection: &'a [Id],
     /// The zoom being edited, if any: (clip, zoom).
     pub zoom_edit: Option<(Id, Zoom)>,
+    /// Where the canvas sits inside the overlay, and its on-screen size.
+    pub origin: Vector,
+    pub display: Size,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -45,14 +48,15 @@ pub struct State {
 /// Canvas pixels per overlay pixel, and the conversions both ways.
 struct Map {
     k: f32,
+    origin: Vector,
 }
 
 impl Map {
     fn to_canvas(&self, p: Point) -> Point {
-        Point::new(p.x * self.k, p.y * self.k)
+        Point::new((p.x - self.origin.x) * self.k, (p.y - self.origin.y) * self.k)
     }
     fn to_screen(&self, p: Point) -> Point {
-        Point::new(p.x / self.k, p.y / self.k)
+        Point::new(p.x / self.k + self.origin.x, p.y / self.k + self.origin.y)
     }
 }
 
@@ -98,8 +102,8 @@ impl Overlay<'_> {
         }
     }
 
-    fn map(&self, bounds: Rectangle) -> Map {
-        Map { k: self.scene.width as f32 / bounds.width.max(1.0) }
+    fn map(&self, _bounds: Rectangle) -> Map {
+        Map { k: self.scene.width as f32 / self.display.width.max(1.0), origin: self.origin }
     }
 
     fn knob(&self, l: &LayerSpec, map: &Map) -> Point {
@@ -230,13 +234,14 @@ impl canvas::Program<Message> for Overlay<'_> {
             if let Some(l) = self.layer(clip) {
                 let r = zoom_rect(l, &z);
                 let (a, b) = (s(r.position()), s(Point::new(r.x + r.width, r.y + r.height)));
-                // Dim everything outside the focus area.
+                // Dim the canvas outside the focus area.
                 let dim = Color { a: 0.55, ..Color::BLACK };
-                let (w, h) = (bounds.width, bounds.height);
-                f.fill_rectangle(Point::ORIGIN, Size::new(w, a.y), dim);
-                f.fill_rectangle(Point::new(0.0, b.y), Size::new(w, h - b.y), dim);
-                f.fill_rectangle(Point::new(0.0, a.y), Size::new(a.x, b.y - a.y), dim);
-                f.fill_rectangle(Point::new(b.x, a.y), Size::new(w - b.x, b.y - a.y), dim);
+                let (ox, oy, w, h) = (self.origin.x, self.origin.y, self.display.width, self.display.height);
+                let (ax, ay, bx, by) = (a.x.clamp(ox, ox + w), a.y.clamp(oy, oy + h), b.x.clamp(ox, ox + w), b.y.clamp(oy, oy + h));
+                f.fill_rectangle(Point::new(ox, oy), Size::new(w, ay - oy), dim);
+                f.fill_rectangle(Point::new(ox, by), Size::new(w, oy + h - by), dim);
+                f.fill_rectangle(Point::new(ox, ay), Size::new(ax - ox, by - ay), dim);
+                f.fill_rectangle(Point::new(bx, ay), Size::new(ox + w - bx, by - ay), dim);
                 let rect = Path::rectangle(a, Size::new(b.x - a.x, b.y - a.y));
                 f.stroke(&rect, Stroke::default().with_color(BRAND_2).with_width(2.0));
                 for c in [a, Point::new(b.x, a.y), b, Point::new(a.x, b.y)] {
@@ -245,7 +250,7 @@ impl canvas::Program<Message> for Overlay<'_> {
                 let label = format!("Zoom {:.0}%", z.scale * 100.0);
                 let chip = Path::rounded_rectangle(Point::new(a.x, a.y - 24.0), Size::new(78.0, 19.0), 5.0.into());
                 f.fill(&chip, BRAND_2);
-                f.fill_text(Text { content: label, position: Point::new(a.x + 39.0, a.y - 14.5), color: Color::WHITE, size: 11.0.into(), font: INTER_SEMIBOLD, align_x: alignment::Horizontal::Center.into(), align_y: alignment::Vertical::Center, ..Text::default() });
+                f.fill_text(Text { content: label, position: Point::new(a.x + 39.0, a.y - 14.5), color: ON_ACCENT, size: 11.0.into(), font: INTER_SEMIBOLD, align_x: alignment::Horizontal::Center.into(), align_y: alignment::Vertical::Center, ..Text::default() });
             }
             return vec![f.into_geometry()];
         }
@@ -276,11 +281,12 @@ impl canvas::Program<Message> for Overlay<'_> {
         }
 
         let (gx, gy) = state.guides;
+        let (ox, oy, w, h) = (self.origin.x, self.origin.y, self.display.width, self.display.height);
         if gx {
-            f.fill_rectangle(Point::new(bounds.width / 2.0 - 0.5, 0.0), Size::new(1.0, bounds.height), BRAND_2);
+            f.fill_rectangle(Point::new(ox + w / 2.0 - 0.5, oy), Size::new(1.0, h), BRAND_2);
         }
         if gy {
-            f.fill_rectangle(Point::new(0.0, bounds.height / 2.0 - 0.5), Size::new(bounds.width, 1.0), BRAND_2);
+            f.fill_rectangle(Point::new(ox, oy + h / 2.0 - 0.5), Size::new(w, 1.0), BRAND_2);
         }
         vec![f.into_geometry()]
     }

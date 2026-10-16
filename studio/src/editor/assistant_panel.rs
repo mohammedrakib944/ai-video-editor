@@ -45,7 +45,7 @@ impl Editor {
         }
         let transcript: Element<'_, Message> = if self.chat.is_empty() {
             let hero = column![
-                container(icon(code::SPARKLES, 18).color(Color::WHITE)).center(40).style(style::logo),
+                container(icon(code::SPARKLES, 18).color(ON_ACCENT)).center(40).style(style::logo),
                 text("What should we make?").font(INTER_SEMIBOLD).size(T_TITLE),
                 text("Select a part of the timeline with the Range tool (R), then describe the motion you want.").size(T_SMALL).color(TEXT_3).align_x(Alignment::Center),
             ]
@@ -81,7 +81,7 @@ impl Editor {
                     }
                     ChatItem::Reply(t) => {
                         let font = if t.is_ascii() { INTER } else { HIND };
-                        row![container(icon(code::SPARKLES, 11).color(Color::WHITE)).center(20).style(style::logo), text(t).font(font).size(T_BODY).width(Fill)].spacing(8).into()
+                        row![container(icon(code::SPARKLES, 11).color(ON_ACCENT)).center(20).style(style::logo), text(t).font(font).size(T_BODY).width(Fill)].spacing(8).into()
                     }
                     ChatItem::Tool { label, state, detail, image: img, .. } => {
                         let (glyph, color) = match state {

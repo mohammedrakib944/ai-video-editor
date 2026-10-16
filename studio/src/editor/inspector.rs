@@ -54,7 +54,6 @@ pub enum Edit {
     OutroDuration(f64),
     Transition(Option<TransitionKind>),
     TransitionDuration(f64),
-    AddZoom,
     RemoveZoom(Id),
     ZoomScale(Id, f64),
     ZoomFocusX(Id, f64),
@@ -85,7 +84,6 @@ impl Edit {
             Edit::Font(_) | Edit::FontSize(_) | Edit::Weight(_) | Edit::TextColor(_) | Edit::Align(_) | Edit::TextBox(_) => ("text-style", "Text style"),
             Edit::Intro(_) | Edit::Outro(_) | Edit::IntroDuration(_) | Edit::OutroDuration(_) => ("motion", "Animation"),
             Edit::Transition(_) | Edit::TransitionDuration(_) => ("transition", "Transition"),
-            Edit::AddZoom => ("add-zoom", "Add zoom"),
             Edit::RemoveZoom(_) => ("remove-zoom", "Remove zoom"),
             Edit::ZoomScale(..) | Edit::ZoomFocusX(..) | Edit::ZoomFocusY(..) | Edit::ZoomFocus(..) => ("zoom", "Zoom"),
         }
@@ -431,7 +429,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>) -> 
                 }),
             );
         }
-        zooms = zooms.push(widgets::secondary_button(Some(code::PLUS), "Add zoom at playhead", Some(e(Edit::AddZoom))).width(Fill));
+        zooms = zooms.push(widgets::secondary_button(Some(code::PLUS), "Add zoom at playhead", Some(Message::AddZoomAtPlayhead)).width(Fill));
         col = col.push(section(code::ZOOM_IN, "Zoom & pan", zooms.into()));
     }
 

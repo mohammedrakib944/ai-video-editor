@@ -57,8 +57,7 @@ fn window_settings() -> window::Settings {
         size: Size::new(1480.0, 920.0),
         min_size: Some(Size::new(1100.0, 680.0)),
         decorations: false,
-        // On Linux we draw rounded corners and a shadow, which needs a transparent surface.
-        transparent: cfg!(not(windows)),
+        transparent: false,
         platform_specific: platform_specific(),
         ..Default::default()
     }

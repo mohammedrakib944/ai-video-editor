@@ -42,7 +42,7 @@ pub fn window_frame(rounded: bool) -> impl Fn(&Theme) -> container::Style {
 
 pub fn title_bar(rounded: bool) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style {
-        background: Some(SURFACE_0.into()),
+        background: Some(SURFACE_1.into()),
         border: Border {
             radius: if rounded { Radius { top_left: R_XL, top_right: R_XL, bottom_right: 0.0, bottom_left: 0.0 } } else { 0.0.into() },
             ..Default::default()
@@ -68,14 +68,18 @@ pub fn hairline(_: &Theme) -> container::Style {
 }
 
 pub fn panel(_: &Theme) -> container::Style {
-    container::Style { background: Some(SURFACE_1.into()), border: border(LINE, 1.0, R_LG), ..Default::default() }
+    container::Style { background: Some(SURFACE_1.into()), ..Default::default() }
+}
+
+/// The workspace around the preview canvas.
+pub fn workspace(_: &Theme) -> container::Style {
+    container::Style { background: Some(WINDOW.into()), ..Default::default() }
 }
 
 pub fn panel_header(_: &Theme) -> container::Style {
     container::Style {
         background: Some(SURFACE_1.into()),
         text_color: Some(TEXT_2),
-        border: Border { radius: Radius { top_left: R_LG, top_right: R_LG, bottom_right: 0.0, bottom_left: 0.0 }, ..Default::default() },
         ..Default::default()
     }
 }
@@ -129,8 +133,8 @@ pub fn swatch(color: Color, radius: f32) -> impl Fn(&Theme) -> container::Style 
 pub fn logo(_: &Theme) -> container::Style {
     container::Style {
         background: Some(brand_gradient()),
-        text_color: Some(Color::WHITE),
-        border: border(Color { a: 0.25, ..Color::WHITE }, 1.0, 7.0),
+        text_color: Some(ON_ACCENT),
+        border: border(Color { a: 0.3, ..Color::WHITE }, 1.0, 7.0),
         shadow: Shadow { color: ACCENT_GLOW, offset: Vector::new(0.0, 2.0), blur_radius: 10.0 },
         ..Default::default()
     }
@@ -156,8 +160,8 @@ pub fn primary(_: &Theme, status: button::Status) -> button::Style {
     let disabled = matches!(status, button::Status::Disabled);
     button_base(
         Some(vertical(top, bottom)),
-        if disabled { TEXT_4 } else { Color::WHITE },
-        border(Color { a: if disabled { 0.0 } else { 0.18 }, ..Color::WHITE }, 1.0, R_MD),
+        if disabled { TEXT_4 } else { ON_ACCENT },
+        border(Color { a: if disabled { 0.0 } else { 0.28 }, ..Color::WHITE }, 1.0, R_MD),
         if disabled || matches!(status, button::Status::Pressed) { Shadow::default() } else { Shadow { color: ACCENT_GLOW, offset: Vector::new(0.0, 3.0), blur_radius: 12.0 } },
     )
 }
@@ -209,7 +213,7 @@ pub fn menu_item(danger: bool) -> impl Fn(&Theme, button::Status) -> button::Sty
         let text = match () {
             _ if disabled => TEXT_4,
             _ if danger => DANGER,
-            _ if hovered => Color::WHITE,
+            _ if hovered => ON_ACCENT,
             _ => TEXT_1,
         };
         button_base(bg, text, border(Color::TRANSPARENT, 0.0, R_SM), Shadow::default())
@@ -307,7 +311,7 @@ pub fn select_menu(_: &Theme) -> menu::Style {
         background: SURFACE_2.into(),
         border: border(LINE_STRONG, 1.0, R_MD),
         text_color: TEXT_1,
-        selected_text_color: Color::WHITE,
+        selected_text_color: ON_ACCENT,
         selected_background: ACCENT.into(),
         shadow: soft_shadow(24.0, 10.0, 0.5),
     }
@@ -335,7 +339,7 @@ pub fn toggler(_: &Theme, status: w::toggler::Status) -> w::toggler::Style {
         background: if on { ACCENT.into() } else if hovered { SURFACE_4.into() } else { SURFACE_3.into() },
         background_border_width: 1.0,
         background_border_color: if on { Color { a: 0.2, ..Color::WHITE } } else { LINE_STRONG },
-        foreground: Color::WHITE.into(),
+        foreground: if on { ON_ACCENT.into() } else { TEXT_1.into() },
         foreground_border_width: 0.0,
         foreground_border_color: Color::TRANSPARENT,
         text_color: Some(TEXT_2),
@@ -352,7 +356,7 @@ pub fn checkbox(_: &Theme, status: w::checkbox::Status) -> w::checkbox::Style {
     };
     w::checkbox::Style {
         background: if on { ACCENT.into() } else { SURFACE_0.into() },
-        icon_color: Color::WHITE,
+        icon_color: ON_ACCENT,
         border: border(if on { ACCENT } else if hovered { LINE_STRONG } else { LINE_STRONG }, 1.0, 4.0),
         text_color: Some(TEXT_2),
     }

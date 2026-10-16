@@ -326,6 +326,26 @@ impl Project {
         Ok(())
     }
 
+    /// Moves or resizes a zoom along its clip without overlapping the clip's other zooms.
+    pub fn set_zoom_timing(&mut self, clip: Id, zoom: Id, at: f64, duration: f64) -> anyhow::Result<()> {
+        let c = self.clip_mut(clip)?;
+        let len = c.duration;
+        let others: Vec<(f64, f64)> = c.zooms.iter().filter(|z| z.id != zoom).map(|z| (z.at, z.at + z.duration)).collect();
+        let z = c.zooms.iter_mut().find(|z| z.id == zoom).context("That zoom no longer exists")?;
+        let mut at = at.clamp(0.0, (len - 0.3).max(0.0));
+        let mut duration = duration.max(0.3).min(len - at);
+        // Stay between the neighbours on either side of where it was dropped.
+        let mid = at + duration / 2.0;
+        let lo = others.iter().filter(|(_, e)| *e <= mid).map(|(_, e)| *e).fold(0.0, f64::max);
+        let hi = others.iter().filter(|(s, _)| *s >= mid).map(|(s, _)| *s).fold(len, f64::min);
+        ensure!(hi - lo >= 0.3, "There's no room for the zoom there");
+        duration = duration.min(hi - lo);
+        at = at.clamp(lo, hi - duration);
+        z.at = at;
+        z.duration = duration;
+        Ok(())
+    }
+
     /// Duplicates a clip right after itself (or the nearest free spot).
     pub fn duplicate_clip(&mut self, id: Id) -> anyhow::Result<Id> {
         let clip = self.clip(id).context("That clip no longer exists")?.clone();
@@ -424,6 +444,22 @@ mod tests {
         let track = p.clip(c1).unwrap().track;
         p.move_clip(c2, track, 1.0).unwrap();
         assert_eq!(p.clip(c2).unwrap().start, 4.0);
+    }
+
+    #[test]
+    fn zoom_timing_stays_between_neighbours() {
+        let (mut p, a) = project_with_video(20.0);
+        let c = p.add_media_clip(a, None, 0.0).unwrap();
+        let mk = |id, at, duration| crate::clip::Zoom { id, at, duration, scale: 2.0, focus_x: 0.5, focus_y: 0.5, ramp: 0.5 };
+        p.clip_mut(c).unwrap().zooms = vec![mk(1, 2.0, 3.0), mk(2, 10.0, 3.0)];
+        // Dragged onto its neighbour: pushed back next to it.
+        p.set_zoom_timing(c, 2, 4.0, 3.0).unwrap();
+        let z = p.clip(c).unwrap().zooms[1];
+        assert_eq!((z.at, z.duration), (5.0, 3.0));
+        // Stretched past the clip end: clamped.
+        p.set_zoom_timing(c, 2, 18.0, 9.0).unwrap();
+        let z = p.clip(c).unwrap().zooms[1];
+        assert!(z.at + z.duration <= 20.0 + 1e-9);
     }
 
     #[test]

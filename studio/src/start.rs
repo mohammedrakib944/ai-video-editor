@@ -125,7 +125,7 @@ fn recent_list(recent: &[RecentProject]) -> Element<'_, Message> {
     } else {
         let rows = recent.iter().map(|r| {
             let exists = r.path.is_file();
-            let thumb = container(tinted(code::FILM, 16, if exists { iced::Color::WHITE } else { TEXT_3 }))
+            let thumb = container(tinted(code::FILM, 16, if exists { ON_ACCENT } else { TEXT_3 }))
                 .center(Length::Fixed(40.0))
                 .style(move |t| if exists { style::logo(t) } else { style::card(t) });
             let meta = if exists { format!("{}  ·  {}", r.summary, relative_time(r.opened_at)) } else { "File missing".to_string() };

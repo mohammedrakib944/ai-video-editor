@@ -21,9 +21,10 @@ pub enum WindowAction {
     Resize(Direction),
 }
 
-/// Whether we draw our own rounded frame and shadow (Linux, not maximized).
-pub fn draws_frame(maximized: bool) -> bool {
-    cfg!(not(windows)) && !maximized
+/// Whether we draw our own rounded frame. The window is flush to its edges
+/// everywhere; Windows still rounds the corners natively.
+pub fn draws_frame(_maximized: bool) -> bool {
+    false
 }
 
 /// Space around the frame for the drawn shadow.
@@ -64,9 +65,43 @@ pub fn title_bar<'a, M: Clone + 'a>(
         .into()
 }
 
-/// The app's mark: a gradient tile with a play glyph.
+/// The app's mark: a play shape in motion (speed trails) on a lime-to-mint tile.
 pub fn logo<'a, M: 'a>() -> Element<'a, M> {
-    container(icon(code::PLAY, 11).color(iced::Color::WHITE)).center(22).style(style::logo).into()
+    logo_sized(22.0)
+}
+
+pub fn logo_sized<'a, M: 'a>(size: f32) -> Element<'a, M> {
+    iced::widget::canvas(Mark).width(size).height(size).into()
+}
+
+struct Mark;
+
+impl<M> iced::widget::canvas::Program<M> for Mark {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &iced::Renderer, _: &iced::Theme, bounds: iced::Rectangle, _: mouse::Cursor) -> Vec<iced::widget::canvas::Geometry> {
+        use iced::widget::canvas::{Frame, Gradient, Path, gradient};
+        use iced::{Point, Size};
+        let mut f = Frame::new(renderer, bounds.size());
+        let s = bounds.width.min(bounds.height);
+        let tile = Path::rounded_rectangle(Point::ORIGIN, Size::new(s, s), (s * 0.3).into());
+        let fill = Gradient::Linear(gradient::Linear::new(Point::ORIGIN, Point::new(s, s)).add_stop(0.0, ACCENT).add_stop(1.0, BRAND_2));
+        f.fill(&tile, fill);
+        // Speed trails behind the play shape.
+        for (i, (y, len)) in [(0.36, 0.20), (0.5, 0.28), (0.64, 0.20)].into_iter().enumerate() {
+            let a = if i == 1 { 0.85 } else { 0.5 };
+            let bar = Path::rounded_rectangle(Point::new(s * (0.40 - len), s * y - s * 0.035), Size::new(s * len, s * 0.07), (s * 0.035).into());
+            f.fill(&bar, iced::Color { a, ..ON_ACCENT });
+        }
+        let play = Path::new(|b| {
+            b.move_to(Point::new(s * 0.42, s * 0.27));
+            b.line_to(Point::new(s * 0.78, s * 0.5));
+            b.line_to(Point::new(s * 0.42, s * 0.73));
+            b.close();
+        });
+        f.fill(&play, ON_ACCENT);
+        vec![f.into_geometry()]
+    }
 }
 
 /// Wraps the window content in the frame, plus invisible resize edges when not maximized.

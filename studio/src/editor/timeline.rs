@@ -9,7 +9,7 @@ use iced::widget::canvas::{self, Action, Cache, Frame, Geometry, Path, Stroke, T
 use iced::{Color, Point, Rectangle, Renderer, Size, Theme, alignment};
 
 use super::media_cache::{MediaCache, PEAKS_PER_SECOND};
-use super::{Message, Tool};
+use super::Message;
 use crate::clip::{Clip, Content};
 use crate::edit::Edge;
 use crate::model::{Id, MediaKind, Project, TrackKind};
@@ -21,6 +21,7 @@ pub const TOP_PAD: f32 = 6.0;
 pub const GAP: f32 = 4.0;
 const EDGE_GRAB: f32 = 7.0;
 const SNAP_PX: f32 = 9.0;
+const ZOOM_BAND_H: f32 = 15.0;
 
 pub fn track_height(kind: TrackKind) -> f32 {
     match kind {
@@ -119,6 +120,8 @@ pub struct Ruler {
     pub view: View,
     pub playhead: f64,
     pub range: Option<(f64, f64)>,
+    /// Range start marked, waiting for its end.
+    pub anchor: Option<f64>,
 }
 
 #[derive(Default)]
@@ -166,6 +169,12 @@ impl canvas::Program<Message> for Ruler {
         if let Some((a, b)) = self.range {
             let (x0, x1) = (self.view.x(a), self.view.x(b));
             f.fill_rectangle(Point::new(x0, 0.0), Size::new(x1 - x0, size.height), Color { a: 0.18, ..ACCENT });
+            for (x, label) in [(x0, "A"), (x1, "B")] {
+                flag(&mut f, x, label);
+            }
+        }
+        if let Some(a) = self.anchor {
+            flag(&mut f, self.view.x(a), "A");
         }
         let steps = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0];
         let step = steps.iter().copied().find(|s| s * self.view.zoom >= 84.0).unwrap_or(1800.0);
@@ -204,6 +213,14 @@ impl canvas::Program<Message> for Ruler {
     }
 }
 
+/// A small lettered flag hanging from the top of the ruler.
+fn flag(f: &mut Frame, x: f32, label: &str) {
+    f.fill_rectangle(Point::new(x - 0.5, 0.0), Size::new(1.0, RULER_H), ACCENT);
+    let tag = Path::rounded_rectangle(Point::new(x - 7.0, 1.0), Size::new(14.0, 13.0), 3.0.into());
+    f.fill(&tag, ACCENT);
+    f.fill_text(Text { content: label.into(), position: Point::new(x, 7.5), color: ON_ACCENT, size: 9.5.into(), font: INTER_BOLD, align_x: alignment::Horizontal::Center.into(), align_y: alignment::Vertical::Center, ..Text::default() });
+}
+
 fn wheel(delta: ScrollDelta) -> (f32, f32) {
     match delta {
         ScrollDelta::Lines { x, y } => (x * 48.0, y * 48.0),
@@ -224,8 +241,9 @@ pub struct Lanes<'a> {
     pub selection: &'a [Id],
     pub playhead: f64,
     pub view: View,
-    pub tool: Tool,
     pub snapping: bool,
+    /// The zoom open in the canvas editor, highlighted on its clip.
+    pub zoom_edit: Option<(Id, Id)>,
     pub range: Option<(f64, f64)>,
     /// Asset being dragged in from the library.
     pub dnd: Option<Id>,
@@ -239,7 +257,9 @@ enum Drag {
     Pan { x0: f32, scroll0: f64 },
     Move { clip: Id, grab: f64, track: Id, start: f64, press: Point, moved: bool },
     Trim { clip: Id, edge: Edge, t: f64 },
-    Range { anchor: f64, current: f64 },
+    /// Moving a zoom along its clip; `at` is clip-relative.
+    ZoomMove { clip: Id, zoom: Id, grab: f64, at: f64, press: Point, moved: bool },
+    ZoomTrim { clip: Id, zoom: Id, edge: Edge, at: f64, duration: f64 },
 }
 
 #[derive(Default)]
@@ -284,15 +304,23 @@ impl Lanes<'_> {
         Some((clip, zone))
     }
 
-    /// The zoom marker under `p`, as (clip, zoom).
-    fn zoom_pill(&self, p: Point) -> Option<(Id, Id)> {
+    /// The zoom band under `p`: (clip, zoom, which part).
+    fn zoom_hit(&self, p: Point) -> Option<(&Clip, &crate::clip::Zoom, Zone)> {
         let (clip, _) = self.hit(p)?;
         let (_, _, top, h) = self.row_of(clip.track)?;
-        if p.y < top + h - 13.0 {
+        let band_top = top + h - ZOOM_BAND_H - 3.0;
+        if p.y < band_top || p.y > top + h {
             return None;
         }
-        let local = self.view.t(p.x) - clip.start;
-        clip.zooms.iter().find(|z| local >= z.at && local <= z.at + z.duration).map(|z| (clip.id, z.id))
+        clip.zooms.iter().find_map(|z| {
+            let (x0, x1) = (self.view.x(clip.start + z.at), self.view.x(clip.start + z.at + z.duration));
+            if p.x < x0 - 3.0 || p.x > x1 + 3.0 {
+                return None;
+            }
+            let grab = 6.0f32.min((x1 - x0) / 4.0);
+            let zone = if p.x - x0 <= grab { Zone::Edge(Edge::Start) } else if x1 - p.x <= grab { Zone::Edge(Edge::End) } else { Zone::Body };
+            Some((clip, z, zone))
+        })
     }
 
     fn snap_points(&self, exclude: Option<Id>) -> Vec<f64> {
@@ -367,23 +395,16 @@ impl canvas::Program<Message> for Lanes<'_> {
                     return None;
                 }
                 let t = self.view.t(p.x).max(0.0);
-                match self.tool {
-                    Tool::Blade => {
-                        let (clip, _) = self.hit(p)?;
-                        let (t, _) = self.snap(t, Some(clip.id));
-                        Some(Action::publish(Message::Split(clip.id, t)).and_capture())
-                    }
-                    Tool::Range => {
-                        let (t, guide) = self.snap(t, None);
-                        state.guide = guide;
-                        state.drag = Some(Drag::Range { anchor: t, current: t });
-                        Some(Action::capture())
-                    }
-                    Tool::Select if self.zoom_pill(p).is_some() => {
-                        let (clip, zoom) = self.zoom_pill(p)?;
-                        Some(Action::publish(Message::ZoomEdit(Some((clip, zoom)))).and_capture())
-                    }
-                    Tool::Select => match self.hit(p) {
+                // Zoom bands sit on top of their clip and take clicks first.
+                if let Some((clip, z, zone)) = self.zoom_hit(p) {
+                    state.drag = Some(match zone {
+                        Zone::Edge(edge) => Drag::ZoomTrim { clip: clip.id, zoom: z.id, edge, at: z.at, duration: z.duration },
+                        Zone::Body => Drag::ZoomMove { clip: clip.id, zoom: z.id, grab: t - clip.start - z.at, at: z.at, press: p, moved: false },
+                    });
+                    return Some(Action::publish(Message::ZoomEdit(Some((clip.id, z.id)))).and_capture());
+                }
+                {
+                    match self.hit(p) {
                         Some((clip, Zone::Edge(edge))) => {
                             let t = if edge == Edge::Start { clip.start } else { clip.end() };
                             state.drag = Some(Drag::Trim { clip: clip.id, edge, t });
@@ -398,7 +419,7 @@ impl canvas::Program<Message> for Lanes<'_> {
                             state.drag = Some(Drag::Pan { x0: p.x, scroll0: self.view.scroll });
                             Some(Action::publish(Message::Select(None, false)).and_capture())
                         }
-                    },
+                    }
                 }
             }
             canvas::Event::Mouse(mouse::Event::CursorMoved { position }) => {
@@ -434,9 +455,33 @@ impl canvas::Program<Message> for Lanes<'_> {
                         *t = s;
                         state.guide = guide;
                     }
-                    Drag::Range { current, .. } => {
-                        let (s, guide) = self.snap(self.view.t(p.x).max(0.0), None);
-                        *current = s;
+                    Drag::ZoomMove { clip, zoom, grab, at, press, moved } => {
+                        if !*moved && press.distance(p) < 3.0 {
+                            return None;
+                        }
+                        *moved = true;
+                        let c = self.project.clip(*clip)?;
+                        let z = c.zooms.iter().find(|z| z.id == *zoom)?;
+                        let (s, guide) = self.snap_span((self.view.t(p.x) - *grab).max(0.0), z.duration, *clip);
+                        *at = (s - c.start).clamp(0.0, (c.duration - z.duration).max(0.0));
+                        state.guide = guide;
+                    }
+                    Drag::ZoomTrim { clip, zoom, edge, at, duration } => {
+                        let c = self.project.clip(*clip)?;
+                        let z = c.zooms.iter().find(|z| z.id == *zoom)?;
+                        let (t, guide) = self.snap(self.view.t(p.x), Some(*clip));
+                        let local = (t - c.start).clamp(0.0, c.duration);
+                        let end = z.at + z.duration;
+                        match edge {
+                            Edge::Start => {
+                                *at = local.min(end - 0.3);
+                                *duration = end - *at;
+                            }
+                            Edge::End => {
+                                *at = z.at;
+                                *duration = (local - z.at).max(0.3);
+                            }
+                        }
                         state.guide = guide;
                     }
                 }
@@ -453,10 +498,12 @@ impl canvas::Program<Message> for Lanes<'_> {
                     Drag::Move { clip, track, start, moved: true, .. } => Message::MoveClip { clip, track, start },
                     Drag::Move { .. } | Drag::Pan { .. } => return Some(Action::request_redraw().and_capture()),
                     Drag::Trim { clip, edge, t } => Message::Trim { clip, edge, t },
-                    Drag::Range { anchor, current } => {
-                        let (a, b) = (anchor.min(current), anchor.max(current));
-                        Message::SetRange(((b - a) * self.view.zoom > 3.0).then_some((a, b)))
+                    Drag::ZoomMove { moved: false, .. } => return Some(Action::request_redraw().and_capture()),
+                    Drag::ZoomMove { clip, zoom, at, .. } => {
+                        let duration = self.project.clip(clip)?.zooms.iter().find(|z| z.id == zoom)?.duration;
+                        Message::ZoomTiming { clip, zoom, at, duration }
                     }
+                    Drag::ZoomTrim { clip, zoom, at, duration, .. } => Message::ZoomTiming { clip, zoom, at, duration },
                 };
                 Some(Action::publish(msg).and_capture())
             }
@@ -474,10 +521,7 @@ impl canvas::Program<Message> for Lanes<'_> {
         let h = bounds.height;
 
         // Range selection.
-        let range = match state.drag {
-            Some(Drag::Range { anchor, current }) => Some((anchor.min(current), anchor.max(current))),
-            _ => self.range,
-        };
+        let range = self.range;
         if let Some((a, b)) = range {
             let (x0, x1) = (self.view.x(a), self.view.x(b));
             o.fill_rectangle(Point::new(x0, 0.0), Size::new(x1 - x0, h), Color { a: 0.10, ..ACCENT });
@@ -499,6 +543,18 @@ impl canvas::Program<Message> for Lanes<'_> {
                     let (s, e) = if edge == Edge::Start { (t.min(c.end() - 0.1), c.end()) } else { (c.start, t.max(c.start + 0.1)) };
                     let r = Rectangle::new(Point::new(self.view.x(s), top), Size::new(((e - s) * self.view.zoom) as f32, rh));
                     ghost(&mut o, r, clip_color(self.project, c));
+                }
+            }
+            Some(Drag::ZoomMove { clip, zoom, at, moved: true, .. }) | Some(Drag::ZoomTrim { clip, zoom, at, .. }) => {
+                if let (Some(c), Some((_, _, top, rh))) = (self.project.clip(clip), self.project.clip(clip).and_then(|c| self.row_of(c.track))) {
+                    let duration = match state.drag {
+                        Some(Drag::ZoomTrim { duration, .. }) => duration,
+                        _ => c.zooms.iter().find(|z| z.id == zoom).map(|z| z.duration).unwrap_or(1.0),
+                    };
+                    let r = Rectangle::new(Point::new(self.view.x(c.start + at), top + rh - ZOOM_BAND_H - 3.0), Size::new((duration * self.view.zoom) as f32, ZOOM_BAND_H));
+                    let path = Path::rounded_rectangle(r.position(), r.size(), 4.0.into());
+                    o.fill(&path, Color { a: 0.35, ..ACCENT });
+                    o.stroke(&path, Stroke::default().with_color(ACCENT).with_width(1.5));
                 }
             }
             _ => {}
@@ -524,7 +580,7 @@ impl canvas::Program<Message> for Lanes<'_> {
         o.fill_rectangle(Point::new(x - 0.75, 0.0), Size::new(1.5, h), ACCENT);
 
         // Hovered clip edge.
-        if self.tool == Tool::Select && state.drag.is_none() {
+        if state.drag.is_none() && self.zoom_hit(state.hover.unwrap_or(Point::new(-1.0, -1.0))).is_none() {
             if let Some((c, Zone::Edge(edge))) = state.hover.and_then(|p| self.hit(p)) {
                 if let Some((_, _, top, rh)) = self.row_of(c.track) {
                     let x = self.view.x(if edge == Edge::Start { c.start } else { c.end() });
@@ -533,30 +589,24 @@ impl canvas::Program<Message> for Lanes<'_> {
                 }
             }
         }
-        if self.tool == Tool::Blade {
-            if let Some(p) = state.hover {
-                o.fill_rectangle(Point::new(p.x - 0.5, 0.0), Size::new(1.0, h), DANGER);
-            }
-        }
         vec![deco, o.into_geometry()]
     }
 
     fn mouse_interaction(&self, state: &LanesState, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
         match state.drag {
             Some(Drag::Move { moved: true, .. }) | Some(Drag::Pan { .. }) => return mouse::Interaction::Grabbing,
-            Some(Drag::Trim { .. }) => return mouse::Interaction::ResizingHorizontally,
+            Some(Drag::Trim { .. } | Drag::ZoomTrim { .. }) => return mouse::Interaction::ResizingHorizontally,
+            Some(Drag::ZoomMove { moved: true, .. }) => return mouse::Interaction::Grabbing,
             _ => {}
         }
         let Some(p) = cursor.position_in(bounds) else { return mouse::Interaction::default() };
-        match self.tool {
-            Tool::Blade if self.hit(p).is_some() => mouse::Interaction::Crosshair,
-            Tool::Range => mouse::Interaction::Text,
-            Tool::Select => match self.hit(p) {
-                Some((_, Zone::Edge(_))) => mouse::Interaction::ResizingHorizontally,
-                Some((_, Zone::Body)) => mouse::Interaction::Pointer,
-                None => mouse::Interaction::default(),
-            },
-            _ => mouse::Interaction::default(),
+        if let Some((_, _, zone)) = self.zoom_hit(p) {
+            return if zone == Zone::Body { mouse::Interaction::Grab } else { mouse::Interaction::ResizingHorizontally };
+        }
+        match self.hit(p) {
+            Some((_, Zone::Edge(_))) => mouse::Interaction::ResizingHorizontally,
+            Some((_, Zone::Body)) => mouse::Interaction::Pointer,
+            None => mouse::Interaction::default(),
         }
     }
 }
@@ -738,13 +788,43 @@ impl Lanes<'_> {
             f.stroke(&Path::line(Point::new(r.x + tw, r.y), Point::new(r.x, r.y + r.height)), Stroke::default().with_color(Color { a: 0.8, ..Color::WHITE }).with_width(1.0));
         }
 
-        // Zoom regions as pills along the bottom.
-        for z in &clip.zooms {
+        // Zoom and pan animations as bands along the bottom, like Camtasia's animation arrows.
+        let mut zooms: Vec<&crate::clip::Zoom> = clip.zooms.iter().collect();
+        zooms.sort_by(|a, b| a.at.total_cmp(&b.at));
+        for (i, z) in zooms.iter().enumerate() {
             let zx = self.view.x(clip.start + z.at);
-            let zw = (z.duration * self.view.zoom) as f32;
-            let pill = Path::rounded_rectangle(Point::new(zx + 2.0, r.y + r.height - 10.0), Size::new((zw - 4.0).max(4.0), 6.0), 3.0.into());
-            f.fill(&pill, BRAND_2);
-            f.stroke(&pill, Stroke::default().with_color(Color { a: 0.6, ..Color::BLACK }).with_width(1.0));
+            let zw = ((z.duration * self.view.zoom) as f32).max(6.0);
+            let band = Rectangle::new(Point::new(zx + 1.0, r.y + r.height - ZOOM_BAND_H - 3.0), Size::new(zw - 2.0, ZOOM_BAND_H));
+            let selected = self.zoom_edit == Some((clip.id, z.id));
+            let pans = i > 0 && (zooms[i - 1].at + zooms[i - 1].duration - z.at).abs() < 1e-3;
+            let fill = if selected { ACCENT } else { Color { a: 0.92, ..BRAND_2 } };
+            let path = Path::rounded_rectangle(band.position(), band.size(), 4.0.into());
+            f.fill(&path, fill);
+            // Easing ramps: darker wedges where the camera moves in and out.
+            let ramp = ((z.ramp.min(z.duration / 2.0) * self.view.zoom) as f32).min(band.width / 2.0);
+            if ramp > 3.0 {
+                let shade = Color { a: 0.28, ..ON_ACCENT };
+                let (x0, x1, y0, y1) = (band.x, band.x + band.width, band.y, band.y + band.height);
+                f.fill(&Path::new(|b| { b.move_to(Point::new(x0, y1)); b.line_to(Point::new(x0 + ramp, y0)); b.line_to(Point::new(x0, y0)); b.close(); }), shade);
+                f.fill(&Path::new(|b| { b.move_to(Point::new(x1, y1)); b.line_to(Point::new(x1 - ramp, y0)); b.line_to(Point::new(x1, y0)); b.close(); }), shade);
+            }
+            if band.width > 54.0 {
+                f.with_clip(band, |f| {
+                    f.fill_text(Text {
+                        content: if pans { format!("Pan · {:.0}%", z.scale * 100.0) } else { format!("Zoom {:.0}%", z.scale * 100.0) },
+                        position: Point::new(band.x + band.width / 2.0, band.y + band.height / 2.0),
+                        color: ON_ACCENT,
+                        size: 10.0.into(),
+                        font: INTER_SEMIBOLD,
+                        align_x: alignment::Horizontal::Center.into(),
+                        align_y: alignment::Vertical::Center,
+                        ..Text::default()
+                    });
+                });
+            }
+            if selected {
+                f.stroke(&path, Stroke::default().with_color(Color::WHITE).with_width(1.5));
+            }
         }
 
         // Label chip (text clips show their content instead).
@@ -764,7 +844,7 @@ impl Lanes<'_> {
             });
         }
 
-        let (line, width) = if selected { (Color::WHITE, 2.0) } else { (Color { a: 0.55, ..color }, 1.0) };
+        let (line, width) = if selected { (ACCENT, 2.0) } else { (Color { a: 0.55, ..color }, 1.0) };
         f.stroke(&body, Stroke::default().with_color(line).with_width(width));
         if selected {
             let glow = Path::rounded_rectangle(Point::new(r.x - 2.0, r.y - 2.0), Size::new(r.width + 4.0, r.height + 4.0), (radius + 2.0).into());

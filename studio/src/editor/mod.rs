@@ -70,14 +70,6 @@ pub enum SideTab {
     Assistant,
 }
 
-/// Timeline tools.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tool {
-    Select,
-    Blade,
-    Range,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum TrackAction {
     Rename,
@@ -96,7 +88,6 @@ pub enum Message {
     PaneResized(pane_grid::ResizeEvent),
     LibraryTab(LibraryTab),
     SideTab(SideTab),
-    Tool(Tool),
     TogglePlay,
     ToggleMute,
     ToggleSnapping,
@@ -116,8 +107,12 @@ pub enum Message {
     Select(Option<Id>, bool),
     MoveClip { clip: Id, track: Id, start: f64 },
     Trim { clip: Id, edge: Edge, t: f64 },
-    Split(Id, f64),
     SplitAtPlayhead,
+    MarkRange,
+    MarkIn,
+    MarkOut,
+    AddZoomAtPlayhead,
+    ZoomTiming { clip: Id, zoom: Id, at: f64, duration: f64 },
     DeleteSelection,
     DuplicateSelection,
     SetRange(Option<(f64, f64)>),
@@ -176,7 +171,8 @@ pub struct Editor {
     panes: pane_grid::State<Pane>,
     library_tab: LibraryTab,
     pub side_tab: SideTab,
-    tool: Tool,
+    /// Range start marked with the playhead, waiting for the end.
+    range_anchor: Option<f64>,
     playing: Option<(Instant, f64)>,
     snapping: bool,
     playhead: f64,
@@ -231,7 +227,7 @@ impl Editor {
             panes: pane_grid::State::with_configuration(config),
             library_tab: LibraryTab::Media,
             side_tab: SideTab::Inspector,
-            tool: Tool::Select,
+            range_anchor: None,
             playing: None,
             snapping: true,
             playhead: 0.0,
@@ -369,7 +365,6 @@ impl Editor {
             Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => self.panes.resize(split, ratio),
             Message::LibraryTab(t) => self.library_tab = t,
             Message::SideTab(t) => self.side_tab = t,
-            Message::Tool(t) => self.tool = t,
             Message::ToggleSnapping => self.snapping = !self.snapping,
             Message::TogglePlay => {
                 if self.playing.is_some() {
@@ -566,11 +561,6 @@ impl Editor {
             Message::Trim { clip, edge, t } => {
                 self.edit("Trim clip", |p| p.trim(clip, edge, t));
             }
-            Message::Split(clip, t) => {
-                if let Some(right) = self.edit("Split clip", |p| p.split(clip, t)) {
-                    self.selection = vec![right];
-                }
-            }
             Message::SplitAtPlayhead => {
                 let t = self.playhead;
                 let targets: Vec<Id> = if self.selection.is_empty() {
@@ -594,7 +584,52 @@ impl Editor {
                     });
                 }
             }
+            Message::MarkRange => {
+                let t = self.playhead;
+                match self.range_anchor.take() {
+                    Some(a) if (t - a).abs() > 0.05 => self.set_range(a.min(t), a.max(t)),
+                    Some(_) => self.notify("Move the playhead to where the range should end", false),
+                    None => {
+                        self.range = None;
+                        self.range_anchor = Some(t);
+                        self.notify("Range start (A) set — move the playhead and press R again", false);
+                    }
+                }
+                self.lanes_cache.clear();
+            }
+            Message::MarkIn => {
+                let t = self.playhead;
+                match self.range {
+                    Some((_, b)) if b > t + 0.05 => self.set_range(t, b),
+                    _ => {
+                        self.range = None;
+                        self.range_anchor = Some(t);
+                    }
+                }
+                self.lanes_cache.clear();
+            }
+            Message::MarkOut => {
+                let t = self.playhead;
+                let a = self.range_anchor.take().or(self.range.map(|r| r.0)).unwrap_or(0.0);
+                if t > a + 0.05 {
+                    self.set_range(a, t);
+                } else {
+                    self.notify("The end of the range must come after its start", true);
+                }
+                self.lanes_cache.clear();
+            }
+            Message::AddZoomAtPlayhead => self.add_zoom_at_playhead(),
+            Message::ZoomTiming { clip, zoom, at, duration } => {
+                self.edit("Move zoom", |p| p.set_zoom_timing(clip, zoom, at, duration));
+            }
             Message::DeleteSelection => {
+                if let Some((clip, zoom)) = self.zoom_edit.take() {
+                    self.edit("Remove zoom", |p| {
+                        p.clip_mut(clip)?.zooms.retain(|z| z.id != zoom);
+                        Ok(())
+                    });
+                    return Task::none();
+                }
                 let ids = std::mem::take(&mut self.selection);
                 if !ids.is_empty() {
                     self.edit(if ids.len() == 1 { "Delete clip" } else { "Delete clips" }, |p| p.delete_clips(&ids));
@@ -615,18 +650,9 @@ impl Editor {
             Message::Edit(id, edit) => {
                 let (key, desc) = edit.describe();
                 let key = format!("{key}:{id}");
-                let playhead = self.playhead;
                 self.edit_merge(desc, Some(&key), |p| {
-                    match edit {
-                        Edit::Speed(s) => return p.set_speed(id, s),
-                        Edit::AddZoom => {
-                            let zid = p.alloc_id();
-                            let c = p.clip_mut(id)?;
-                            let at = (playhead - c.start).clamp(0.0, (c.duration - 2.0).max(0.0));
-                            c.zooms.push(Zoom { id: zid, at, duration: 2.5f64.min(c.duration - at), scale: 1.8, focus_x: 0.5, focus_y: 0.5, ramp: 0.6 });
-                            return Ok(());
-                        }
-                        _ => {}
+                    if let Edit::Speed(s) = edit {
+                        return p.set_speed(id, s);
                     }
                     edit.apply(p.clip_mut(id)?);
                     Ok(())
@@ -844,12 +870,15 @@ impl Editor {
             }
             Message::Escape => {
                 if self.zoom_edit.take().is_some() {
+                    self.lanes_cache.clear();
+                    return Task::none();
+                }
+                if self.range_anchor.take().is_some() {
                     return Task::none();
                 }
                 if self.renaming.take().is_none() {
                     self.range = None;
                     self.selection.clear();
-                    self.tool = Tool::Select;
                     self.lanes_cache.clear();
                 }
             }
@@ -986,6 +1015,57 @@ impl Editor {
         Task::run(stream, Message::ExportProgress)
     }
 
+    fn set_range(&mut self, a: f64, b: f64) {
+        self.range = Some((a, b));
+        self.range_anchor = None;
+        self.side_tab = SideTab::Assistant;
+    }
+
+    /// Camtasia-style: a zoom starting at the playhead on the clip under it. Right after
+    /// another zoom it continues at the same magnification, which makes a pan.
+    fn add_zoom_at_playhead(&mut self) {
+        let t = self.playhead;
+        let p = &self.doc.project;
+        let visual = |c: &crate::clip::Clip| c.asset().and_then(|a| p.asset(a)).is_some_and(|a| a.is_visual()) && t >= c.start && t < c.end();
+        let selected = self.selection.iter().filter_map(|id| p.clip(*id)).find(|c| visual(c)).map(|c| c.id);
+        let topmost = p.tracks.iter().find_map(|tr| p.clips_on(tr.id).find(|c| visual(c)).map(|c| c.id));
+        let Some(clip_id) = selected.or(topmost) else {
+            self.notify("Move the playhead over a video or image clip to add a zoom", false);
+            return;
+        };
+        let c = p.clip(clip_id).unwrap();
+        let local = t - c.start;
+        if let Some(z) = c.zooms.iter().find(|z| local >= z.at && local < z.at + z.duration) {
+            let target = Some((clip_id, z.id));
+            let _ = self.update(Message::ZoomEdit(target));
+            return;
+        }
+        let prev = c.zooms.iter().filter(|z| z.at + z.duration <= local + 1e-6).max_by(|a, b| (a.at + a.duration).total_cmp(&(b.at + b.duration))).copied();
+        let next_start = c.zooms.iter().filter(|z| z.at > local).map(|z| z.at).fold(c.duration, f64::min);
+        let (at, scale, pan) = match prev {
+            Some(z) if local - (z.at + z.duration) < 0.4 => (z.at + z.duration, z.scale, true),
+            _ => (local, 1.8, false),
+        };
+        let duration = 3.0f64.min(next_start - at);
+        if duration < 0.3 {
+            self.notify("There's no room for another zoom here", false);
+            return;
+        }
+        let (fx, fy) = match prev {
+            Some(z) if pan => ((z.focus_x + 0.25).min(0.85), z.focus_y),
+            _ => (0.5, 0.5),
+        };
+        let created = self.edit(if pan { "Add pan" } else { "Add zoom" }, |p| {
+            let zid = p.alloc_id();
+            p.clip_mut(clip_id)?.zooms.push(Zoom { id: zid, at, duration, scale, focus_x: fx, focus_y: fy, ramp: 0.6 });
+            Ok(zid)
+        });
+        if let Some(zid) = created {
+            let _ = self.update(Message::ZoomEdit(Some((clip_id, zid))));
+            self.notify(if pan { "Pan added — drag the frame on the canvas to aim it" } else { "Zoom added — drag the frame on the canvas to aim it" }, false);
+        }
+    }
+
     fn after_history(&mut self) {
         let p = &self.doc.project;
         self.selection.retain(|id| p.clip(*id).is_some());
@@ -1047,25 +1127,28 @@ impl Editor {
 
     pub fn view(&self) -> Element<'_, Message> {
         let grid = pane_grid(&self.panes, |_, pane, _| {
+            // The preview has no header, so the canvas gets the space; it sits on the workspace color.
+            if *pane == Pane::Preview {
+                return pane_grid::Content::new(container(self.preview()).width(Fill).height(Fill)).style(style::workspace);
+            }
             let (header, body): (Element<'_, Message>, Element<'_, Message>) = match pane {
                 Pane::Library => (self.library_header(), self.library()),
-                Pane::Preview => (pane_title("Preview", Some(self.doc.project.canvas.summary())), self.preview()),
                 Pane::Inspector => (self.side_header(), self.inspector()),
-                Pane::Timeline => (self.timeline_header(), self.timeline()),
+                _ => (self.timeline_header(), self.timeline()),
             };
-            pane_grid::Content::new(container(body).width(Fill).height(Fill))
-                .title_bar(pane_grid::TitleBar::new(header).padding([0, 6]).style(style::panel_header))
-                .style(style::panel)
+            let header = column![container(header).padding([0, 6]), widgets::divider()];
+            pane_grid::Content::new(container(body).width(Fill).height(Fill)).title_bar(pane_grid::TitleBar::new(header).style(style::panel_header)).style(style::panel)
         })
-        .spacing(5)
+        // One-pixel gaps show the window color: thin, solid separators between panels.
+        .spacing(1)
         .min_size(160)
         .on_resize(10, Message::PaneResized)
         .style(|_| pane_grid::Style {
-            hovered_region: pane_grid::Highlight { background: ACCENT_SOFT.into(), border: iced::Border { color: ACCENT, width: 1.0, radius: R_LG.into() } },
+            hovered_region: pane_grid::Highlight { background: ACCENT_SOFT.into(), border: iced::Border { color: ACCENT, width: 1.0, radius: 0.0.into() } },
             picked_split: pane_grid::Line { color: ACCENT, width: 2.0 },
-            hovered_split: pane_grid::Line { color: Color { a: 0.55, ..ACCENT }, width: 2.0 },
+            hovered_split: pane_grid::Line { color: Color { a: 0.6, ..ACCENT }, width: 2.0 },
         });
-        let body = container(grid).padding(5).width(Fill).height(Fill);
+        let body = container(grid).width(Fill).height(Fill).style(style::workspace);
         let mut layers: Vec<Element<'_, Message>> = vec![body.into()];
         if let Some((msg, error, _)) = &self.toast {
             let toast = container(
@@ -1105,8 +1188,11 @@ impl Editor {
     fn preview(&self) -> Element<'_, Message> {
         let (cw, ch) = self.doc.project.canvas.size();
         let stage = responsive(move |size: Size| {
-            let fit = (size.width / cw as f32).min(size.height / ch as f32);
+            // A little room around the canvas so selection handles stay reachable at its edges.
+            const ROOM: f32 = 14.0;
+            let fit = ((size.width - ROOM * 2.0) / cw as f32).min((size.height - ROOM * 2.0) / ch as f32).max(0.01);
             let (w, h) = ((cw as f32 * fit).floor(), (ch as f32 * fit).floor());
+            let origin = iced::Vector::new(((size.width - w) / 2.0).floor(), ((size.height - h) / 2.0).floor());
             // Decode a little above the on-screen size so high-DPI screens stay sharp.
             self.frames.set_preview_width(w * 1.5);
             let project = &self.doc.project;
@@ -1125,33 +1211,32 @@ impl Editor {
                 None => project,
             };
             let scene = std::sync::Arc::new(scene::evaluate(shown, self.playhead, (cw, ch), &self.frames.bind(project), self.playing.is_some()));
-            let overlay = canvas_overlay::Overlay { project, scene: scene.clone(), selection: &self.selection, zoom_edit: editing };
-            let canvas = stack![
-                iced::widget::shader(preview::Preview { scene }).width(w).height(h),
-                iced::widget::canvas(overlay).width(w).height(h),
-            ];
-            let frame = container(canvas).style(|_| container::Style {
-                border: iced::Border { color: LINE, width: 1.0, radius: 2.0.into() },
-                shadow: iced::Shadow { color: Color { a: 0.5, ..Color::BLACK }, offset: iced::Vector::new(0.0, 6.0), blur_radius: 24.0 },
-                ..Default::default()
-            });
-            container(frame).center(Fill).into()
+            // The overlay spans the whole stage, so handles keep working past the canvas edge.
+            let overlay = canvas_overlay::Overlay { project, scene: scene.clone(), selection: &self.selection, zoom_edit: editing, origin, display: Size::new(w, h) };
+            let canvas = iced::widget::shader(preview::Preview { scene }).width(w).height(h);
+            let frame = container(canvas).padding(1).style(|_| container::Style { border: iced::Border { color: LINE_STRONG, width: 1.0, radius: 0.0.into() }, ..Default::default() });
+            stack![container(frame).center(Fill), iced::widget::canvas(overlay).width(Fill).height(Fill)].into()
         });
         let duration = self.doc.project.duration();
-        let transport = row![
-            text(fmt_timecode_frames(self.playhead, self.doc.project.canvas.fps)).font(INTER_MEDIUM).size(T_BODY),
-            text(format!(" / {}", fmt_timecode(duration))).size(T_BODY).color(TEXT_4),
-            space().width(Fill),
+        let fps = self.doc.project.canvas.fps;
+        // Three fixed zones: the controls in the middle never move while the time ticks.
+        let time = row![tabular(&fmt_timecode_frames(self.playhead, fps), TEXT_1), text("  /  ").size(T_SMALL).color(TEXT_4), tabular(&fmt_timecode(duration), TEXT_3)].align_y(Alignment::Center);
+        let controls = row![
             widgets::tip(widgets::icon_button(code::SKIP_BACK, Some(Message::GoStart)), "Go to start", Some("Home"), tip_pos()),
             widgets::tip(play_button(self.playing.is_some()), if self.playing.is_some() { "Pause" } else { "Play" }, Some("Space"), tip_pos()),
             widgets::tip(widgets::icon_button(code::SKIP_FORWARD, Some(Message::GoEnd)), "Go to end", Some("End"), tip_pos()),
-            space().width(Fill),
-            widgets::tip(widgets::icon_toggle(if self.muted { code::VOLUME_X } else { code::VOLUME_2 }, self.muted, Message::ToggleMute), if self.muted { "Unmute preview" } else { "Mute preview" }, Some("M"), tip_pos()),
-            widgets::tip(widgets::icon_button(code::MAXIMIZE_2, None), "Full screen", Some("F"), tip_pos()),
         ]
-        .spacing(4)
+        .spacing(6)
         .align_y(Alignment::Center);
-        column![container(stage).padding([10, 14]).height(Fill), container(transport).padding([6, 12])].into()
+        let tools = row![
+            text(self.doc.project.canvas.summary()).size(T_CAPTION).color(TEXT_4),
+            widgets::tip(widgets::icon_toggle(if self.muted { code::VOLUME_X } else { code::VOLUME_2 }, self.muted, Message::ToggleMute), if self.muted { "Unmute preview" } else { "Mute preview" }, Some("M"), tip_pos()),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        let transport = row![container(time).width(Fill), controls, container(tools).width(Fill).align_right(Fill)].align_y(Alignment::Center);
+        let bar = column![widgets::divider(), container(transport).padding([7, 12]).style(style::panel)];
+        column![container(stage).height(Fill), bar].into()
     }
 
     fn inspector(&self) -> Element<'_, Message> {
@@ -1188,17 +1273,19 @@ impl Editor {
     }
 
     fn timeline_header(&self) -> Element<'_, Message> {
+        let range_label = match (self.range_anchor, self.range) {
+            (Some(_), _) => "Set B",
+            _ => "Range",
+        };
         let tools = row![
-            widgets::tip(widgets::icon_toggle(code::MOUSE_POINTER_2, self.tool == Tool::Select, Message::Tool(Tool::Select)), "Select", Some("V"), tip_pos()),
-            widgets::tip(widgets::icon_toggle(code::SCISSORS, self.tool == Tool::Blade, Message::Tool(Tool::Blade)), "Blade — click a clip to split", Some("B"), tip_pos()),
-            widgets::tip(widgets::icon_toggle(code::SQUARE_DASHED, self.tool == Tool::Range, Message::Tool(Tool::Range)), "Range — select a part to animate", Some("R"), tip_pos()),
+            widgets::tip(labeled_tool(code::SCISSORS, "Split", false, Message::SplitAtPlayhead), "Split at the playhead", Some("S"), tip_pos()),
+            widgets::tip(labeled_tool(code::SQUARE_DASHED, range_label, self.range_anchor.is_some() || self.range.is_some(), Message::MarkRange), "Mark A, move the playhead, mark B", Some("R  ·  I / O"), tip_pos()),
+            widgets::tip(labeled_tool(code::ZOOM_IN, "Zoom", self.zoom_edit.is_some(), Message::AddZoomAtPlayhead), "Add a zoom or pan at the playhead", Some("Z"), tip_pos()),
             container(widgets::vdivider(16.0)).padding([0, 4]),
-            widgets::tip(widgets::icon_button(code::SPLIT, Some(Message::SplitAtPlayhead)), "Split at playhead", Some("S"), tip_pos()),
-            widgets::tip(widgets::icon_button(code::TRASH_2, (!self.selection.is_empty()).then_some(Message::DeleteSelection)), "Delete", Some("Del"), tip_pos()),
-            container(widgets::vdivider(16.0)).padding([0, 4]),
+            widgets::tip(widgets::icon_button(code::TRASH_2, (!self.selection.is_empty() || self.zoom_edit.is_some()).then_some(Message::DeleteSelection)), "Delete", Some("Del"), tip_pos()),
             widgets::tip(widgets::icon_toggle(code::MAGNET, self.snapping, Message::ToggleSnapping), "Snapping", Some("N"), tip_pos()),
         ]
-        .spacing(2)
+        .spacing(4)
         .align_y(Alignment::Center);
         let zoom = row![
             widgets::tip(widgets::icon_button(code::ZOOM_OUT, Some(Message::ZoomBy(1.0 / 1.4))), "Zoom out", Some("−"), tip_pos()),
@@ -1206,7 +1293,7 @@ impl Editor {
             widgets::tip(widgets::icon_button(code::ZOOM_IN, Some(Message::ZoomBy(1.4))), "Zoom in", Some("+"), tip_pos()),
         ]
         .spacing(2);
-        header_row(row![text("Timeline").font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_2), container(tools).padding([0, 10])].align_y(Alignment::Center).into(), zoom.into())
+        header_row(row![text("Timeline").font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_2), container(tools).padding([0, 12])].align_y(Alignment::Center).into(), zoom.into())
     }
 
     fn timeline(&self) -> Element<'_, Message> {
@@ -1218,7 +1305,7 @@ impl Editor {
             let add = DropDownless::add_track_button(project);
             let ruler = row![
                 container(add).width(HEADER_W).height(RULER_H).padding([0, 8]).center_y(RULER_H),
-                iced::widget::canvas(Ruler { view: self.view, playhead: self.playhead, range: self.range }).width(Fill).height(RULER_H),
+                iced::widget::canvas(Ruler { view: self.view, playhead: self.playhead, range: self.range, anchor: self.range_anchor }).width(Fill).height(RULER_H),
             ];
             let lanes = Lanes {
                 project,
@@ -1226,8 +1313,8 @@ impl Editor {
                 selection: &self.selection,
                 playhead: self.playhead,
                 view: self.view,
-                tool: self.tool,
                 snapping: self.snapping,
+                zoom_edit: self.zoom_edit,
                 range: self.range,
                 dnd: self.dnd,
                 cache: &self.lanes_cache,
@@ -1375,17 +1462,18 @@ fn editor_event(event: Event, status: event::Status, _window: window::Id) -> Opt
                 Key::Character("y") if cmd => Some(Message::Redo),
                 Key::Character("d") if cmd => Some(Message::DuplicateSelection),
                 Key::Character("i") if cmd => Some(Message::Import),
-                Key::Character("b") if cmd => Some(Message::SplitAtPlayhead),
+                Key::Character("b") => Some(Message::SplitAtPlayhead),
                 Key::Character("s") if !cmd => Some(Message::SplitAtPlayhead),
-                Key::Character("v") if !cmd => Some(Message::Tool(Tool::Select)),
-                Key::Character("b") => Some(Message::Tool(Tool::Blade)),
-                Key::Character("r") if !cmd => Some(Message::Tool(Tool::Range)),
+                Key::Character("r") if !cmd => Some(Message::MarkRange),
+                Key::Character("i") if !cmd => Some(Message::MarkIn),
+                Key::Character("o") if !cmd => Some(Message::MarkOut),
                 Key::Character("n") if !cmd => Some(Message::ToggleSnapping),
                 Key::Character("t") if !cmd => Some(Message::AddText),
                 Key::Character("m") if !cmd => Some(Message::ToggleMute),
                 Key::Character("=" | "+") => Some(Message::ZoomBy(1.4)),
                 Key::Character("-") => Some(Message::ZoomBy(1.0 / 1.4)),
                 Key::Character("Z") | Key::Character("z") if modifiers.shift() => Some(Message::ZoomFit),
+                Key::Character("z") if !cmd => Some(Message::AddZoomAtPlayhead),
                 _ => None,
             }
         }
@@ -1397,16 +1485,13 @@ fn tip_pos() -> iced::widget::tooltip::Position {
     iced::widget::tooltip::Position::Top
 }
 
-fn pane_title<'a>(title: &'a str, detail: Option<String>) -> Element<'a, Message> {
-    let mut r = row![text(title).font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_2)].spacing(S2).align_y(Alignment::Center);
-    if let Some(d) = detail {
-        r = r.push(text(d).size(T_CAPTION).color(TEXT_4));
-    }
-    container(r).height(38).padding([0, 8]).center_y(38).into()
-}
-
 fn header_row<'a>(left: Element<'a, Message>, right: Element<'a, Message>) -> Element<'a, Message> {
     container(row![left, space().width(Fill), right].align_y(Alignment::Center)).height(38).padding([0, 2]).center_y(38).into()
+}
+
+/// A toolbar button with an icon and a short label.
+fn labeled_tool<'a>(glyph: char, label: &'a str, active: bool, on_press: Message) -> Element<'a, Message> {
+    button(row![icon(glyph, 13), text(label).font(INTER_MEDIUM).size(T_SMALL)].spacing(6).align_y(Alignment::Center)).padding([5, 9]).style(style::toggle(active)).on_press(on_press).into()
 }
 
 fn tab<'a>(label: &'a str, active: bool, on_press: Message) -> Element<'a, Message> {
@@ -1420,6 +1505,15 @@ fn tab_icon<'a>(glyph: char, label: &'a str, active: bool, on_press: Message) ->
 
 fn play_button<'a>(playing: bool) -> Element<'a, Message> {
     button(container(icon(if playing { code::PAUSE } else { code::PLAY }, 15)).center(Length::Fill)).width(38).height(38).padding(0).style(style::primary).on_press(Message::TogglePlay).into()
+}
+
+/// Text with every digit in a fixed-width cell, so changing numbers don't jiggle.
+fn tabular<'a>(s: &str, color: Color) -> Element<'a, Message> {
+    row(s.chars().map(|c| {
+        let w = if c.is_ascii_digit() { 8.2 } else { 5.0 };
+        container(text(c.to_string()).font(INTER_MEDIUM).size(T_BODY).color(color)).width(w).center_x(w).into()
+    }))
+    .into()
 }
 
 pub fn fmt_timecode(t: f64) -> String {
