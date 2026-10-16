@@ -1,0 +1,18 @@
+[package]
+name = "iced-ui-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone prototype: not part of the editor's build.
+[workspace]
+
+[dependencies]
+iced = { version = "0.14", features = ["advanced", "canvas", "image", "tokio", "wgpu"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
