@@ -710,6 +710,19 @@ impl Lanes<'_> {
             }
         }
 
+        // Transition into the clip: a soft wedge at its start.
+        if let Some(tr) = clip.transition {
+            let tw = ((tr.duration * self.view.zoom) as f32).clamp(6.0, r.width);
+            let wedge = Path::new(|b| {
+                b.move_to(Point::new(r.x, r.y));
+                b.line_to(Point::new(r.x + tw, r.y));
+                b.line_to(Point::new(r.x, r.y + r.height));
+                b.close();
+            });
+            f.fill(&wedge, Color { a: 0.35, ..Color::WHITE });
+            f.stroke(&Path::line(Point::new(r.x + tw, r.y), Point::new(r.x, r.y + r.height)), Stroke::default().with_color(Color { a: 0.8, ..Color::WHITE }).with_width(1.0));
+        }
+
         // Zoom regions as pills along the bottom.
         for z in &clip.zooms {
             let zx = self.view.x(clip.start + z.at);

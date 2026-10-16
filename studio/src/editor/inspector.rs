@@ -7,7 +7,7 @@ use iced::{Alignment, Color, Element, Fill, Length};
 
 use super::Message;
 use super::timeline::clip_label;
-use crate::clip::{Align, Clip, Content, Fit, MotionKind, Rgba};
+use crate::clip::{Align, Clip, Content, Fit, MotionKind, Rgba, TransitionKind};
 use crate::model::{Id, MediaKind, Project};
 use crate::ui::icons::{code, icon, tinted};
 use crate::ui::tokens::*;
@@ -49,6 +49,10 @@ pub enum Edit {
     TextBox(bool),
     Intro(Option<MotionKind>),
     Outro(Option<MotionKind>),
+    IntroDuration(f64),
+    OutroDuration(f64),
+    Transition(Option<TransitionKind>),
+    TransitionDuration(f64),
     AddZoom,
     RemoveZoom(Id),
     ZoomScale(Id, f64),
@@ -77,7 +81,8 @@ impl Edit {
             Edit::Speed(_) => ("speed", "Speed"),
             Edit::Text(_) => ("text", "Edit text"),
             Edit::Font(_) | Edit::FontSize(_) | Edit::Weight(_) | Edit::TextColor(_) | Edit::Align(_) | Edit::TextBox(_) => ("text-style", "Text style"),
-            Edit::Intro(_) | Edit::Outro(_) => ("motion", "Animation"),
+            Edit::Intro(_) | Edit::Outro(_) | Edit::IntroDuration(_) | Edit::OutroDuration(_) => ("motion", "Animation"),
+            Edit::Transition(_) | Edit::TransitionDuration(_) => ("transition", "Transition"),
             Edit::AddZoom => ("add-zoom", "Add zoom"),
             Edit::RemoveZoom(_) => ("remove-zoom", "Remove zoom"),
             Edit::ZoomScale(..) | Edit::ZoomFocusX(..) | Edit::ZoomFocusY(..) => ("zoom", "Zoom"),
@@ -116,6 +121,22 @@ impl Edit {
             Edit::FadeOut(v) => c.audio.fade_out = v,
             Edit::Intro(k) => c.intro = k.map(|kind| crate::clip::Motion { kind, duration: c.intro.map(|m| m.duration).unwrap_or(0.6) }),
             Edit::Outro(k) => c.outro = k.map(|kind| crate::clip::Motion { kind, duration: c.outro.map(|m| m.duration).unwrap_or(0.6) }),
+            Edit::IntroDuration(d) => {
+                if let Some(m) = &mut c.intro {
+                    m.duration = d;
+                }
+            }
+            Edit::OutroDuration(d) => {
+                if let Some(m) = &mut c.outro {
+                    m.duration = d;
+                }
+            }
+            Edit::Transition(k) => c.transition = k.map(|kind| crate::clip::Transition { kind, duration: c.transition.map(|t| t.duration).unwrap_or(0.6) }),
+            Edit::TransitionDuration(d) => {
+                if let Some(t) = &mut c.transition {
+                    t.duration = d;
+                }
+            }
             Edit::RemoveZoom(id) => c.zooms.retain(|z| z.id != id),
             Edit::ZoomScale(id, v) => c.zooms.iter_mut().filter(|z| z.id == id).for_each(|z| z.scale = v),
             Edit::ZoomFocusX(id, v) => c.zooms.iter_mut().filter(|z| z.id == id).for_each(|z| z.focus_x = v),
@@ -159,6 +180,33 @@ impl std::fmt::Display for MotionChoice {
         })
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransitionChoice(Option<TransitionKind>);
+
+impl std::fmt::Display for TransitionChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            None => "None",
+            Some(TransitionKind::Crossfade) => "Crossfade",
+            Some(TransitionKind::SlideLeft) => "Slide",
+            Some(TransitionKind::SlideUp) => "Slide up",
+            Some(TransitionKind::Push) => "Push",
+            Some(TransitionKind::ZoomThrough) => "Zoom through",
+            Some(TransitionKind::Wipe) => "Wipe",
+        })
+    }
+}
+
+const TRANSITIONS: [TransitionChoice; 7] = [
+    TransitionChoice(None),
+    TransitionChoice(Some(TransitionKind::Crossfade)),
+    TransitionChoice(Some(TransitionKind::SlideLeft)),
+    TransitionChoice(Some(TransitionKind::SlideUp)),
+    TransitionChoice(Some(TransitionKind::Push)),
+    TransitionChoice(Some(TransitionKind::ZoomThrough)),
+    TransitionChoice(Some(TransitionKind::Wipe)),
+];
 
 const MOTIONS: [MotionChoice; 8] = [
     MotionChoice(None),
@@ -310,16 +358,28 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip) -> Element<'a, Message> {
                 .style(style::select)
                 .menu_style(style::select_menu)
         };
-        col = col.push(section(
-            code::SPARKLES,
-            "Animation",
-            column![
-                row![text("In").size(T_SMALL).color(TEXT_2).width(84), motion_pick(clip.intro.map(|m| m.kind), Edit::Intro)].align_y(Alignment::Center),
-                row![text("Out").size(T_SMALL).color(TEXT_2).width(84), motion_pick(clip.outro.map(|m| m.kind), Edit::Outro)].align_y(Alignment::Center),
-            ]
-            .spacing(S3)
-            .into(),
-        ));
+        let max_motion = (clip.duration / 2.0).max(0.1);
+        let mut anim = column![row![text("In").size(T_SMALL).color(TEXT_2).width(84), motion_pick(clip.intro.map(|m| m.kind), Edit::Intro)].align_y(Alignment::Center)].spacing(S3);
+        if let Some(m) = clip.intro {
+            anim = anim.push(slider_row("Duration", m.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::IntroDuration(v))));
+        }
+        anim = anim.push(row![text("Out").size(T_SMALL).color(TEXT_2).width(84), motion_pick(clip.outro.map(|m| m.kind), Edit::Outro)].align_y(Alignment::Center));
+        if let Some(m) = clip.outro {
+            anim = anim.push(slider_row("Duration", m.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::OutroDuration(v))));
+        }
+        col = col.push(section(code::SPARKLES, "Animation", anim.into()));
+
+        let transition_pick = pick_list(&TRANSITIONS[..], Some(TransitionChoice(clip.transition.map(|t| t.kind))), move |t: TransitionChoice| e(Edit::Transition(t.0)))
+            .padding([6, 9])
+            .text_size(T_BODY)
+            .width(Fill)
+            .style(style::select)
+            .menu_style(style::select_menu);
+        let mut trans = column![row![text("Style").size(T_SMALL).color(TEXT_2).width(84), transition_pick].align_y(Alignment::Center)].spacing(S3);
+        if let Some(t) = clip.transition {
+            trans = trans.push(slider_row("Duration", t.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::TransitionDuration(v))));
+        }
+        col = col.push(section(code::BLEND, "Transition in", trans.into()));
     }
 
     if is_video || kind == Some(MediaKind::Image) {

@@ -14,6 +14,7 @@ mod platform;
 mod playback;
 mod render;
 mod settings;
+mod sfx;
 mod start;
 mod ui;
 

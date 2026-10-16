@@ -2,6 +2,7 @@
 
 pub mod export_dialog;
 pub mod inspector;
+mod library;
 pub mod media_cache;
 pub mod preview;
 pub mod timeline;
@@ -11,7 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use iced::keyboard::{self, Key, key};
-use iced::widget::{button, column, container, image, mouse_area, pane_grid, responsive, row, space, stack, text, text_input};
+use iced::widget::{button, column, container, mouse_area, pane_grid, responsive, row, space, stack, text, text_input};
 use iced::{Alignment, Color, Element, Event, Fill, Length, Point, Size, Subscription, Task, event, mouse, window};
 use iced_aw::ContextMenu;
 
@@ -124,6 +125,13 @@ pub enum Message {
     Tick(Instant),
     AddText,
     AddShape,
+    ApplyTransition(crate::clip::TransitionKind),
+    ApplyMotion { intro: bool, kind: crate::clip::MotionKind },
+    AddSound(&'static str),
+    SoundReady(&'static str, Result<(PathBuf, ProbeInfo), String>),
+    PreviewSound(&'static str),
+    SoundPreviewReady(&'static str, Result<(PathBuf, ProbeInfo), String>),
+    SoundPreviewTick,
     Track(Id, TrackAction),
     RenameInput(String),
     RenameCommit,
@@ -176,6 +184,7 @@ pub struct Editor {
     audio: Option<crate::playback::AudioPlayer>,
     audio_revision: u64,
     muted: bool,
+    sound_preview: Option<(&'static str, crate::playback::AudioPlayer, Instant)>,
 }
 
 impl Editor {
@@ -225,6 +234,7 @@ impl Editor {
             audio: None,
             audio_revision: 0,
             muted: false,
+            sound_preview: None,
         }
     }
 
@@ -262,6 +272,9 @@ impl Editor {
         }
         if self.toast.is_some() {
             subs.push(iced::time::every(Duration::from_millis(500)).map(|_| Message::DismissToast));
+        }
+        if self.sound_preview.is_some() {
+            subs.push(iced::time::every(Duration::from_millis(250)).map(|_| Message::SoundPreviewTick));
         }
         Subscription::batch(subs)
     }
@@ -304,6 +317,7 @@ impl Editor {
 
     /// (Re)starts playback from the playhead, with audio if there is any.
     fn start_playback(&mut self) {
+        self.sound_preview = None;
         self.playing = Some((Instant::now(), self.playhead));
         self.audio = crate::playback::AudioPlayer::start(&self.doc.project, self.playhead, self.muted).ok();
         self.audio_revision = self.doc.revision;
@@ -628,6 +642,63 @@ impl Editor {
                     self.side_tab = SideTab::Inspector;
                 }
             }
+            Message::ApplyTransition(kind) => {
+                let ids = self.selection.clone();
+                self.edit("Add transition", |p| {
+                    for id in &ids {
+                        let c = p.clip_mut(*id)?;
+                        c.transition = Some(crate::clip::Transition { kind, duration: c.transition.map(|t| t.duration).unwrap_or(0.6).min(c.duration / 2.0) });
+                    }
+                    Ok(())
+                });
+            }
+            Message::ApplyMotion { intro, kind } => {
+                let ids = self.selection.clone();
+                self.edit(if intro { "Animate in" } else { "Animate out" }, |p| {
+                    for id in &ids {
+                        let c = p.clip_mut(*id)?;
+                        let slot = if intro { &mut c.intro } else { &mut c.outro };
+                        *slot = Some(crate::clip::Motion { kind, duration: slot.map(|m| m.duration).unwrap_or(0.6).min(c.duration / 2.0) });
+                    }
+                    Ok(())
+                });
+            }
+            Message::AddSound(id) => return sound_task(id, Message::SoundReady),
+            Message::SoundReady(_, Err(e)) | Message::SoundPreviewReady(_, Err(e)) => self.notify(e, true),
+            Message::SoundReady(id, Ok((path, info))) => {
+                let at = self.playhead;
+                let name = crate::sfx::SOUNDS.iter().find(|s| s.id == id).map(|s| s.name).unwrap_or("Sound");
+                if let Some(clip) = self.edit(&format!("Add {name}"), |p| {
+                    let asset = p.add_asset(&path, &info);
+                    if let Some(a) = p.assets.iter_mut().find(|a| a.id == asset) {
+                        a.name = name.to_string();
+                    }
+                    p.add_media_clip(asset, None, at)
+                }) {
+                    self.selection = vec![clip];
+                    let assets = self.doc.project.assets.clone();
+                    return self.media.ensure(&assets, Message::MediaLoaded);
+                }
+            }
+            Message::PreviewSound(id) => {
+                if self.sound_preview.as_ref().is_some_and(|(s, _, _)| *s == id) {
+                    self.sound_preview = None;
+                } else {
+                    return sound_task(id, Message::SoundPreviewReady);
+                }
+            }
+            Message::SoundPreviewReady(id, Ok((path, info))) => {
+                let mut p = Project::new("preview", self.doc.project.canvas);
+                let asset = p.add_asset(&path, &info);
+                if p.add_media_clip(asset, None, 0.0).is_ok() {
+                    self.sound_preview = crate::playback::AudioPlayer::start(&p, 0.0, false).ok().map(|a| (id, a, Instant::now() + Duration::from_secs_f64(info.duration + 0.3)));
+                }
+            }
+            Message::SoundPreviewTick => {
+                if self.sound_preview.as_ref().is_some_and(|(_, _, until)| Instant::now() > *until) {
+                    self.sound_preview = None;
+                }
+            }
             Message::Track(id, action) => self.track_action(id, action),
             Message::RenameInput(s) => {
                 if let Some((_, name)) = &mut self.renaming {
@@ -901,134 +972,6 @@ impl Editor {
         header_row(tabs.into(), space().into())
     }
 
-    fn library(&self) -> Element<'_, Message> {
-        match self.library_tab {
-            LibraryTab::Media => self.media_library(),
-            LibraryTab::Text => {
-                let card = |title: &'static str, sub: &'static str, font: iced::Font, size: f32| {
-                    button(column![text(title).font(font).size(size), text(sub).size(T_CAPTION).color(TEXT_3)].spacing(4))
-                        .width(Fill)
-                        .padding([12, 12])
-                        .style(style::choice_card(false))
-                        .on_press(Message::AddText)
-                };
-                widgets::scroll(
-                    column![
-                        widgets::section("Add text"),
-                        card("Headline", "Big bold title", INTER_BOLD, 20.0),
-                        card("Subtitle", "Supporting line", INTER_MEDIUM, 15.0),
-                        card("শিরোনাম", "Bangla headline · Hind Siliguri", HIND_SEMIBOLD, 19.0),
-                        text("Click to add at the playhead. Press T anytime.").size(T_CAPTION).color(TEXT_4),
-                        space().height(6),
-                        widgets::section("Shapes"),
-                        button(row![container(space().width(36).height(22)).style(|_| container::Style {
-                            background: Some(style::brand_gradient()),
-                            border: iced::Border { radius: 6.0.into(), ..Default::default() },
-                            ..Default::default()
-                        }), column![text("Gradient card").font(INTER_SEMIBOLD).size(T_BODY), text("Rounded rectangle for callouts").size(T_CAPTION).color(TEXT_3)].spacing(2)].spacing(S3).align_y(Alignment::Center))
-                            .width(Fill)
-                            .padding([10, 12])
-                            .style(style::choice_card(false))
-                            .on_press(Message::AddShape),
-                    ]
-                    .spacing(S2)
-                    .padding([8, 10]),
-                )
-                .height(Fill)
-                .into()
-            }
-            LibraryTab::Transitions => widgets::empty_state(code::BLEND, "Effects & transitions", "Fades, slides, zooms and animated reveals — next up in the motion engine.", None),
-            LibraryTab::Sounds => widgets::empty_state(code::AUDIO_WAVEFORM, "Sound effects", "Whooshes, pops, clicks and risers you can drag onto the timeline.", None),
-        }
-    }
-
-    fn media_library(&self) -> Element<'_, Message> {
-        let project = &self.doc.project;
-        if project.assets.is_empty() && self.importing.is_empty() {
-            return widgets::empty_state(
-                code::UPLOAD,
-                "Bring in your media",
-                "Drop screen recordings, face-cam videos, voiceovers, images or logos here.",
-                Some(widgets::primary_button(Some(code::PLUS), "Import media", Some(Message::Import)).into()),
-            );
-        }
-        let mut cards: Vec<Element<'_, Message>> = project.assets.iter().map(|a| self.media_card(a)).collect();
-        for path in &self.importing {
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            cards.push(
-                container(
-                    column![
-                        container(iced_aw::Spinner::new().width(Length::Fixed(20.0)).height(Length::Fixed(20.0)).circle_radius(2.0)).center_x(Fill).height(76).align_y(Alignment::Center).style(style::inset),
-                        text(name).size(T_CAPTION).color(TEXT_3).wrapping(text::Wrapping::None),
-                    ]
-                    .spacing(6),
-                )
-                .padding(6)
-                .into(),
-            );
-        }
-        let grid = iced::widget::grid(cards).fluid(190).spacing(6).height(iced::widget::grid::Sizing::EvenlyDistribute(Length::Shrink));
-        widgets::scroll(container(grid).padding([6, 8])).height(Fill).into()
-    }
-
-    fn media_card<'a>(&'a self, a: &'a crate::model::Asset) -> Element<'a, Message> {
-        let selected = self.library_selected == Some(a.id);
-        let thumb: Element<'a, Message> = match self.media.get(a.id).and_then(|m| m.cover.clone()) {
-            Some(h) => image(h).width(Fill).height(76).content_fit(iced::ContentFit::Cover).border_radius(6.0).into(),
-            None => {
-                let glyph = match a.kind {
-                    MediaKind::Audio => code::AUDIO_WAVEFORM,
-                    MediaKind::Image => code::IMAGE,
-                    MediaKind::Video => code::FILM,
-                };
-                let color = if a.kind == MediaKind::Audio { clip::AUDIO } else { TEXT_3 };
-                container(tinted(glyph, 22, color)).center_x(Fill).height(76).align_y(Alignment::Center).style(style::inset).into()
-            }
-        };
-        let badge = if a.kind == MediaKind::Image { "IMG".to_string() } else { fmt_duration(a.duration) };
-        let thumb = stack![
-            thumb,
-            container(container(text(badge).font(INTER_SEMIBOLD).size(10)).padding([1, 5]).style(|_| container::Style {
-                background: Some(Color { a: 0.7, ..Color::BLACK }.into()),
-                text_color: Some(Color::WHITE),
-                border: iced::Border { radius: 4.0.into(), ..Default::default() },
-                ..Default::default()
-            }))
-            .align_right(Fill)
-            .align_bottom(76)
-            .padding(5),
-        ];
-        let name_font = if a.name.is_ascii() { INTER_MEDIUM } else { HIND };
-        let card = container(column![thumb, text(&a.name).font(name_font).size(T_CAPTION).wrapping(text::Wrapping::None)].spacing(6))
-            .padding(5)
-            .width(Fill)
-            .style(move |t| {
-                let mut s = style::card(t);
-                if selected {
-                    s.border = iced::Border { color: ACCENT, width: 1.5, radius: R_LG.into() };
-                    s.background = Some(Color { a: 0.08, ..ACCENT }.into());
-                } else {
-                    s.background = None;
-                    s.border.color = Color::TRANSPARENT;
-                }
-                s
-            });
-        let id = a.id;
-        let area = mouse_area(card).on_press(Message::LibraryPress(id)).on_double_click(Message::LibraryAdd(id)).interaction(mouse::Interaction::Grab);
-        ContextMenu::new(area, move || {
-            widgets::menu(
-                vec![
-                    MenuItem::new(code::PLUS, "Add to timeline", Message::LibraryAdd(id)).shortcut("Double-click"),
-                    MenuItem::Separator,
-                    MenuItem::new(code::TRASH_2, "Remove from project", Message::LibraryRemove(id)).danger(),
-                ],
-                220.0,
-            )
-        })
-        .style(|_, _| iced_aw::style::context_menu::Style { background: Color::TRANSPARENT.into() })
-        .into()
-    }
-
     fn preview(&self) -> Element<'_, Message> {
         let (cw, ch) = self.doc.project.canvas.size();
         let stage = responsive(move |size: Size| {
@@ -1223,6 +1166,22 @@ impl Editor {
         }
         col.into()
     }
+}
+
+/// Synthesizes (if needed) and probes a built-in sound in the background.
+fn sound_task(id: &'static str, done: fn(&'static str, Result<(PathBuf, ProbeInfo), String>) -> Message) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let path = crate::sfx::path(id).map_err(|e| e.to_string())?;
+                let info = media::probe(&path).map_err(|e| e.to_string())?;
+                Ok((path, info))
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        },
+        move |r| done(id, r),
+    )
 }
 
 /// Track creation button above the headers.
