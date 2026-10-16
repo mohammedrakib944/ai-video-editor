@@ -149,6 +149,12 @@ pub fn schemas() -> Vec<Value> {
             &["clip_id", "property", "keys"],
         ),
         tool("clear_keyframes", "Remove keyframes from a clip (one property, or all).", json!({ "clip_id": int(""), "property": choice(PROPS, "Optional") }), &["clip_id"]),
+        tool(
+            "set_range_volume",
+            "Change the volume of only part of a clip (e.g. duck music under speech, or mute a cough). Other parts are unchanged. Volume 1 removes the change.",
+            json!({ "clip_id": int(""), "start": num("Timeline seconds"), "end": num("Timeline seconds"), "volume": num("0 = silent, 0.3 = ducked, 1 = original, up to 2") }),
+            &["clip_id", "start", "end", "volume"],
+        ),
         tool("add_sound", "Add a built-in sound effect on an audio track. Sounds: whoosh, swoosh, pop, click, ding, riser, impact, typing, chime.", json!({ "sound": choice(&["whoosh", "swoosh", "pop", "click", "ding", "riser", "impact", "typing", "chime"], ""), "start": num("Timeline seconds"), "volume": num("0–2, default 1") }), &["sound", "start"]),
         tool("add_track", "Add a track.", json!({ "kind": choice(&["video", "audio"], ""), "name": string("") }), &["kind"]),
         tool("rename_track", "Rename a track.", json!({ "track_id": int(""), "name": string("") }), &["track_id", "name"]),
@@ -646,6 +652,11 @@ impl Editor {
                     Ok(())
                 })?;
                 Ok("Keyframes cleared".into())
+            })(),
+            "set_range_volume" => (|| {
+                let (clip, a0, b0, v) = (req_id(&a, "clip_id")?, req_f(&a, "start")?, req_f(&a, "end")?, req_f(&a, "volume")?);
+                self.ai_edit("Range volume", |p| p.set_range_volume(clip, a0, b0, v))?;
+                Ok(format!("Volume {:.0}% between {a0:.2}s and {b0:.2}s", v * 100.0))
             })(),
             "add_sound" => {
                 let sound = s(&a, "sound").unwrap_or("").to_string();

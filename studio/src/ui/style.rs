@@ -42,7 +42,7 @@ pub fn window_frame(rounded: bool) -> impl Fn(&Theme) -> container::Style {
 
 pub fn title_bar(rounded: bool) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style {
-        background: Some(SURFACE_1.into()),
+        background: Some(WINDOW.into()),
         border: Border {
             radius: if rounded { Radius { top_left: R_XL, top_right: R_XL, bottom_right: 0.0, bottom_left: 0.0 } } else { 0.0.into() },
             ..Default::default()
@@ -67,18 +67,28 @@ pub fn hairline(_: &Theme) -> container::Style {
     container::Style { background: Some(LINE.into()), ..Default::default() }
 }
 
+/// A block: matte dark gray with a faint top sheen, a quiet lighter border and soft corners.
 pub fn panel(_: &Theme) -> container::Style {
-    container::Style { background: Some(SURFACE_1.into()), ..Default::default() }
+    container::Style {
+        background: Some(vertical(hex_mix(SURFACE_1, Color::WHITE, 0.018), SURFACE_1)),
+        border: border(BLOCK_BORDER, 1.0, R_LG),
+        ..Default::default()
+    }
 }
 
-/// The workspace around the preview canvas.
+/// The preview block: darker inside, so the canvas stands out.
 pub fn workspace(_: &Theme) -> container::Style {
+    container::Style { background: Some(SURFACE_0.into()), border: border(BLOCK_BORDER, 1.0, R_LG), ..Default::default() }
+}
+
+/// The plain background the blocks sit on.
+pub fn backdrop(_: &Theme) -> container::Style {
     container::Style { background: Some(WINDOW.into()), ..Default::default() }
 }
 
 pub fn panel_header(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(SURFACE_1.into()),
+        background: None,
         text_color: Some(TEXT_2),
         ..Default::default()
     }
@@ -295,6 +305,16 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
         value: TEXT_1,
         selection: Color { a: 0.35, ..ACCENT },
     }
+}
+
+pub fn text_area(_: &Theme, status: w::text_editor::Status) -> w::text_editor::Style {
+    let (line, bg) = match status {
+        w::text_editor::Status::Focused { .. } => (LINE_FOCUS, SURFACE_0),
+        w::text_editor::Status::Hovered => (LINE_STRONG, SURFACE_0),
+        w::text_editor::Status::Disabled => (LINE, SURFACE_1),
+        w::text_editor::Status::Active => (LINE, SURFACE_0),
+    };
+    w::text_editor::Style { background: bg.into(), border: border(line, 1.0, R_MD), placeholder: TEXT_4, value: TEXT_1, selection: Color { a: 0.35, ..ACCENT } }
 }
 
 pub fn select(_: &Theme, status: pick_list::Status) -> pick_list::Style {

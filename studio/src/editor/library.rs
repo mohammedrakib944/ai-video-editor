@@ -89,12 +89,13 @@ impl Editor {
                 container(tinted(glyph, 22, color)).center_x(Fill).height(76).align_y(Alignment::Center).style(style::inset).into()
             }
         };
-        let badge = if a.kind == MediaKind::Image { "IMG".to_string() } else { fmt_duration(a.duration) };
+        let missing = self.missing.contains(&a.id);
+        let badge = if missing { "Missing".to_string() } else if a.kind == MediaKind::Image { "IMG".to_string() } else { fmt_duration(a.duration) };
         let thumb = stack![
             thumb,
-            container(container(text(badge).font(INTER_SEMIBOLD).size(10)).padding([1, 5]).style(|_| container::Style {
-                background: Some(Color { a: 0.7, ..Color::BLACK }.into()),
-                text_color: Some(Color::WHITE),
+            container(container(text(badge).font(INTER_SEMIBOLD).size(10)).padding([1, 5]).style(move |_| container::Style {
+                background: Some(if missing { DANGER } else { Color { a: 0.7, ..Color::BLACK } }.into()),
+                text_color: Some(if missing { ON_ACCENT } else { Color::WHITE }),
                 border: iced::Border { radius: 4.0.into(), ..Default::default() },
                 ..Default::default()
             }))
@@ -123,6 +124,7 @@ impl Editor {
             widgets::menu(
                 vec![
                     MenuItem::new(code::PLUS, "Add to timeline", Message::LibraryAdd(id)).shortcut("Double-click"),
+                    MenuItem::new(code::FOLDER_OPEN, if missing { "Locate file…" } else { "Replace file…" }, Message::Relink(id)),
                     MenuItem::Separator,
                     MenuItem::new(code::TRASH_2, "Remove from project", Message::LibraryRemove(id)).danger(),
                 ],

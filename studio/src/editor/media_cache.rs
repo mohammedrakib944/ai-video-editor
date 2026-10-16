@@ -55,6 +55,12 @@ impl MediaCache {
         Task::batch(tasks)
     }
 
+    /// Drops cached thumbnails so they're made again (after relinking).
+    pub fn forget(&mut self, id: Id) {
+        self.entries.remove(&id);
+        self.loading.retain(|&l| l != id);
+    }
+
     pub fn insert(&mut self, id: Id, media: AssetMedia) {
         self.loading.retain(|&l| l != id);
         self.entries.insert(id, media);

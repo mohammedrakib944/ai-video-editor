@@ -100,18 +100,46 @@ pub struct Grade {
     pub temperature: f64,
 }
 
+/// A volume change on part of a clip (from a range selection). Times are clip-relative.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Gain {
+    pub id: Id,
+    pub at: f64,
+    pub duration: f64,
+    /// Multiplies the clip volume inside the span (0 = silent).
+    pub volume: f64,
+}
+
+/// Length of the smooth ramp at each edge of a `Gain`, so changes don't click.
+pub const GAIN_RAMP: f64 = 0.06;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Audio {
     pub volume: f64,
     pub muted: bool,
     pub fade_in: f64,
     pub fade_out: f64,
+    pub gains: Vec<Gain>,
 }
 
 impl Default for Audio {
     fn default() -> Self {
-        Audio { volume: 1.0, muted: false, fade_in: 0.0, fade_out: 0.0 }
+        Audio { volume: 1.0, muted: false, fade_in: 0.0, fade_out: 0.0, gains: Vec::new() }
+    }
+}
+
+impl Audio {
+    /// The range-gain factor at clip-relative time `t` (1 outside every range).
+    pub fn gain_at(&self, t: f64) -> f64 {
+        self.gains
+            .iter()
+            .map(|g| {
+                let ramp = GAIN_RAMP.min(g.duration / 2.0).max(1e-4);
+                let k = ((t - g.at) / ramp).min((g.at + g.duration - t) / ramp).clamp(0.0, 1.0);
+                1.0 + (g.volume - 1.0) * k
+            })
+            .product()
     }
 }
 

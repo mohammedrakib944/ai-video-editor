@@ -151,6 +151,9 @@ pub struct Track {
     pub muted: bool,
     pub locked: bool,
     pub hidden: bool,
+    /// Lane height on the timeline, if the user resized it.
+    #[serde(default)]
+    pub height: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

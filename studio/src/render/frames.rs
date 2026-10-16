@@ -207,6 +207,14 @@ impl FrameServer {
         s.eof || s.frames.iter().any(|f| f.pts <= src_time + dur * 0.5 && f.pts + dur > src_time - dur * 0.5)
     }
 
+    /// Forgets decoded pixels of an asset whose file changed.
+    pub fn forget_asset(&self, asset: Id) {
+        self.images.lock().unwrap().remove(&asset);
+        self.images_loading.borrow_mut().remove(&asset);
+        // Decoders are per clip; drop them all so none keeps reading the old file.
+        self.decoders.borrow_mut().clear();
+    }
+
     /// Stops decoders for clips that haven't been shown for a while.
     pub fn collect_idle(&self) {
         self.decoders.borrow_mut().retain(|_, d| d.last_used.get().elapsed() < IDLE_DROP);

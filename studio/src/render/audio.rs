@@ -31,6 +31,9 @@ pub fn mix_graph(project: &Project, first_input: usize, total: f64) -> (Vec<Audi
         f.push_str(&atempo(speed));
         f.push_str(&format!(",atrim=0:{:.6},asetpts=PTS-STARTPTS", clip.duration));
         f.push_str(&format!(",volume={:.4}", clip.audio.volume));
+        if !clip.audio.gains.is_empty() {
+            f.push_str(&format!(",volume='{}':eval=frame", gain_expression(&clip.audio.gains)));
+        }
         if clip.audio.fade_in > 0.0 {
             f.push_str(&format!(",afade=t=in:st=0:d={:.4}", clip.audio.fade_in.min(clip.duration)));
         }
@@ -51,6 +54,18 @@ pub fn mix_graph(project: &Project, first_input: usize, total: f64) -> (Vec<Audi
         graph.push_str(&format!(";\n{labels}amix=inputs={n}:normalize=0:dropout_transition=0,apad,atrim=duration={total:.6}[aout]"));
     }
     (inputs, graph)
+}
+
+/// FFmpeg expression for the range gains, matching `Audio::gain_at` (t is clip-relative).
+fn gain_expression(gains: &[crate::clip::Gain]) -> String {
+    gains
+        .iter()
+        .map(|g| {
+            let ramp = crate::clip::GAIN_RAMP.min(g.duration / 2.0).max(1e-4);
+            format!("(1+({:.4}-1)*clip(min((t-{:.4})/{ramp:.4},({:.4}-t)/{ramp:.4}),0,1))", g.volume, g.at, g.at + g.duration)
+        })
+        .collect::<Vec<_>>()
+        .join("*")
 }
 
 /// `atempo` only accepts 0.5–2.0 per stage, so larger changes are chained.
@@ -81,6 +96,40 @@ mod tests {
         assert_eq!(atempo(1.0), "");
         assert_eq!(atempo(4.0), ",atempo=2.0,atempo=2.000000");
         assert_eq!(atempo(0.25), ",atempo=0.5,atempo=0.500000");
+    }
+
+    #[test]
+    fn range_volume_reaches_the_mix() {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!("studio-gain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        assert!(crate::ffmpeg::ffmpeg().unwrap().args(["-f", "lavfi", "-i", "sine=frequency=440:duration=3", "-y"]).arg(&tone).status().unwrap().success());
+        let mut p = Project::new("t", Default::default());
+        let a = p.add_asset(&tone, &crate::media::probe(&tone).unwrap());
+        let c = p.add_media_clip(a, None, 0.0).unwrap();
+        p.set_range_volume(c, 1.0, 2.0, 0.0).unwrap();
+        let (inputs, graph) = mix_graph(&p, 0, 3.0);
+        let script = dir.join("g.txt");
+        std::fs::write(&script, graph).unwrap();
+        let mut cmd = crate::ffmpeg::ffmpeg().unwrap();
+        for i in &inputs {
+            cmd.args(["-ss", &crate::ffmpeg::secs(i.seek), "-t", &crate::ffmpeg::secs(i.length), "-i"]).arg(&i.path);
+        }
+        cmd.arg(crate::ffmpeg::filter_script_option()).arg(&script).args(["-map", "[aout]", "-f", "f32le", "-ac", "1", "-ar", "8000", "pipe:1"]);
+        let mut child = cmd.stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let mut bytes = Vec::new();
+        child.stdout.take().unwrap().read_to_end(&mut bytes).unwrap();
+        child.wait().unwrap();
+        let samples: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        let rms = |a: f64, b: f64| {
+            let s = &samples[(a * 8000.0) as usize..(b * 8000.0) as usize];
+            (s.iter().map(|v| v * v).sum::<f32>() / s.len() as f32).sqrt()
+        };
+        assert!(rms(0.2, 0.8) > 0.05, "before the range is audible");
+        assert!(rms(1.2, 1.8) < 0.001, "the range is muted");
+        assert!(rms(2.2, 2.8) > 0.05, "after the range is audible again");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

@@ -11,24 +11,29 @@ const fn alpha(c: Color, a: f32) -> Color {
     Color { a, ..c }
 }
 
-// Surfaces, darkest to lightest. `WINDOW` is the workspace (and the hairlines
-// between panels); `SURFACE_1` is every panel.
-pub const WINDOW: Color = hex(0x050605);
-pub const SURFACE_0: Color = hex(0x0B0C09);
-pub const SURFACE_1: Color = hex(0x171914);
-pub const SURFACE_2: Color = hex(0x1F221B);
-pub const SURFACE_3: Color = hex(0x282C23);
-pub const SURFACE_4: Color = hex(0x33382D);
+// Neutral grays, darkest to lightest. `WINDOW` is the near-black background the
+// panels (blocks) float on; `SURFACE_1` is a block.
+pub const WINDOW: Color = hex(0x050505);
+pub const SURFACE_0: Color = hex(0x0A0A0A);
+pub const SURFACE_1: Color = hex(0x121212);
+pub const SURFACE_2: Color = hex(0x1A1A1A);
+pub const SURFACE_3: Color = hex(0x242424);
+pub const SURFACE_4: Color = hex(0x2E2E2E);
 
-// Hairlines are translucent so they read the same on every surface.
-pub const LINE: Color = alpha(Color::WHITE, 0.055);
-pub const LINE_STRONG: Color = alpha(Color::WHITE, 0.10);
+/// The border around every block: one step lighter than the block, clearly visible but quiet.
+pub const BLOCK_BORDER: Color = hex(0x262626);
+/// The border around the preview canvas.
+pub const CANVAS_BORDER: Color = hex(0x3A3A3A);
+
+// Hairlines inside blocks are translucent so they read the same on every surface.
+pub const LINE: Color = alpha(Color::WHITE, 0.07);
+pub const LINE_STRONG: Color = alpha(Color::WHITE, 0.12);
 pub const LINE_FOCUS: Color = alpha(ACCENT, 0.85);
 
-pub const TEXT_1: Color = hex(0xF3F5EF);
-pub const TEXT_2: Color = hex(0xA9AE9F);
-pub const TEXT_3: Color = hex(0x74796B);
-pub const TEXT_4: Color = hex(0x4E5247);
+pub const TEXT_1: Color = hex(0xF5F5F5);
+pub const TEXT_2: Color = hex(0xA6A6A6);
+pub const TEXT_3: Color = hex(0x737373);
+pub const TEXT_4: Color = hex(0x4D4D4D);
 
 /// Lime: primary buttons, selection, active tools.
 pub const ACCENT: Color = hex(0xD6FF00);

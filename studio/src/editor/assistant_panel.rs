@@ -1,6 +1,6 @@
 //! The Assistant tab: chat with the built-in motion designer.
 
-use iced::widget::{button, column, container, image, row, space, text, text_input};
+use iced::widget::{button, column, container, image, row, space, text};
 use iced::{Alignment, Color, Element, Fill, Length};
 
 use super::{Editor, Message};
@@ -47,7 +47,7 @@ impl Editor {
             let hero = column![
                 container(icon(code::SPARKLES, 18).color(ON_ACCENT)).center(40).style(style::logo),
                 text("What should we make?").font(INTER_SEMIBOLD).size(T_TITLE),
-                text("Select a part of the timeline with the Range tool (R), then describe the motion you want.").size(T_SMALL).color(TEXT_3).align_x(Alignment::Center),
+                text("Press R at a start point and again at an end point to mark a range, then describe the motion you want there.").size(T_SMALL).color(TEXT_3).align_x(Alignment::Center),
             ]
             .spacing(S2)
             .align_x(Alignment::Center);
@@ -112,7 +112,15 @@ impl Editor {
             if self.agent.busy && !matches!(self.chat.last(), Some(ChatItem::Tool { state: ToolState::Running, .. })) {
                 col = col.push(row![iced_aw::Spinner::new().width(Length::Fixed(14.0)).height(Length::Fixed(14.0)).circle_radius(1.5), text("Thinking…").size(T_SMALL).color(TEXT_3)].spacing(8).align_y(Alignment::Center));
             }
-            widgets::scroll(col.padding([8, 12])).id(SCROLL_ID).anchor_bottom().height(Fill).into()
+            // Follows new content only while the user is at the bottom.
+            widgets::scroll(col.padding([8, 12]))
+                .id(SCROLL_ID)
+                .on_scroll(|v| {
+                    let y = v.relative_offset().y;
+                    Message::ChatScrolled(y.is_nan() || y >= 0.98 || v.content_bounds().height <= v.bounds().height)
+                })
+                .height(Fill)
+                .into()
         };
 
         // What the assistant will see along with the message.
@@ -148,19 +156,37 @@ impl Editor {
         let send: Element<'_, Message> = if self.agent.busy {
             widgets::tip(button(container(icon(code::SQUARE, 13)).center(32)).width(34).height(34).padding(0).style(style::secondary).on_press(Message::ChatStop), "Stop", None, iced::widget::tooltip::Position::Top)
         } else {
-            let ready = !self.chat_input.trim().is_empty();
+            let ready = !self.chat_input.text().trim().is_empty();
             button(container(icon(code::SEND, 14)).center(32)).width(34).height(34).padding(0).style(style::primary).on_press_maybe(ready.then_some(Message::ChatSend)).into()
         };
-        let font = if self.chat_input.is_ascii() { INTER } else { HIND };
+        let font = if self.chat_input.text().is_ascii() { INTER } else { HIND };
         let composer = container(
             column![
                 chips,
                 row![
-                    text_input("Describe what you want…", &self.chat_input).id(INPUT_ID).on_input(Message::ChatInput).on_submit(Message::ChatSend).font(font).padding([9, 11]).size(T_BODY).style(style::input),
+                    // Enter sends; Shift+Enter starts a new line. Grows up to about six lines.
+                    iced::widget::text_editor(&self.chat_input)
+                        .id(INPUT_ID)
+                        .placeholder("Describe what you want…")
+                        .on_action(Message::ChatEdit)
+                        .key_binding(|kp| {
+                            use iced::keyboard::key::Named;
+                            use iced::widget::text_editor::Binding;
+                            if kp.key == iced::keyboard::Key::Named(Named::Enter) && !kp.modifiers.shift() {
+                                return Some(Binding::Custom(Message::ChatSend));
+                            }
+                            Binding::from_key_press(kp)
+                        })
+                        .font(font)
+                        .size(T_BODY)
+                        .padding([9, 11])
+                        .min_height(40)
+                        .max_height(140)
+                        .style(style::text_area),
                     send,
                 ]
                 .spacing(S2)
-                .align_y(Alignment::Center),
+                .align_y(Alignment::End),
             ]
             .spacing(S2),
         )

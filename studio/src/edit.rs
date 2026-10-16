@@ -101,7 +101,7 @@ impl Project {
 
     pub fn add_track(&mut self, kind: TrackKind, name: &str, index: Option<usize>) -> Id {
         let id = self.alloc_id();
-        let track = Track { id, name: name.to_string(), kind, muted: false, locked: false, hidden: false };
+        let track = Track { id, name: name.to_string(), kind, muted: false, locked: false, hidden: false, height: None };
         // Visual tracks stay above audio tracks.
         let first_audio = self.tracks.iter().position(|t| t.kind == TrackKind::Audio).unwrap_or(self.tracks.len());
         let at = match (kind, index) {
@@ -266,6 +266,10 @@ impl Project {
                 for k in c.keyframes.values_mut().flatten() {
                     k.t -= shift;
                 }
+                for g in &mut c.audio.gains {
+                    g.at -= shift;
+                }
+                c.audio.gains.retain(|g| g.at + g.duration > 0.0);
             }
             Edge::End => {
                 c.duration = (t.min(next_start) - clip.start).max(MIN_CLIP);
@@ -296,10 +300,12 @@ impl Project {
         for k in right.keyframes.values_mut().flatten() {
             k.t -= cut;
         }
+        right.audio.gains = clip.audio.gains.iter().filter(|g| g.at + g.duration > cut).map(|g| crate::clip::Gain { at: g.at - cut, ..*g }).collect();
         let left = self.clip_mut(id)?;
         left.duration = cut;
         left.outro = None;
         left.zooms.retain(|z| z.at < cut);
+        left.audio.gains.retain(|g| g.at < cut);
         self.clips.push(right);
         Ok(new_id)
     }
@@ -344,6 +350,22 @@ impl Project {
         z.at = at;
         z.duration = duration;
         Ok(())
+    }
+
+    /// Sets the volume of the part of `clip` between timeline times `a` and `b` (replacing
+    /// earlier range changes that overlap it). `volume` 1 removes the change.
+    pub fn set_range_volume(&mut self, clip: Id, a: f64, b: f64, volume: f64) -> anyhow::Result<Option<Id>> {
+        let id = self.alloc_id();
+        let c = self.clip_mut(clip)?;
+        let (s, e) = ((a.min(b) - c.start).max(0.0), (a.max(b) - c.start).min(c.duration));
+        ensure!(e - s >= 0.05, "The selected range doesn't cover this clip");
+        c.audio.gains.retain(|g| g.at + g.duration <= s + 1e-6 || g.at >= e - 1e-6);
+        if (volume - 1.0).abs() < 1e-3 {
+            return Ok(None);
+        }
+        c.audio.gains.push(crate::clip::Gain { id, at: s, duration: e - s, volume: volume.clamp(0.0, 4.0) });
+        c.audio.gains.sort_by(|x, y| x.at.total_cmp(&y.at));
+        Ok(Some(id))
     }
 
     /// Duplicates a clip right after itself (or the nearest free spot).
@@ -460,6 +482,26 @@ mod tests {
         p.set_zoom_timing(c, 2, 18.0, 9.0).unwrap();
         let z = p.clip(c).unwrap().zooms[1];
         assert!(z.at + z.duration <= 20.0 + 1e-9);
+    }
+
+    #[test]
+    fn range_volume_only_changes_the_range() {
+        let mut p = Project::new("t", Canvas::default());
+        let info = ProbeInfo { kind: MediaKind::Audio, duration: 10.0, width: 0, height: 0, fps: 0.0, has_audio: true };
+        let a = p.add_asset(&PathBuf::from("/a.wav"), &info);
+        let c = p.add_media_clip(a, None, 2.0).unwrap();
+        p.set_range_volume(c, 4.0, 6.0, 0.25).unwrap();
+        let audio = &p.clip(c).unwrap().audio;
+        assert_eq!(audio.gain_at(1.0), 1.0, "before the range");
+        assert!((audio.gain_at(3.0) - 0.25).abs() < 1e-9, "inside the range");
+        assert_eq!(audio.gain_at(5.0), 1.0, "after the range");
+        // Splitting keeps the range on the right half, at the right place.
+        let right = p.split(c, 4.5).unwrap();
+        let r = &p.clip(right).unwrap().audio;
+        assert!((r.gain_at(0.5) - 0.25).abs() < 1e-9 && r.gain_at(2.0) == 1.0);
+        // Setting 100% again removes the change.
+        p.set_range_volume(right, 4.5, 6.0, 1.0).unwrap();
+        assert!(p.clip(right).unwrap().audio.gains.is_empty());
     }
 
     #[test]

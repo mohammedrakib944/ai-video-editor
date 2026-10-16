@@ -254,7 +254,7 @@ const MOTIONS: [MotionChoice; 8] = [
     MotionChoice(Some(MotionKind::ZoomIn)),
 ];
 
-pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>) -> Element<'a, Message> {
+pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, range: Option<(f64, f64)>) -> Element<'a, Message> {
     let id = clip.id;
     let e = move |edit: Edit| Message::Edit(id, edit);
     let kind = clip.asset().and_then(|a| project.asset(a)).map(|a| a.kind);
@@ -503,18 +503,50 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>) -> 
 
     if has_audio {
         let a = &clip.audio;
-        col = col.push(section(
-            code::VOLUME_2,
-            "Audio",
-            column![
-                slider_row("Volume", a.volume * 100.0, 0.0..=200.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::Volume(v / 100.0))),
-                toggle_row("Mute", a.muted, move |m| e(Edit::Mute(m))),
-                slider_row("Fade in", a.fade_in, 0.0..=5.0, 0.05, |v| format!("{v:.1}s"), move |v| e(Edit::FadeIn(v))),
-                slider_row("Fade out", a.fade_out, 0.0..=5.0, 0.05, |v| format!("{v:.1}s"), move |v| e(Edit::FadeOut(v))),
-            ]
-            .spacing(S3)
-            .into(),
-        ));
+        let mut audio = column![
+            slider_row("Volume", a.volume * 100.0, 0.0..=200.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::Volume(v / 100.0))),
+            toggle_row("Mute", a.muted, move |m| e(Edit::Mute(m))),
+            slider_row("Fade in", a.fade_in, 0.0..=5.0, 0.05, |v| format!("{v:.1}s"), move |v| e(Edit::FadeIn(v))),
+            slider_row("Fade out", a.fade_out, 0.0..=5.0, 0.05, |v| format!("{v:.1}s"), move |v| e(Edit::FadeOut(v))),
+        ]
+        .spacing(S3);
+
+        // Volume for just the selected range of this clip.
+        let overlap = range.and_then(|(ra, rb)| {
+            let (s, t) = (ra.max(clip.start), rb.min(clip.end()));
+            (t - s >= 0.05).then_some((s, t))
+        });
+        let mut part = column![].spacing(S2);
+        match overlap {
+            Some((s, t)) => {
+                let (ls, lt) = (s - clip.start, t - clip.start);
+                let current = a.gains.iter().find(|g| (g.at - ls).abs() < 1e-3 && (g.at + g.duration - lt).abs() < 1e-3).map(|g| g.volume).unwrap_or(1.0);
+                part = part
+                    .push(row![tinted(code::SQUARE_DASHED, 12, ACCENT), text(format!("Selected range {} – {}", super::fmt_timecode_short(s), super::fmt_timecode_short(t))).size(T_SMALL).color(TEXT_2)].spacing(6).align_y(Alignment::Center))
+                    .push(slider_row("Range volume", current * 100.0, 0.0..=200.0, 1.0, |v| format!("{v:.0}%"), move |v| Message::RangeVolume(id, v / 100.0)))
+                    .push(row![
+                        widgets::secondary_button(Some(code::VOLUME_X), "Mute range", Some(Message::RangeVolume(id, 0.0))),
+                        widgets::ghost_button(None, "Reset", Some(Message::RangeVolume(id, 1.0))),
+                    ].spacing(S2));
+            }
+            None => {
+                part = part.push(text("Mark a range (R) to change the volume of just one part of this clip.").size(T_CAPTION).color(TEXT_3));
+            }
+        }
+        for g in &a.gains {
+            let gid = g.id;
+            part = part.push(
+                row![
+                    text(format!("{} – {}", super::fmt_timecode_short(clip.start + g.at), super::fmt_timecode_short(clip.start + g.at + g.duration))).size(T_CAPTION).color(TEXT_2).width(Fill),
+                    text(if g.volume == 0.0 { "Muted".to_string() } else { format!("{:.0}%", g.volume * 100.0) }).font(INTER_MEDIUM).size(T_CAPTION),
+                    widgets::icon_button(code::X, Some(Message::RemoveGain(id, gid))).width(22).height(22),
+                ]
+                .spacing(S2)
+                .align_y(Alignment::Center),
+            );
+        }
+        audio = audio.push(container(part).padding(S3).width(Fill).style(style::inset));
+        col = col.push(section(code::VOLUME_2, "Audio", audio.into()));
     }
 
     widgets::scroll(col.padding(iced::Padding { top: 0.0, right: 10.0, bottom: 12.0, left: 4.0 })).height(Fill).into()

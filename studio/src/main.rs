@@ -25,7 +25,21 @@ use iced::{Size, window};
 
 use crate::ui::tokens;
 
+/// winit can't receive files dragged in from the file manager on Wayland, so on
+/// Linux the app runs through XWayland, where drag and drop works. Set
+/// `STUDIO_WAYLAND=1` to stay on native Wayland anyway.
+#[cfg(target_os = "linux")]
+fn prefer_xwayland() {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let xwayland = std::env::var_os("DISPLAY").is_some();
+    if wayland && xwayland && std::env::var_os("STUDIO_WAYLAND").is_none() {
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
+}
+
 fn main() -> iced::Result {
+    #[cfg(target_os = "linux")]
+    prefer_xwayland();
     let mut application = iced::application(app::App::new, app::App::update, app::App::view)
         .title(app::App::title)
         .subscription(app::App::subscription)

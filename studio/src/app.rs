@@ -48,6 +48,8 @@ pub enum Message {
     Ai(crate::ai_connect::Message),
     OpenAi,
     AiChecked(crate::settings::AiProvider, Result<String, String>),
+    /// Media dropped on the start screen: make a project from it.
+    StartDrop(PathBuf),
 }
 
 pub struct App {
@@ -91,7 +93,10 @@ impl App {
                 let autosave = if e.doc.is_dirty() && e.path.is_some() { iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::Autosave) } else { Subscription::none() };
                 Subscription::batch([e.subscription().map(Message::Editor), autosave])
             }
-            Screen::Start(_) => Subscription::none(),
+            Screen::Start(_) => event::listen_with(|event, _, _| match event {
+                Event::Window(window::Event::FileDropped(p)) => Some(Message::StartDrop(p)),
+                _ => None,
+            }),
         };
         Subscription::batch([window::resize_events().map(|_| Message::WindowResized), event::listen_with(shortcut), editor, crate::mcp::subscription().map(Message::Mcp)])
     }
@@ -134,6 +139,19 @@ impl App {
                 }
                 crate::ai_connect::Message::CopyUrl => return iced::clipboard::write(crate::mcp::url()),
             },
+            Message::StartDrop(path) => {
+                if !crate::media::is_media_path(&path) {
+                    self.error = Some("That file type can't be imported".into());
+                    return Task::none();
+                }
+                if let Screen::Start(start) = &mut self.screen {
+                    if let Some(stem) = path.file_stem() {
+                        start.name = stem.to_string_lossy().into_owned();
+                    }
+                }
+                let open = self.create_project();
+                return open.chain(Task::done(Message::Editor(editor::Message::ImportPicked(vec![path]))));
+            }
             Message::AiChecked(provider, result) => {
                 self.ai_checking = false;
                 if result.is_ok() {
@@ -464,10 +482,27 @@ fn snapshot_task() -> Task<Message> {
     // Optionally scroll the track list first (`STUDIO_SNAPSHOT_SCROLL=pixels`).
     let scroll: f32 = std::env::var("STUDIO_SNAPSHOT_SCROLL").ok().and_then(|d| d.parse().ok()).unwrap_or(0.0);
     let scroll_first = Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay)), move |_| Message::Editor(editor::Message::ScrollTracks(scroll)));
+    // `STUDIO_SNAPSHOT_TIME=seconds` scrolls the timeline so that time is at the left edge.
+    let hscroll = match std::env::var("STUDIO_SNAPSHOT_TIME").ok().and_then(|d| d.parse::<f64>().ok()) {
+        Some(t) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.2)), move |_| Message::Editor(editor::Message::SetView(editor::timeline::View { scroll: t, zoom: 48.0 }))),
+        None => Task::none(),
+    };
     let shot = Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay + 0.5)), |_| ()).then(|_| window::latest()).and_then(window::screenshot).map(Message::Snapshot);
     // `STUDIO_SNAPSHOT_OPEN=ai` opens the Connect AI dialog first.
-    let open = if std::env::var("STUDIO_SNAPSHOT_OPEN").as_deref() == Ok("ai") { Task::done(Message::OpenAi) } else { Task::none() };
-    Task::batch([open, scroll_first, shot])
+    let open = match std::env::var("STUDIO_SNAPSHOT_OPEN").as_deref() {
+        Ok("ai") => Task::done(Message::OpenAi),
+        Ok("assistant") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::ToggleAssistant),
+        _ => Task::none(),
+    };
+    // `STUDIO_SNAPSHOT_SELECT=clip[,range_start,range_end]` selects a clip (and a range).
+    let select = match std::env::var("STUDIO_SNAPSHOT_SELECT").ok().map(|v| v.split(',').filter_map(|s| s.parse::<f64>().ok()).collect::<Vec<_>>()) {
+        Some(v) if !v.is_empty() => {
+            let range = (v.len() >= 3).then(|| (v[1], v[2]));
+            Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.3)), move |_| Message::Editor(editor::Message::DevSelect(v[0] as u64, range)))
+        }
+        _ => Task::none(),
+    };
+    Task::batch([open, scroll_first, hscroll, select, shot])
 }
 
 fn window_task(action: WindowAction) -> Task<Message> {

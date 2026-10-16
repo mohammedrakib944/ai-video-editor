@@ -100,6 +100,8 @@ pub enum Message {
     LibraryRemove(Id),
     CursorMoved(Point),
     MouseReleased,
+    /// Files are being dragged over the window (true) or left it (false).
+    FileHover(bool),
     Seek(f64),
     SetView(View),
     ZoomBy(f64),
@@ -115,6 +117,15 @@ pub enum Message {
     ZoomTiming { clip: Id, zoom: Id, at: f64, duration: f64 },
     /// Scroll the track list by this many pixels (positive = down).
     ScrollTracks(f32),
+    /// Volume for the selected range of a clip.
+    RangeVolume(Id, f64),
+    RemoveGain(Id, Id),
+    TrackResizeStart(Id),
+    /// Point a library item at a new file (for moved or missing media).
+    Relink(Id),
+    Relinked(Id, Option<PathBuf>),
+    /// Debug snapshots: select a clip and a range.
+    DevSelect(Id, Option<(f64, f64)>),
     DeleteSelection,
     DuplicateSelection,
     SetRange(Option<(f64, f64)>),
@@ -135,7 +146,9 @@ pub enum Message {
     ZoomEdit(Option<(Id, Id)>),
     SetCanvas(crate::model::Canvas),
     AiTool(crate::mcp::Call),
-    ChatInput(String),
+    ChatEdit(iced::widget::text_editor::Action),
+    /// The transcript scrolled; true when it's at the bottom.
+    ChatScrolled(bool),
     ChatSend,
     ChatSuggestion(String),
     ChatStop,
@@ -202,9 +215,16 @@ pub struct Editor {
     muted: bool,
     sound_preview: Option<(&'static str, crate::playback::AudioPlayer, Instant)>,
     zoom_edit: Option<(Id, Id)>,
+    file_hover: bool,
+    /// Track being resized: (track, cursor y at start, height at start).
+    resizing_track: Option<(Id, f32, f32)>,
+    /// Library items whose file can't be found.
+    missing: std::collections::HashSet<Id>,
     agent: crate::assistant::Agent,
     chat: Vec<assistant_panel::ChatItem>,
-    chat_input: String,
+    chat_input: iced::widget::text_editor::Content,
+    /// Keep the transcript pinned to the newest message (off once the user scrolls up).
+    chat_follow: bool,
 }
 
 impl Editor {
@@ -257,10 +277,19 @@ impl Editor {
             muted: false,
             sound_preview: None,
             zoom_edit: None,
+            file_hover: false,
+            resizing_track: None,
+            missing: Default::default(),
             agent: crate::assistant::Agent::default(),
             chat: Vec::new(),
-            chat_input: String::new(),
+            chat_input: iced::widget::text_editor::Content::new(),
+            chat_follow: true,
         }
+    }
+
+    fn refresh_missing(&mut self) {
+        self.missing = self.doc.project.assets.iter().filter(|a| !a.path.is_file()).map(|a| a.id).collect();
+        self.lanes_cache.clear();
     }
 
     /// Turns the assistant on or off when the user connects or disconnects an AI.
@@ -278,6 +307,11 @@ impl Editor {
 
     /// Starts loading thumbnails and waveforms for the project's media.
     pub fn boot(&mut self) -> Task<Message> {
+        self.refresh_missing();
+        if !self.missing.is_empty() {
+            let n = self.missing.len();
+            self.notify(if n == 1 { "1 media file can't be found — right-click it in the library to locate it".to_string() } else { format!("{n} media files can't be found — right-click them in the library to locate them") }, true);
+        }
         let assets = self.doc.project.assets.clone();
         self.media.ensure(&assets, Message::MediaLoaded)
     }
@@ -446,7 +480,13 @@ impl Editor {
                     Message::ImportPicked,
                 );
             }
+            Message::FileHover(on) => self.file_hover = on,
             Message::ImportPicked(paths) => {
+                self.file_hover = false;
+                let skipped = paths.iter().filter(|p| !media::is_media_path(p)).count();
+                if skipped > 0 {
+                    self.notify(if skipped == 1 { "That file type can't be imported".to_string() } else { format!("{skipped} files couldn't be imported (unsupported type)") }, true);
+                }
                 let mut tasks = Vec::new();
                 for path in paths.into_iter().filter(|p| media::is_media_path(p)) {
                     if self.importing.contains(&path) || self.doc.project.assets.iter().any(|a| a.path == path) {
@@ -472,6 +512,7 @@ impl Editor {
                     Ok(info) => {
                         if let Some(id) = self.edit(&format!("Import {name}"), |p| Ok(p.add_asset(&path, &info))) {
                             self.library_selected = Some(id);
+                            self.refresh_missing();
                             let assets = self.doc.project.assets.clone();
                             return self.media.ensure(&assets, Message::MediaLoaded);
                         }
@@ -501,6 +542,13 @@ impl Editor {
             }
             Message::CursorMoved(p) => {
                 self.cursor = p;
+                if let Some((id, y0, h0)) = self.resizing_track {
+                    let h = (h0 + p.y - y0).clamp(timeline::MIN_TRACK_H, timeline::MAX_TRACK_H);
+                    self.edit_merge("Resize track", Some(&format!("track-height:{id}")), |pr| {
+                        pr.track_mut(id)?.height = Some(h.round());
+                        Ok(())
+                    });
+                }
                 if let Some((id, origin)) = self.press {
                     if self.dnd.is_none() && origin.distance(p) > 6.0 {
                         self.dnd = Some(id);
@@ -510,6 +558,7 @@ impl Editor {
             Message::MouseReleased => {
                 self.press = None;
                 self.dnd = None;
+                self.resizing_track = None;
             }
             Message::DropAsset { asset, track, t } => {
                 self.press = None;
@@ -634,6 +683,67 @@ impl Editor {
                 self.lanes_cache.clear();
             }
             Message::AddZoomAtPlayhead => self.add_zoom_at_playhead(),
+            Message::RangeVolume(clip, v) => {
+                if let Some((a, b)) = self.range {
+                    self.edit_merge("Range volume", Some(&format!("range-volume:{clip}")), |p| p.set_range_volume(clip, a, b, v));
+                }
+            }
+            Message::DevSelect(clip, range) => {
+                self.selection = vec![clip];
+                self.range = range;
+                self.side_tab = SideTab::Inspector;
+                self.lanes_cache.clear();
+            }
+            Message::Relink(id) => {
+                let name = self.doc.project.asset(id).map(|a| a.name.clone()).unwrap_or_default();
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title(format!("Locate {name}"))
+                            .add_filter("Video, audio and images", media::MEDIA_EXTENSIONS)
+                            .pick_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    },
+                    move |p| Message::Relinked(id, p),
+                );
+            }
+            Message::Relinked(_, None) => {}
+            Message::Relinked(id, Some(path)) => {
+                let probe = media::probe(&path);
+                match probe {
+                    Ok(info) => {
+                        let kind = self.doc.project.asset(id).map(|a| a.kind);
+                        if kind.is_some_and(|k| k != info.kind) {
+                            self.notify("That file is a different kind of media (video, audio or image)", true);
+                        } else {
+                            self.edit("Relink media", |p| {
+                                let a = p.assets.iter_mut().find(|a| a.id == id).ok_or_else(|| anyhow::anyhow!("That media is no longer in the library"))?;
+                                a.path = path.clone();
+                                (a.duration, a.width, a.height, a.fps, a.has_audio) = (info.duration, info.width, info.height, info.fps, info.has_audio);
+                                Ok(())
+                            });
+                            self.media.forget(id);
+                            self.frames.forget_asset(id);
+                            self.refresh_missing();
+                            let assets = self.doc.project.assets.clone();
+                            return self.media.ensure(&assets, Message::MediaLoaded);
+                        }
+                    }
+                    Err(e) => self.notify(format!("Couldn't use that file: {e}"), true),
+                }
+            }
+            Message::TrackResizeStart(id) => {
+                if let Some(t) = self.doc.project.track(id) {
+                    self.resizing_track = Some((id, self.cursor.y, timeline::track_height(t)));
+                }
+            }
+            Message::RemoveGain(clip, gain) => {
+                self.edit("Remove range volume", |p| {
+                    p.clip_mut(clip)?.audio.gains.retain(|g| g.id != gain);
+                    Ok(())
+                });
+            }
             Message::ScrollTracks(dy) => {
                 let visible = (self.timeline_size.get().height - RULER_H).max(1.0);
                 let max = (timeline::content_height(&self.doc.project) - visible).max(0.0);
@@ -664,9 +774,8 @@ impl Editor {
             }
             Message::SetRange(r) => {
                 self.range = r;
-                if r.is_some() {
-                    self.side_tab = SideTab::Assistant;
-                }
+                self.range_anchor = None;
+                self.lanes_cache.clear();
             }
             Message::Edit(id, edit) => {
                 let (key, desc) = edit.describe();
@@ -778,13 +887,14 @@ impl Editor {
                     });
                 }
             }
-            Message::ChatInput(s) => self.chat_input = s,
+            Message::ChatEdit(action) => self.chat_input.perform(action),
+            Message::ChatScrolled(at_bottom) => self.chat_follow = at_bottom,
             Message::ChatSuggestion(s) => {
-                self.chat_input = s;
+                self.chat_input = iced::widget::text_editor::Content::with_text(&s);
                 return self.update(Message::ChatSend);
             }
             Message::ChatSend => {
-                let text = self.chat_input.trim().to_string();
+                let text = self.chat_input.text().trim().to_string();
                 if text.is_empty() || self.agent.busy {
                     return Task::none();
                 }
@@ -794,7 +904,8 @@ impl Editor {
                 match self.agent.send(&text, &context, &cwd) {
                     Ok(()) => {
                         self.chat.push(assistant_panel::ChatItem::User { text, context: label });
-                        self.chat_input.clear();
+                        self.chat_input = iced::widget::text_editor::Content::new();
+                        self.chat_follow = true;
                     }
                     Err(e) => self.chat.push(assistant_panel::ChatItem::Notice(e.to_string())),
                 }
@@ -841,7 +952,9 @@ impl Editor {
                         }
                     }
                 }
-                return iced::widget::operation::snap_to_end(assistant_panel::SCROLL_ID);
+                if self.chat_follow {
+                    return iced::widget::operation::snap_to_end(assistant_panel::SCROLL_ID);
+                }
             }
             Message::ToolImported(call, results, add) => return self.finish_tool_import(call, results, add),
             Message::ToolSound(call, sound, r) => return self.finish_tool_sound(call, sound, r),
@@ -1033,7 +1146,6 @@ impl Editor {
     fn set_range(&mut self, a: f64, b: f64) {
         self.range = Some((a, b));
         self.range_anchor = None;
-        self.side_tab = SideTab::Assistant;
     }
 
     /// Camtasia-style: a zoom starting at the playhead on the clip under it. Right after
@@ -1154,16 +1266,16 @@ impl Editor {
             let header = column![container(header).padding([0, 6]), widgets::divider()];
             pane_grid::Content::new(container(body).width(Fill).height(Fill)).title_bar(pane_grid::TitleBar::new(header).style(style::panel_header)).style(style::panel)
         })
-        // One-pixel gaps show the window color: thin, solid separators between panels.
-        .spacing(1)
+        // Small gaps of the black background between the rounded blocks.
+        .spacing(6)
         .min_size(160)
         .on_resize(10, Message::PaneResized)
         .style(|_| pane_grid::Style {
-            hovered_region: pane_grid::Highlight { background: ACCENT_SOFT.into(), border: iced::Border { color: ACCENT, width: 1.0, radius: 0.0.into() } },
+            hovered_region: pane_grid::Highlight { background: ACCENT_SOFT.into(), border: iced::Border { color: ACCENT, width: 1.0, radius: R_LG.into() } },
             picked_split: pane_grid::Line { color: ACCENT, width: 2.0 },
             hovered_split: pane_grid::Line { color: Color { a: 0.6, ..ACCENT }, width: 2.0 },
         });
-        let body = container(grid).width(Fill).height(Fill).style(style::workspace);
+        let body = container(grid).padding(iced::Padding { top: 0.0, right: 6.0, bottom: 6.0, left: 6.0 }).width(Fill).height(Fill).style(style::backdrop);
         let mut layers: Vec<Element<'_, Message>> = vec![body.into()];
         if let Some((msg, error, _)) = &self.toast {
             let toast = container(
@@ -1174,6 +1286,24 @@ impl Editor {
             .padding([9, 14])
             .style(style::popover);
             layers.push(container(toast).center_x(Fill).align_bottom(Fill).padding(iced::Padding { bottom: 22.0, ..Default::default() }).into());
+        }
+        if self.file_hover {
+            let card = column![
+                container(icon(code::UPLOAD, 22).color(ON_ACCENT)).center(48).style(style::logo),
+                text("Drop to import").font(INTER_SEMIBOLD).size(T_TITLE),
+                text("Video, audio and images go into your media library").size(T_SMALL).color(TEXT_2),
+            ]
+            .spacing(S2)
+            .align_x(Alignment::Center);
+            layers.push(
+                container(container(card).center(Fill).style(|_| container::Style {
+                    background: Some(Color { a: 0.82, ..WINDOW }.into()),
+                    border: iced::Border { color: ACCENT, width: 2.0, radius: R_XL.into() },
+                    ..Default::default()
+                }))
+                .padding(10)
+                .into(),
+            );
         }
         if let Some(dialog) = &self.export {
             layers.push(dialog.view(&self.doc.project));
@@ -1229,7 +1359,7 @@ impl Editor {
             // The overlay spans the whole stage, so handles keep working past the canvas edge.
             let overlay = canvas_overlay::Overlay { project, scene: scene.clone(), selection: &self.selection, zoom_edit: editing, origin, display: Size::new(w, h) };
             let canvas = iced::widget::shader(preview::Preview { scene }).width(w).height(h);
-            let frame = container(canvas).padding(1).style(|_| container::Style { border: iced::Border { color: LINE_STRONG, width: 1.0, radius: 0.0.into() }, ..Default::default() });
+            let frame = container(canvas).padding(1).style(|_| container::Style { border: iced::Border { color: CANVAS_BORDER, width: 1.0, radius: 0.0.into() }, ..Default::default() });
             stack![container(frame).center(Fill), iced::widget::canvas(overlay).width(Fill).height(Fill)].into()
         });
         let duration = self.doc.project.duration();
@@ -1249,7 +1379,7 @@ impl Editor {
         .spacing(8)
         .align_y(Alignment::Center);
         let transport = row![container(time).width(Fill), controls, container(tools).width(Fill).align_right(Fill)].align_y(Alignment::Center);
-        let bar = column![widgets::divider(), container(transport).padding([7, 12]).style(style::panel)];
+        let bar = column![widgets::divider(), container(transport).padding([7, 12])];
         column![container(stage).height(Fill), bar].into()
     }
 
@@ -1258,7 +1388,7 @@ impl Editor {
             SideTab::Inspector => match self.selection.as_slice() {
                 [] => inspector::empty(),
                 [id] => match self.doc.project.clip(*id) {
-                    Some(c) => inspector::view(&self.doc.project, c, self.zoom_edit.map(|(_, z)| z)),
+                    Some(c) => inspector::view(&self.doc.project, c, self.zoom_edit.map(|(_, z)| z), self.range),
                     None => inspector::empty(),
                 },
                 many => inspector::multiple(many.len()),
@@ -1331,6 +1461,7 @@ impl Editor {
                 zoom_edit: self.zoom_edit,
                 range: self.range,
                 dnd: self.dnd,
+                missing: &self.missing,
                 cache: &self.lanes_cache,
                 overflow,
                 vscroll: self.vscroll.min((content_h - (size.height - RULER_H)).max(0.0)),
@@ -1361,7 +1492,7 @@ impl Editor {
         let project = &self.doc.project;
         let mut col = column![space().height(timeline::TOP_PAD)].spacing(0);
         for t in project.tracks.iter().skip(skip) {
-            let h = timeline::track_height(t.kind);
+            let h = timeline::track_height(t);
             let id = t.id;
             let (glyph, color) = match t.kind {
                 TrackKind::Visual => (code::LAYERS, clip::VIDEO),
@@ -1418,7 +1549,9 @@ impl Editor {
                 )
             })
             .style(|_, _| iced_aw::style::context_menu::Style { background: Color::TRANSPARENT.into() });
-            col = col.push(container(menu).padding(iced::Padding { left: 8.0, right: 6.0, bottom: timeline::GAP, top: 0.0 }));
+            // The gap under each header is a handle for resizing the track's height.
+            let grip = mouse_area(space().width(Fill).height(timeline::GAP)).interaction(mouse::Interaction::ResizingVertically).on_press(Message::TrackResizeStart(id));
+            col = col.push(column![container(menu).padding(iced::Padding { left: 8.0, right: 6.0, ..Default::default() }), grip]);
         }
         col.into()
     }
@@ -1472,6 +1605,8 @@ fn editor_event(event: Event, status: event::Status, _window: window::Id) -> Opt
         Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::CursorMoved(position)),
         Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => Some(Message::MouseReleased),
         Event::Window(window::Event::FileDropped(path)) => Some(Message::ImportPicked(vec![path])),
+        Event::Window(window::Event::FileHovered(_)) => Some(Message::FileHover(true)),
+        Event::Window(window::Event::FilesHoveredLeft) => Some(Message::FileHover(false)),
         Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) if status == event::Status::Ignored => {
             let cmd = modifiers.command();
             match key.as_ref() {
@@ -1544,6 +1679,13 @@ fn tabular<'a>(s: &str, color: Color) -> Element<'a, Message> {
 pub fn fmt_timecode(t: f64) -> String {
     let total = t.max(0.0).floor() as u64;
     format!("{:02}:{:02}:{:02}", total / 3600, (total / 60) % 60, total % 60)
+}
+
+/// "0:03.2" style, for ranges.
+pub fn fmt_timecode_short(t: f64) -> String {
+    let t = t.max(0.0);
+    let m = (t / 60.0).floor() as u64;
+    format!("{m}:{:04.1}", t - m as f64 * 60.0)
 }
 
 fn fmt_timecode_frames(t: f64, fps: u32) -> String {

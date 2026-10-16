@@ -62,6 +62,9 @@ fn shifted(project: &Project, t: f64) -> Project {
             }
             c.duration -= cut;
             c.audio.fade_in = (c.audio.fade_in - cut).max(0.0);
+            for g in &mut c.audio.gains {
+                g.at -= cut;
+            }
             c.start = 0.0;
         } else {
             c.start -= t;

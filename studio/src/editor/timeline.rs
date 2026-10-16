@@ -18,16 +18,23 @@ use crate::ui::tokens::*;
 pub const RULER_H: f32 = 30.0;
 pub const HEADER_W: f32 = 210.0;
 pub const TOP_PAD: f32 = 6.0;
-pub const GAP: f32 = 4.0;
+pub const GAP: f32 = 5.0;
 const EDGE_GRAB: f32 = 7.0;
 const SNAP_PX: f32 = 9.0;
 const ZOOM_BAND_H: f32 = 15.0;
 
-pub fn track_height(kind: TrackKind) -> f32 {
+pub const MIN_TRACK_H: f32 = 30.0;
+pub const MAX_TRACK_H: f32 = 220.0;
+
+pub fn default_track_height(kind: TrackKind) -> f32 {
     match kind {
         TrackKind::Visual => 60.0,
         TrackKind::Audio => 46.0,
     }
+}
+
+pub fn track_height(track: &crate::model::Track) -> f32 {
+    track.height.unwrap_or_else(|| default_track_height(track.kind)).clamp(MIN_TRACK_H, MAX_TRACK_H)
 }
 
 /// Horizontal view of the timeline.
@@ -68,7 +75,7 @@ pub fn rows(project: &Project, vscroll: f32) -> Vec<(Id, TrackKind, f32, f32)> {
         .tracks
         .iter()
         .map(|t| {
-            let h = track_height(t.kind);
+            let h = track_height(t);
             let row = (t.id, t.kind, y, h);
             y += h + GAP;
             row
@@ -77,7 +84,7 @@ pub fn rows(project: &Project, vscroll: f32) -> Vec<(Id, TrackKind, f32, f32)> {
 }
 
 pub fn content_height(project: &Project) -> f32 {
-    TOP_PAD + project.tracks.iter().map(|t| track_height(t.kind) + GAP).sum::<f32>() + 24.0
+    TOP_PAD + project.tracks.iter().map(|t| track_height(t) + GAP).sum::<f32>() + 24.0
 }
 
 fn clip_color(project: &Project, clip: &Clip) -> Color {
@@ -247,6 +254,8 @@ pub struct Lanes<'a> {
     pub range: Option<(f64, f64)>,
     /// Asset being dragged in from the library.
     pub dnd: Option<Id>,
+    /// Assets whose file can't be found.
+    pub missing: &'a std::collections::HashSet<Id>,
     pub cache: &'a Caches,
     /// Whether the tracks overflow vertically (then the plain wheel scrolls them).
     pub overflow: bool,
@@ -677,7 +686,7 @@ impl Lanes<'_> {
         for (track, kind, top, h) in rows(self.project, self.vscroll).into_iter().filter(|r| r.2 + r.3 > 0.0 && r.2 < size.height) {
             if layer == Layer::Base {
                 let lane = Path::rounded_rectangle(Point::new(0.0, top), Size::new(size.width, h), 6.0.into());
-                f.fill(&lane, if kind == TrackKind::Audio { Color::from_rgb8(0x10, 0x13, 0x13) } else { SURFACE_1 });
+                f.fill(&lane, if kind == TrackKind::Audio { Color::from_rgb8(0x10, 0x10, 0x10) } else { SURFACE_1 });
             }
             let dim = self.project.track(track).is_some_and(|t| t.hidden || t.muted);
             for clip in self.project.clips_on(track).filter(|c| c.start < t1 && c.end() > t0) {
@@ -712,7 +721,9 @@ impl Lanes<'_> {
         let tile_w = (inner.height * m.strip_w as f32 / super::media_cache::STRIP_H as f32).max(8.0);
         let first = ((inner.x.max(-tile_w) - inner.x) / tile_w).floor().max(0.0) as i32;
         let canvas_w = f.size().width;
-        f.with_clip(inner, |f| {
+        // Images and text aren't clipped to the canvas by iced, so clip them to the visible lane area.
+        let Some(visible) = on_canvas(inner, f.size()) else { return };
+        f.with_clip(visible, |f| {
             let mut i = first;
             loop {
                 let x = inner.x + i as f32 * tile_w;
@@ -760,7 +771,8 @@ impl Lanes<'_> {
                         let ia = (clip.source_time(self.view.t(x)) * rate).max(0.0) as usize;
                         let ib = ((clip.source_time(self.view.t(x + step)) * rate).ceil() as usize).max(ia + 1);
                         let peak = peaks.get(ia.min(peaks.len())..ib.min(peaks.len())).and_then(|s| s.iter().copied().reduce(f32::max)).unwrap_or(0.0);
-                        let hh = (peak.sqrt() * amp).max(0.5);
+                        let gain = clip.audio.gain_at(self.view.t(x) - clip.start) as f32;
+                        let hh = (peak.sqrt() * amp * gain).max(0.5);
                         b.rectangle(Point::new(x, mid - hh), Size::new(step - 0.6, hh * 2.0));
                         x += step;
                     }
@@ -769,13 +781,31 @@ impl Lanes<'_> {
             }
         }
 
+        // Volume line (like Camtasia's audio envelope), shown once part of the clip is changed.
+        let audible = asset.is_some_and(|a| a.has_audio);
+        if audible && !clip.audio.gains.is_empty() {
+            let (x_start, x_end) = (inner.x.max(0.0), (inner.x + inner.width).min(f.size().width));
+            let level = |v: f64| r.y + 5.0 + (1.0 - (v / 1.5).clamp(0.0, 1.0) as f32) * (r.height - 10.0);
+            let line = Path::new(|b| {
+                let mut x = x_start;
+                b.move_to(Point::new(x, level(clip.audio.volume * clip.audio.gain_at(self.view.t(x) - clip.start))));
+                while x < x_end {
+                    x = (x + 2.0).min(x_end);
+                    b.line_to(Point::new(x, level(clip.audio.volume * clip.audio.gain_at(self.view.t(x) - clip.start))));
+                }
+            });
+            f.stroke(&line, Stroke::default().with_color(ACCENT).with_width(1.5));
+        }
+
         // Text clips preview their text.
         if let Content::Text(t) = &clip.content {
             if r.width > 40.0 {
-                f.with_clip(inner, |f| {
+                let Some(visible) = on_canvas(inner, f.size()) else { return };
+                f.with_clip(visible, |f| {
                     f.fill_text(Text {
                         content: t.text.replace('\n', " "),
-                        position: Point::new(r.x + 10.0, r.y + r.height * 0.5),
+                        // Sticks to the left edge while the clip start is scrolled out of view.
+                        position: Point::new(r.x.max(0.0) + 10.0, r.y + r.height * 0.5),
                         color: Color { a: if dim { 0.4 } else { 0.92 }, ..Color::WHITE },
                         size: 15.0.into(),
                         font: if t.text.is_ascii() { INTER_BOLD } else { HIND_SEMIBOLD },
@@ -820,7 +850,8 @@ impl Lanes<'_> {
                 f.fill(&Path::new(|b| { b.move_to(Point::new(x1, y1)); b.line_to(Point::new(x1 - ramp, y0)); b.line_to(Point::new(x1, y0)); b.close(); }), shade);
             }
             if band.width > 54.0 {
-                f.with_clip(band, |f| {
+                let Some(band_visible) = on_canvas(band, f.size()) else { continue };
+                f.with_clip(band_visible, |f| {
                     f.fill_text(Text {
                         content: if pans { format!("Pan · {:.0}%", z.scale * 100.0) } else { format!("Zoom {:.0}%", z.scale * 100.0) },
                         position: Point::new(band.x + band.width / 2.0, band.y + band.height / 2.0),
@@ -840,13 +871,16 @@ impl Lanes<'_> {
 
         // Label chip (text clips show their content instead).
         if r.width > 34.0 && !matches!(clip.content, Content::Text(_)) {
-            let label = clip_label(self.project, clip);
+            let missing = clip.asset().is_some_and(|a| self.missing.contains(&a));
+            let label = if missing { format!("Missing · {}", clip_label(self.project, clip)) } else { clip_label(self.project, clip) };
             let font = if label.is_ascii() { INTER_SEMIBOLD } else { HIND_SEMIBOLD };
-            f.with_clip(Rectangle::new(Point::new(r.x + 4.0, r.y + 3.0), Size::new((r.width - 8.0).max(0.0), 18.0)), |f| {
+            let area = Rectangle::new(Point::new(r.x + 4.0, r.y + 3.0), Size::new((r.width - 8.0).max(0.0), 18.0));
+            let Some(area) = on_canvas(area, f.size()) else { return };
+            f.with_clip(area, |f| {
                 f.fill_text(Text {
                     content: label,
-                    position: Point::new(r.x + 8.0, r.y + 12.0),
-                    color: Color::WHITE,
+                    position: Point::new(r.x.max(0.0) + 8.0, r.y + 12.0),
+                    color: if missing { DANGER } else { Color::WHITE },
                     size: 11.0.into(),
                     font,
                     align_y: alignment::Vertical::Center,
@@ -862,6 +896,11 @@ impl Lanes<'_> {
             f.stroke(&glow, Stroke::default().with_color(Color { a: 0.4, ..ACCENT }).with_width(2.0));
         }
     }
+}
+
+/// The part of `r` inside a canvas of `size`, if any.
+fn on_canvas(r: Rectangle, size: Size) -> Option<Rectangle> {
+    r.intersection(&Rectangle::new(Point::ORIGIN, size))
 }
 
 /// Paints the corners outside a rounded rectangle, hiding square image corners.
