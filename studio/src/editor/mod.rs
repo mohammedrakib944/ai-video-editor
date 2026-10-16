@@ -136,6 +136,7 @@ pub enum Message {
     SoundPreviewReady(&'static str, Result<(PathBuf, ProbeInfo), String>),
     SoundPreviewTick,
     ZoomEdit(Option<(Id, Id)>),
+    SetCanvas(crate::model::Canvas),
     AiTool(crate::mcp::Call),
     ChatInput(String),
     ChatSend,
@@ -728,6 +729,14 @@ impl Editor {
                 }
             }
             Message::AiTool(call) => return self.handle_tool(call),
+            Message::SetCanvas(c) => {
+                if c != self.doc.project.canvas {
+                    self.edit("Change format", |p| {
+                        p.canvas = c;
+                        Ok(())
+                    });
+                }
+            }
             Message::ChatInput(s) => self.chat_input = s,
             Message::ChatSuggestion(s) => {
                 self.chat_input = s;

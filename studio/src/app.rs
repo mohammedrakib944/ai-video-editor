@@ -31,6 +31,8 @@ pub enum Message {
     Start(start::Message),
     Editor(editor::Message),
     AppMenu(bool),
+    FormatMenu(bool),
+    Autosave,
     NewProject,
     Open,
     OpenPicked(Option<PathBuf>),
@@ -48,6 +50,7 @@ pub struct App {
     screen: Screen,
     maximized: bool,
     app_menu: bool,
+    format_menu: bool,
     error: Option<String>,
 }
 
@@ -57,7 +60,7 @@ impl App {
             eprintln!("assistant server: {e}");
         }
         let error = (!crate::ffmpeg::is_available()).then(|| format!("FFmpeg was not found, so media can't be imported or previewed. {}", crate::ffmpeg::missing_hint()));
-        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, error };
+        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: std::env::var("STUDIO_DEV").as_deref() == Ok("menu"), format_menu: std::env::var("STUDIO_DEV").as_deref() == Ok("format"), error }; // TEMP
         let path = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file());
         let task = match path {
             Some(p) => Task::done(Message::OpenPicked(Some(p))),
@@ -75,7 +78,11 @@ impl App {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let editor = match &self.screen {
-            Screen::Editor(e) => e.subscription().map(Message::Editor),
+            Screen::Editor(e) => {
+                // Save automatically a moment after each change.
+                let autosave = if e.doc.is_dirty() && e.path.is_some() { iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::Autosave) } else { Subscription::none() };
+                Subscription::batch([e.subscription().map(Message::Editor), autosave])
+            }
             Screen::Start(_) => Subscription::none(),
         };
         Subscription::batch([window::resize_events().map(|_| Message::WindowResized), event::listen_with(shortcut), editor, crate::mcp::subscription().map(Message::Mcp)])
@@ -112,6 +119,17 @@ impl App {
                 }
             }
             Message::AppMenu(open) => self.app_menu = open,
+            Message::FormatMenu(open) => self.format_menu = open,
+            Message::Autosave => {
+                if let Screen::Editor(e) = &mut self.screen {
+                    if let (true, Some(path)) = (e.doc.is_dirty(), e.path.clone()) {
+                        match e.doc.project.save(&path) {
+                            Ok(()) => e.doc.mark_saved(),
+                            Err(err) => self.error = Some(format!("Autosave failed: {err}")),
+                        }
+                    }
+                }
+            }
             Message::NewProject => {
                 self.app_menu = false;
                 self.close_project();
@@ -184,9 +202,15 @@ impl App {
         Task::none()
     }
 
+    /// Saves the project (if it has a file) and the layout.
     fn persist(&mut self) {
-        if let Screen::Editor(e) = &self.screen {
+        if let Screen::Editor(e) = &mut self.screen {
             self.settings.layout = e.layout();
+            if let (true, Some(path)) = (e.doc.is_dirty(), e.path.clone()) {
+                if e.doc.project.save(&path).is_ok() {
+                    e.doc.mark_saved();
+                }
+            }
         }
         self.settings.save();
     }
@@ -314,9 +338,14 @@ impl App {
         );
         let dropdown = DropDown::new(menu_button, menu, self.app_menu)
             .on_dismiss(Message::AppMenu(false))
+            .width(iced::Length::Fixed(230.0))
             .alignment(iced_aw::drop_down::Alignment::BottomEnd)
             .offset(6.0);
-        let status = if e.doc.is_dirty() { ("Unsaved", WARNING) } else if e.path.is_some() { ("Saved", TEXT_4) } else { ("Not saved", WARNING) };
+        let status = match (e.path.is_some(), e.doc.is_dirty()) {
+            (true, true) => ("Saving…", ACCENT_HOVER),
+            (true, false) => ("Saved", TEXT_4),
+            (false, _) => ("Not saved", WARNING),
+        };
         let left = row![
             dropdown,
             text(&e.doc.project.name).font(INTER_SEMIBOLD).size(T_BODY),
@@ -325,9 +354,36 @@ impl App {
         ]
         .spacing(S2)
         .align_y(Alignment::Center);
-        let center = container(row![icon(code::MONITOR, 12).color(TEXT_3), text(e.doc.project.canvas.summary()).font(INTER_MEDIUM).size(T_SMALL).color(TEXT_2)].spacing(6).align_y(Alignment::Center))
-            .padding([5, 10])
-            .style(style::segmented_track);
+        let chip = button(
+            row![icon(code::MONITOR, 12).color(TEXT_3), text(e.doc.project.canvas.summary()).font(INTER_MEDIUM).size(T_SMALL).color(TEXT_2), icon(code::CHEVRON_DOWN, 12).color(TEXT_3)].spacing(6).align_y(Alignment::Center),
+        )
+        .padding([5, 10])
+        .style(|t, s| {
+            let mut st = style::secondary(t, s);
+            if matches!(s, iced::widget::button::Status::Active) {
+                st.background = Some(SURFACE_0.into());
+                st.shadow = Default::default();
+            }
+            st
+        })
+        .on_press(Message::FormatMenu(!self.format_menu));
+        let canvas = e.doc.project.canvas;
+        let set = move |c: crate::model::Canvas| Message::Editor(editor::Message::SetCanvas(c));
+        let (w, h) = canvas.size();
+        let panel = container(
+            column![
+                row![text("Video format").font(INTER_SEMIBOLD).size(T_BODY), space().width(Fill), text(format!("{w} × {h}")).size(T_CAPTION).color(TEXT_3)].align_y(Alignment::Center),
+                widgets::field("Aspect ratio", widgets::segmented(&crate::model::Aspect::ALL, canvas.aspect, |a| a.label(), move |a| set(crate::model::Canvas { aspect: a, ..canvas }))),
+                widgets::field("Resolution", widgets::segmented(&crate::model::Resolution::ALL, canvas.resolution, |r| r.label().to_string(), move |r| set(crate::model::Canvas { resolution: r, ..canvas }))),
+                widgets::field("Frame rate", widgets::segmented(&crate::model::FRAME_RATES, canvas.fps, |f| format!("{f} fps"), move |f| set(crate::model::Canvas { fps: f, ..canvas }))),
+                text("Positions and sizes adapt automatically when you change the format.").size(T_CAPTION).color(TEXT_3),
+            ]
+            .spacing(S3),
+        )
+        .width(380)
+        .padding(S4)
+        .style(style::popover);
+        let center = DropDown::new(chip, panel, self.format_menu).on_dismiss(Message::FormatMenu(false)).width(iced::Length::Fixed(380.0)).alignment(iced_aw::drop_down::Alignment::Bottom).offset(8.0);
         let pos = iced::widget::tooltip::Position::Bottom;
         let right = row![
             widgets::tip(widgets::icon_button(code::UNDO_2, e.doc.can_undo().then_some(Message::Editor(editor::Message::Undo))), e.doc.undo_label().unwrap_or("Undo"), Some("Ctrl+Z"), pos),
