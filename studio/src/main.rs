@@ -1,0 +1,84 @@
+// Hide the console window in release builds on Windows.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod app;
+mod editor;
+mod model;
+mod settings;
+mod start;
+mod ui;
+
+use iced::{Size, window};
+
+use crate::ui::tokens;
+
+fn main() -> iced::Result {
+    let fonts: [&'static [u8]; 10] = [
+        include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+        include_bytes!("../assets/fonts/Inter-Medium.ttf"),
+        include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
+        include_bytes!("../assets/fonts/Inter-Bold.ttf"),
+        include_bytes!("../assets/fonts/HindSiliguri-Regular.ttf"),
+        include_bytes!("../assets/fonts/HindSiliguri-SemiBold.ttf"),
+        include_bytes!("../assets/fonts/Poppins-Regular.ttf"),
+        include_bytes!("../assets/fonts/Poppins-Medium.ttf"),
+        include_bytes!("../assets/fonts/Poppins-SemiBold.ttf"),
+        include_bytes!("../assets/icons/lucide.ttf"),
+    ];
+    let mut application = iced::application(app::App::new, app::App::update, app::App::view)
+        .title(app::App::title)
+        .subscription(app::App::subscription)
+        .theme(theme())
+        .default_font(tokens::INTER)
+        .antialiasing(true)
+        .window(window_settings());
+    for font in fonts {
+        application = application.font(font);
+    }
+    application.run()
+}
+
+fn theme() -> iced::Theme {
+    iced::Theme::custom(
+        "Studio",
+        iced::theme::Palette {
+            background: tokens::WINDOW,
+            text: tokens::TEXT_1,
+            primary: tokens::ACCENT,
+            success: tokens::SUCCESS,
+            warning: tokens::WARNING,
+            danger: tokens::DANGER,
+        },
+    )
+}
+
+fn window_settings() -> window::Settings {
+    window::Settings {
+        size: Size::new(1480.0, 920.0),
+        min_size: Some(Size::new(1100.0, 680.0)),
+        decorations: false,
+        // On Linux we draw rounded corners and a shadow, which needs a transparent surface.
+        transparent: cfg!(not(windows)),
+        platform_specific: platform_specific(),
+        ..Default::default()
+    }
+}
+
+#[cfg(windows)]
+fn platform_specific() -> window::settings::PlatformSpecific {
+    window::settings::PlatformSpecific {
+        undecorated_shadow: true,
+        corner_preference: window::settings::platform::CornerPreference::Round,
+        ..Default::default()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_specific() -> window::settings::PlatformSpecific {
+    window::settings::PlatformSpecific { application_id: "ai-video-editor".into(), ..Default::default() }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn platform_specific() -> window::settings::PlatformSpecific {
+    Default::default()
+}

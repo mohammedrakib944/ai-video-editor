@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Lightweight Windows video editor with live preview, driven by Claude through MCP"
 
+[workspace]
+# `studio` is the Iced rewrite, built alongside the current egui app.
+members = [".", "studio"]
+exclude = ["spikes"]
+
 [[bin]]
 name = "ai-video-editor"
 path = "src/main.rs"
