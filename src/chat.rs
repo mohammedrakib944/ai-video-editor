@@ -30,22 +30,22 @@ pub enum ChatEvent {
     TurnDone { error: Option<String> },
 }
 
-const SYSTEM_PROMPT: &str = "You are the editing assistant built into AI Video Editor, a Windows desktop video editor. \
+const SYSTEM_PROMPT: &str = "You are the editing assistant built into AI Video Editor, a desktop video editor. \
 The user is watching the editor while you work: every change you make with the ai-video-editor tools shows up live in \
 their preview and timeline, and they can undo anything. Act on requests directly with the tools instead of describing \
 what you would do. Call get_project first when you need clip ids or times. Use get_frame to check your work visually \
-when it matters. Use Glob to find media files when the user mentions a folder. Paths are Windows paths. \
+when it matters. Use Glob to find media files when the user mentions a folder. \
 Each user message may start with an <editor> line describing the playhead and the selected clip; use it to resolve \
 words like here, this clip or now. Keep replies short and friendly: one or two sentences saying what you changed.";
 
 /// Locates the Claude Code executable.
 pub fn find_claude() -> Option<PathBuf> {
-    let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default();
-    let mut candidates = vec![home.join(".local").join("bin").join("claude.exe")];
+    let names: &[&str] = if cfg!(windows) { &["claude.exe", "claude.cmd"] } else { &["claude"] };
+    let home = crate::platform::home_dir();
+    let mut candidates = vec![home.join(".local").join("bin").join(names[0])];
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            candidates.push(dir.join("claude.exe"));
-            candidates.push(dir.join("claude.cmd"));
+            candidates.extend(names.iter().map(|n| dir.join(n)));
         }
     }
     if let Some(appdata) = std::env::var_os("APPDATA") {
@@ -162,7 +162,8 @@ impl ChatAgent {
         let cfg = json!({ "mcpServers": { SERVER_KEY: { "type": "http", "url": mcp::own_url() } } });
         std::fs::write(&mcp_cfg, serde_json::to_string_pretty(&cfg)?)?;
         let prompt = dir.join("chat-system-prompt.txt");
-        std::fs::write(&prompt, SYSTEM_PROMPT)?;
+        let os = crate::platform::OS_NAME;
+        std::fs::write(&prompt, format!("{SYSTEM_PROMPT} The editor runs on {os}; paths are {os} paths."))?;
         Ok((mcp_cfg, prompt))
     }
 

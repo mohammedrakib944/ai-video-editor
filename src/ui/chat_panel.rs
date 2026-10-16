@@ -132,8 +132,8 @@ impl App {
             let ed = self.shared.editor.lock();
             ed.path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()))
         }
-        .or_else(|| std::env::var_os("USERPROFILE").map(|h| std::path::PathBuf::from(h).join("Videos")).filter(|d| d.is_dir()))
-        .or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from))
+        .or_else(|| Some(crate::platform::home_dir().join("Videos")).filter(|d| d.is_dir()))
+        .or_else(|| Some(crate::platform::home_dir()).filter(|d| d.is_dir()))
         .unwrap_or_else(std::env::temp_dir);
         let context = self.editor_context();
         self.chat_items.push(ChatItem::User { text: text.clone(), at: Instant::now() });

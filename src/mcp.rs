@@ -198,7 +198,7 @@ fn tool_list() -> Vec<Value> {
         tool("get_project", "Get the full project: canvas (aspect/resolution/fps), media library, every clip on every track with timeline times, playhead and export status. Call this first.", json!({}), &[]),
         tool(
             "import_media",
-            "Import video, audio or image files (absolute Windows paths) into the media library. Optionally append them to the timeline: videos/images go to the end of the main track, audio onto the music track at time 0.",
+            &format!("Import video, audio or image files (absolute {} paths) into the media library. Optionally append them to the timeline: videos/images go to the end of the main track, audio onto the music track at time 0.", crate::platform::OS_NAME),
             json!({
                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Absolute file paths" },
                 "add_to_timeline": { "type": "boolean", "description": "Also place them on the timeline (default false)" },
@@ -742,7 +742,7 @@ fn call_tool(shared: &Shared, name: &str, args: &Value) -> anyhow::Result<Vec<Va
         "export_video" => {
             let path = PathBuf::from(args["path"].as_str().ok_or_else(|| anyhow!("missing `path`"))?);
             if !path.is_absolute() {
-                bail!("`path` must be absolute, e.g. C:\\Users\\me\\Videos\\out.mp4");
+                bail!("`path` must be absolute, e.g. {}", crate::platform::EXAMPLE_PATH);
             }
             let path = if path.extension().is_none() { path.with_extension("mp4") } else { path };
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();

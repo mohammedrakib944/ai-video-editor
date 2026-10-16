@@ -44,19 +44,18 @@ pub fn install(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     // Phosphor icon font (used through `icons::*`), shared by every family.
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
-    let load = |name: &str| std::fs::read(std::path::Path::new(&windir).join("Fonts").join(name)).ok();
+    let load = |windows: &[&str], fontconfig: &str| crate::platform::find_font(windows, fontconfig).and_then(|p| std::fs::read(p).ok());
     let mut bold_family = fonts.families[&FontFamily::Proportional].clone();
-    if let Some(data) = load("segoeui.ttf") {
+    if let Some(data) = load(&["segoeui.ttf"], "sans") {
         fonts.font_data.insert("segoe".into(), egui::FontData::from_owned(data).into());
         fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "segoe".into());
     }
-    if let Some(data) = load("seguisb.ttf").or_else(|| load("segoeuib.ttf")) {
+    if let Some(data) = load(&["seguisb.ttf", "segoeuib.ttf"], "sans:semibold") {
         fonts.font_data.insert("segoe-bold".into(), egui::FontData::from_owned(data).into());
         bold_family.insert(0, "segoe-bold".into());
     }
     // Symbols used by icons (play, scissors, ...).
-    if let Some(data) = load("seguisym.ttf") {
+    if let Some(data) = load(&["seguisym.ttf"], "DejaVu Sans") {
         fonts.font_data.insert("segoe-symbol".into(), egui::FontData::from_owned(data).into());
         fonts.families.get_mut(&FontFamily::Proportional).unwrap().push("segoe-symbol".into());
         bold_family.push("segoe-symbol".into());

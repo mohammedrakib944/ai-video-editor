@@ -1170,10 +1170,10 @@ impl App {
                     }))
                 }
                 ExportAction::ShowInFolder(p) => {
-                    let _ = std::process::Command::new("explorer").arg(format!("/select,{}", p.display())).spawn();
+                    crate::platform::reveal(&p);
                 }
                 ExportAction::Play(p) => {
-                    let _ = std::process::Command::new("explorer").arg(&p).spawn();
+                    crate::platform::open(&p);
                 }
                 ExportAction::None => {}
             },
@@ -1212,7 +1212,12 @@ impl App {
             Dialog::MissingFfmpeg => {
                 ui.label(RichText::new("FFmpeg is missing").font(theme::bold_font(22.0)));
                 ui.add_space(6.0);
-                ui.label(RichText::new("AI Video Editor needs ffmpeg.exe and ffprobe.exe in a folder named \"ffmpeg\" next to the app. Reinstall the app or copy them there, then restart.").color(TEXT_DIM));
+                let help = if cfg!(windows) {
+                    "AI Video Editor needs ffmpeg.exe and ffprobe.exe in a folder named \"ffmpeg\" next to the app. Reinstall the app or copy them there, then restart."
+                } else {
+                    "AI Video Editor needs ffmpeg and ffprobe. Install FFmpeg (for example `sudo apt install ffmpeg`), then restart."
+                };
+                ui.label(RichText::new(help).color(TEXT_DIM));
                 ui.add_space(14.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if widgets::primary_button(ui, "Quit", true).clicked() {

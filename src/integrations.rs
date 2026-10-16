@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
 
-use crate::ffmpeg;
 use crate::mcp;
 
 pub const SERVER_KEY: &str = "ai-video-editor";
@@ -30,7 +29,7 @@ impl Client {
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_default()
+    crate::platform::home_dir()
 }
 
 fn claude_desktop_configs() -> Vec<PathBuf> {
@@ -103,15 +102,22 @@ pub fn connect(client: Client) -> anyhow::Result<String> {
     match client {
         Client::ClaudeCode => {
             let run = |args: &[&str]| {
-                let mut cmd = ffmpeg::hidden_command("cmd");
-                cmd.arg("/C").arg("claude").args(args);
+                #[cfg(windows)]
+                let mut cmd = {
+                    let mut c = crate::ffmpeg::hidden_command("cmd");
+                    c.arg("/C").arg("claude");
+                    c
+                };
+                #[cfg(not(windows))]
+                let mut cmd = std::process::Command::new(crate::chat::find_claude().unwrap_or_else(|| "claude".into()));
+                cmd.args(args);
                 cmd.output()
             };
             // Remove an old entry first so the URL is always current.
             let _ = run(&["mcp", "remove", "--scope", "user", SERVER_KEY]);
             let url = mcp::url();
             let out = run(&["mcp", "add", "--transport", "http", "--scope", "user", SERVER_KEY, &url])
-                .context("could not run the `claude` command")?;
+                .with_context(|| format!("could not run the `claude` command. Run this in a terminal instead:\n{}", claude_code_command()))?;
             if !out.status.success() {
                 let err = String::from_utf8_lossy(&out.stderr);
                 let msg = if err.contains("not recognized") || err.trim().is_empty() {

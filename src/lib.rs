@@ -3,6 +3,7 @@ pub mod ffmpeg;
 pub mod integrations;
 pub mod mcp;
 pub mod media;
+pub mod platform;
 pub mod playback;
 pub mod project;
 pub mod render;

@@ -25,6 +25,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 ab_glyph = "0.2"
 egui-phosphor = "0.9"
 
+# Window-system backends; default features are off above, so Linux needs them explicitly.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.31", default-features = false, features = ["wayland", "x11"] }
+
 [dev-dependencies]
 egui_kittest = "0.31"
 tempfile = "3"

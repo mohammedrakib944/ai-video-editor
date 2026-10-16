@@ -199,7 +199,7 @@ pub enum ExportAction {
 }
 
 pub fn default_export_path(name: &str) -> String {
-    let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default();
+    let home = crate::platform::home_dir();
     let dir = [home.join("Videos"), home.join("Desktop"), home.clone()].into_iter().find(|d| d.is_dir()).unwrap_or(home);
     let safe: String = name.chars().map(|c| if r#"<>:"/\|?*"#.contains(c) { '_' } else { c }).collect();
     let safe = if safe.trim().is_empty() { "video".to_string() } else { safe.trim().to_string() };
@@ -335,7 +335,7 @@ pub fn export_dialog(ui: &mut Ui, form: &mut ExportForm, status: &ExportStatus, 
             } else if form.path.trim().is_empty() {
                 Some("Choose where to save the video.".to_string())
             } else if !path.is_absolute() {
-                Some("Use a full path, like C:\\Users\\you\\Videos\\video.mp4".to_string())
+                Some(format!("Use a full path, like {}", crate::platform::EXAMPLE_PATH))
             } else if !path.parent().is_some_and(|d| d.is_dir()) {
                 Some("That folder does not exist.".to_string())
             } else {

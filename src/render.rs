@@ -61,14 +61,8 @@ fn font_available() -> bool {
         if dest.is_file() {
             return true;
         }
-        let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
-        for name in ["segoeuib.ttf", "arialbd.ttf", "segoeui.ttf", "arial.ttf"] {
-            let src = Path::new(&windir).join("Fonts").join(name);
-            if src.is_file() && std::fs::copy(&src, &dest).is_ok() {
-                return true;
-            }
-        }
-        false
+        crate::platform::find_font(&["segoeuib.ttf", "arialbd.ttf", "segoeui.ttf", "arial.ttf"], "sans:bold")
+            .is_some_and(|src| std::fs::copy(src, &dest).is_ok())
     })
 }
 
@@ -381,7 +375,7 @@ pub fn build(project: &Project, spec: &RenderSpec, rgba: bool) -> anyhow::Result
     let graph = graph.trim_end().trim_end_matches(';').to_string();
     let graph_file = format!("{}/graph.txt", job.rel);
     std::fs::write(ffmpeg::work_dir().join(&graph_file), &graph).context("could not write filter graph")?;
-    cmd.arg("-/filter_complex").arg(&graph_file);
+    cmd.arg(ffmpeg::filter_script_option()).arg(&graph_file);
     Ok((cmd, job))
 }
 
