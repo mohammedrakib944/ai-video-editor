@@ -37,10 +37,6 @@ impl MediaCache {
         self.entries.get(&id)
     }
 
-    pub fn is_loading(&self, id: Id) -> bool {
-        self.loading.contains(&id)
-    }
-
     /// Starts generating media for assets that don't have it yet.
     pub fn ensure<M: Send + 'static>(&mut self, assets: &[Asset], done: impl Fn(Id, AssetMedia) -> M + Send + Sync + Clone + 'static) -> Task<M> {
         let mut tasks = Vec::new();

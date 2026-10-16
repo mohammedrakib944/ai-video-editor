@@ -9,6 +9,7 @@ mod editor;
 mod ffmpeg;
 mod media;
 mod model;
+mod render;
 mod settings;
 mod start;
 mod ui;

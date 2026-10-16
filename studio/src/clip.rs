@@ -100,12 +100,6 @@ pub struct Grade {
     pub temperature: f64,
 }
 
-impl Grade {
-    pub fn is_neutral(&self) -> bool {
-        *self == Grade::default()
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Audio {

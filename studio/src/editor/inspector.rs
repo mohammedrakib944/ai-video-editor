@@ -190,7 +190,19 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip) -> Element<'a, Message> {
         row![
             container(tinted(glyph, 15, color)).center(32).style(style::badge(color)),
             column![
-                text(clip_label(project, clip)).font(INTER_SEMIBOLD).size(T_BODY).wrapping(text::Wrapping::None),
+                text_input("Clip name", &clip.name.clone().unwrap_or_else(|| clip_label(project, clip)))
+                    .on_input(move |s| e(Edit::Name(s)))
+                    .font(INTER_SEMIBOLD)
+                    .size(T_BODY)
+                    .padding([3, 6])
+                    .style(|t, s| {
+                        let mut st = style::input(t, s);
+                        if matches!(s, text_input::Status::Active) {
+                            st.border.color = Color::TRANSPARENT;
+                            st.background = Color::TRANSPARENT.into();
+                        }
+                        st
+                    }),
                 text(format!("{kind_label} · {:.2}s at {}", clip.duration, super::fmt_timecode(clip.start))).size(T_CAPTION).color(TEXT_3),
             ]
             .spacing(2)

@@ -53,7 +53,8 @@ pub struct App {
 
 impl App {
     pub fn new() -> (App, Task<Message>) {
-        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, error: None };
+        let error = (!crate::ffmpeg::is_available()).then(|| format!("FFmpeg was not found, so media can't be imported or previewed. {}", crate::ffmpeg::missing_hint()));
+        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, error };
         let path = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file());
         let task = match path {
             Some(p) => Task::done(Message::OpenPicked(Some(p))),

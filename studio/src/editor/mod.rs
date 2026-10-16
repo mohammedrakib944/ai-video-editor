@@ -2,6 +2,7 @@
 
 pub mod inspector;
 pub mod media_cache;
+pub mod preview;
 pub mod timeline;
 
 use std::cell::Cell;
@@ -21,6 +22,8 @@ use crate::doc::Doc;
 use crate::edit::Edge;
 use crate::media::{self, ProbeInfo};
 use crate::model::{Id, MediaKind, Project, TrackKind};
+use crate::render::frames::FrameServer;
+use crate::render::scene;
 use crate::settings::Layout;
 use crate::ui::icons::{code, icon, tinted};
 use crate::ui::tokens::*;
@@ -118,6 +121,7 @@ pub enum Message {
     Redo,
     Tick(Instant),
     AddText,
+    AddShape,
     Track(Id, TrackAction),
     RenameInput(String),
     RenameCommit,
@@ -153,6 +157,7 @@ pub struct Editor {
     renaming: Option<(Id, String)>,
     toast: Option<(String, bool, Instant)>,
     timeline_size: Cell<Size>,
+    frames: FrameServer,
 }
 
 impl Editor {
@@ -197,6 +202,7 @@ impl Editor {
             renaming: None,
             toast: None,
             timeline_size: Cell::new(Size::new(1000.0, 300.0)),
+            frames: FrameServer::default(),
         }
     }
 
@@ -228,7 +234,8 @@ impl Editor {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![event::listen_with(editor_event)];
-        if self.playing.is_some() {
+        // Redraw every frame while playing, or while decoders are still catching up after a seek.
+        if self.playing.is_some() || self.frames.busy() {
             subs.push(window::frames().map(Message::Tick));
         }
         if self.toast.is_some() {
@@ -243,11 +250,17 @@ impl Editor {
 
     /// Runs an edit; on failure shows the reason instead.
     fn edit<T>(&mut self, desc: &str, f: impl FnOnce(&mut Project) -> anyhow::Result<T>) -> Option<T> {
-        self.edit_merge(desc, None, f)
+        let result = self.doc.apply(desc, f);
+        self.after_edit(result)
     }
 
     fn edit_merge<T>(&mut self, desc: &str, key: Option<&str>, f: impl FnOnce(&mut Project) -> anyhow::Result<T>) -> Option<T> {
-        match self.doc.apply_merge(desc, key, f) {
+        let result = self.doc.apply_merge(desc, key, f);
+        self.after_edit(result)
+    }
+
+    fn after_edit<T>(&mut self, result: anyhow::Result<T>) -> Option<T> {
+        match result {
             Ok(v) => {
                 self.lanes_cache.clear();
                 Some(v)
@@ -297,6 +310,8 @@ impl Editor {
                 };
             }
             Message::Tick(now) => {
+                self.frames.settle();
+                self.frames.collect_idle();
                 if let Some((started, from)) = self.playing {
                     let t = from + now.duration_since(started).as_secs_f64();
                     let end = self.doc.project.duration();
@@ -537,6 +552,24 @@ impl Editor {
                     self.side_tab = SideTab::Inspector;
                 }
             }
+            Message::AddShape => {
+                let at = self.playhead;
+                let shape = crate::clip::ShapeLayer {
+                    kind: crate::clip::ShapeKind::Rectangle,
+                    width: 520.0,
+                    height: 160.0,
+                    fill: crate::clip::Rgba::hex(0x7C6DFF),
+                    fill_to: Some(crate::clip::Rgba::hex(0xC56BFF)),
+                };
+                if let Some(id) = self.edit("Add shape", |p| {
+                    let id = p.add_shape_clip(None, at, shape)?;
+                    p.clip_mut(id)?.look.corner_radius = 48.0;
+                    Ok(id)
+                }) {
+                    self.selection = vec![id];
+                    self.side_tab = SideTab::Inspector;
+                }
+            }
             Message::Track(id, action) => self.track_action(id, action),
             Message::RenameInput(s) => {
                 if let Some((_, name)) = &mut self.renaming {
@@ -702,6 +735,17 @@ impl Editor {
                         card("Subtitle", "Supporting line", INTER_MEDIUM, 15.0),
                         card("শিরোনাম", "Bangla headline · Hind Siliguri", HIND_SEMIBOLD, 19.0),
                         text("Click to add at the playhead. Press T anytime.").size(T_CAPTION).color(TEXT_4),
+                        space().height(6),
+                        widgets::section("Shapes"),
+                        button(row![container(space().width(36).height(22)).style(|_| container::Style {
+                            background: Some(style::brand_gradient()),
+                            border: iced::Border { radius: 6.0.into(), ..Default::default() },
+                            ..Default::default()
+                        }), column![text("Gradient card").font(INTER_SEMIBOLD).size(T_BODY), text("Rounded rectangle for callouts").size(T_CAPTION).color(TEXT_3)].spacing(2)].spacing(S3).align_y(Alignment::Center))
+                            .width(Fill)
+                            .padding([10, 12])
+                            .style(style::choice_card(false))
+                            .on_press(Message::AddShape),
                     ]
                     .spacing(S2)
                     .padding([8, 10]),
@@ -804,17 +848,18 @@ impl Editor {
     fn preview(&self) -> Element<'_, Message> {
         let (cw, ch) = self.doc.project.canvas.size();
         let stage = responsive(move |size: Size| {
-            let fit = (size.width / cw as f32).min(size.height / ch as f32).min(1.0);
+            let fit = (size.width / cw as f32).min(size.height / ch as f32);
             let (w, h) = ((cw as f32 * fit).floor(), (ch as f32 * fit).floor());
-            let frame = container(column![tinted(code::CLAPPERBOARD, 22, TEXT_4), text("Preview renderer coming next").size(T_SMALL).color(TEXT_4)].spacing(6).align_x(Alignment::Center))
-                .center_x(w)
-                .center_y(h)
-                .style(|_| container::Style {
-                    background: Some(Color::BLACK.into()),
-                    border: iced::Border { color: LINE, width: 1.0, radius: 2.0.into() },
-                    shadow: iced::Shadow { color: Color { a: 0.5, ..Color::BLACK }, offset: iced::Vector::new(0.0, 6.0), blur_radius: 24.0 },
-                    ..Default::default()
-                });
+            // Decode a little above the on-screen size so high-DPI screens stay sharp.
+            self.frames.set_preview_width(w * 1.5);
+            let project = &self.doc.project;
+            let scene = scene::evaluate(project, self.playhead, (cw, ch), &self.frames.bind(project), self.playing.is_some());
+            let canvas = iced::widget::shader(preview::Preview { scene: std::sync::Arc::new(scene) }).width(w).height(h);
+            let frame = container(canvas).style(|_| container::Style {
+                border: iced::Border { color: LINE, width: 1.0, radius: 2.0.into() },
+                shadow: iced::Shadow { color: Color { a: 0.5, ..Color::BLACK }, offset: iced::Vector::new(0.0, 6.0), blur_radius: 24.0 },
+                ..Default::default()
+            });
             container(frame).center(Fill).into()
         });
         let duration = self.doc.project.duration();
