@@ -120,6 +120,7 @@ impl Compositor {
 
         let (w, h) = (scene.width as f32, scene.height as f32);
         let background = LayerSpec {
+            clip: 0,
             slot: 0,
             frame: None,
             center: [w / 2.0, h / 2.0],

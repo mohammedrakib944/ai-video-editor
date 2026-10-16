@@ -17,6 +17,8 @@ pub trait Sources {
 
 #[derive(Debug, Clone)]
 pub struct LayerSpec {
+    /// The clip this layer shows (0 for the background).
+    pub clip: Id,
     /// Texture slot: the same slot is reused for a clip's video frames.
     pub slot: u64,
     pub frame: Option<Arc<Frame>>,
@@ -202,6 +204,7 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
     let sc = look.shadow.color;
     let g = &clip.grade;
     Some(LayerSpec {
+        clip: clip.id,
         slot,
         frame,
         center: [x, y],

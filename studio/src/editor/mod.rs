@@ -1,5 +1,6 @@
 //! The editor screen: library, preview, inspector and timeline in resizable panes.
 
+mod canvas_overlay;
 pub mod export_dialog;
 pub mod inspector;
 mod library;
@@ -132,6 +133,7 @@ pub enum Message {
     PreviewSound(&'static str),
     SoundPreviewReady(&'static str, Result<(PathBuf, ProbeInfo), String>),
     SoundPreviewTick,
+    ZoomEdit(Option<(Id, Id)>),
     Track(Id, TrackAction),
     RenameInput(String),
     RenameCommit,
@@ -185,6 +187,7 @@ pub struct Editor {
     audio_revision: u64,
     muted: bool,
     sound_preview: Option<(&'static str, crate::playback::AudioPlayer, Instant)>,
+    zoom_edit: Option<(Id, Id)>,
 }
 
 impl Editor {
@@ -235,6 +238,7 @@ impl Editor {
             audio_revision: 0,
             muted: false,
             sound_preview: None,
+            zoom_edit: None,
         }
     }
 
@@ -529,6 +533,9 @@ impl Editor {
                 if !self.selection.is_empty() {
                     self.side_tab = SideTab::Inspector;
                 }
+                if self.zoom_edit.is_some_and(|(c, _)| !self.selection.contains(&c)) {
+                    self.zoom_edit = None;
+                }
                 self.lanes_cache.clear();
             }
             Message::MoveClip { clip, track, start } => {
@@ -699,6 +706,23 @@ impl Editor {
                     self.sound_preview = None;
                 }
             }
+            Message::ZoomEdit(target) => {
+                self.zoom_edit = target;
+                if let Some((clip, zoom)) = target {
+                    self.stop_playback();
+                    self.selection = vec![clip];
+                    self.side_tab = SideTab::Inspector;
+                    let c = self.doc.project.clip(clip).cloned();
+                    if let Some((c, z)) = c.as_ref().and_then(|c| c.zooms.iter().find(|z| z.id == zoom).map(|z| (c, *z))) {
+                        // Show a moment inside the zoom so its clip is on screen.
+                        let (a, b) = (c.start + z.at, c.start + z.at + z.duration);
+                        if self.playhead < a || self.playhead > b {
+                            self.seek(a + z.duration / 2.0);
+                        }
+                    }
+                    self.lanes_cache.clear();
+                }
+            }
             Message::Track(id, action) => self.track_action(id, action),
             Message::RenameInput(s) => {
                 if let Some((_, name)) = &mut self.renaming {
@@ -721,6 +745,9 @@ impl Editor {
                 self.seek(end);
             }
             Message::Escape => {
+                if self.zoom_edit.take().is_some() {
+                    return Task::none();
+                }
                 if self.renaming.take().is_none() {
                     self.range = None;
                     self.selection.clear();
@@ -980,8 +1007,26 @@ impl Editor {
             // Decode a little above the on-screen size so high-DPI screens stay sharp.
             self.frames.set_preview_width(w * 1.5);
             let project = &self.doc.project;
-            let scene = scene::evaluate(project, self.playhead, (cw, ch), &self.frames.bind(project), self.playing.is_some());
-            let canvas = iced::widget::shader(preview::Preview { scene: std::sync::Arc::new(scene) }).width(w).height(h);
+            // While editing a zoom, show that clip unzoomed so the whole frame is visible.
+            let editing = self.zoom_edit.and_then(|(clip, zoom)| project.clip(clip).and_then(|c| c.zooms.iter().find(|z| z.id == zoom).map(|z| (clip, *z))));
+            let unzoomed;
+            let shown = match editing {
+                Some((clip, _)) => {
+                    let mut p = project.clone();
+                    if let Ok(c) = p.clip_mut(clip) {
+                        c.zooms.clear();
+                    }
+                    unzoomed = p;
+                    &unzoomed
+                }
+                None => project,
+            };
+            let scene = std::sync::Arc::new(scene::evaluate(shown, self.playhead, (cw, ch), &self.frames.bind(project), self.playing.is_some()));
+            let overlay = canvas_overlay::Overlay { project, scene: scene.clone(), selection: &self.selection, zoom_edit: editing };
+            let canvas = stack![
+                iced::widget::shader(preview::Preview { scene }).width(w).height(h),
+                iced::widget::canvas(overlay).width(w).height(h),
+            ];
             let frame = container(canvas).style(|_| container::Style {
                 border: iced::Border { color: LINE, width: 1.0, radius: 2.0.into() },
                 shadow: iced::Shadow { color: Color { a: 0.5, ..Color::BLACK }, offset: iced::Vector::new(0.0, 6.0), blur_radius: 24.0 },
@@ -1011,7 +1056,7 @@ impl Editor {
             SideTab::Inspector => match self.selection.as_slice() {
                 [] => inspector::empty(),
                 [id] => match self.doc.project.clip(*id) {
-                    Some(c) => inspector::view(&self.doc.project, c),
+                    Some(c) => inspector::view(&self.doc.project, c, self.zoom_edit.map(|(_, z)| z)),
                     None => inspector::empty(),
                 },
                 many => inspector::multiple(many.len()),

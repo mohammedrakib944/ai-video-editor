@@ -18,6 +18,7 @@ pub enum Edit {
     Name(String),
     X(f64),
     Y(f64),
+    Position(f64, f64),
     Scale(f64),
     Rotation(f64),
     Opacity(f64),
@@ -58,6 +59,7 @@ pub enum Edit {
     ZoomScale(Id, f64),
     ZoomFocusX(Id, f64),
     ZoomFocusY(Id, f64),
+    ZoomFocus(Id, f64, f64),
 }
 
 impl Edit {
@@ -65,7 +67,7 @@ impl Edit {
     pub fn describe(&self) -> (&'static str, &'static str) {
         match self {
             Edit::Name(_) => ("name", "Rename clip"),
-            Edit::X(_) | Edit::Y(_) => ("position", "Move"),
+            Edit::X(_) | Edit::Y(_) | Edit::Position(..) => ("position", "Move"),
             Edit::Scale(_) => ("scale", "Scale"),
             Edit::Rotation(_) => ("rotation", "Rotate"),
             Edit::Opacity(_) => ("opacity", "Opacity"),
@@ -85,7 +87,7 @@ impl Edit {
             Edit::Transition(_) | Edit::TransitionDuration(_) => ("transition", "Transition"),
             Edit::AddZoom => ("add-zoom", "Add zoom"),
             Edit::RemoveZoom(_) => ("remove-zoom", "Remove zoom"),
-            Edit::ZoomScale(..) | Edit::ZoomFocusX(..) | Edit::ZoomFocusY(..) => ("zoom", "Zoom"),
+            Edit::ZoomScale(..) | Edit::ZoomFocusX(..) | Edit::ZoomFocusY(..) | Edit::ZoomFocus(..) => ("zoom", "Zoom"),
         }
     }
 
@@ -98,6 +100,10 @@ impl Edit {
             Edit::Name(s) => c.name = (!s.trim().is_empty()).then(|| s.trim().to_string()),
             Edit::X(v) => t.x = v,
             Edit::Y(v) => t.y = v,
+            Edit::Position(x, y) => {
+                t.x = x;
+                t.y = y;
+            }
             Edit::Scale(v) => t.scale = v,
             Edit::Rotation(v) => t.rotation = v,
             Edit::Opacity(v) => t.opacity = v,
@@ -141,6 +147,10 @@ impl Edit {
             Edit::ZoomScale(id, v) => c.zooms.iter_mut().filter(|z| z.id == id).for_each(|z| z.scale = v),
             Edit::ZoomFocusX(id, v) => c.zooms.iter_mut().filter(|z| z.id == id).for_each(|z| z.focus_x = v),
             Edit::ZoomFocusY(id, v) => c.zooms.iter_mut().filter(|z| z.id == id).for_each(|z| z.focus_y = v),
+            Edit::ZoomFocus(id, x, y) => c.zooms.iter_mut().filter(|z| z.id == id).for_each(|z| {
+                z.focus_x = x;
+                z.focus_y = y;
+            }),
             edit => {
                 if let Content::Text(tl) = &mut c.content {
                     match edit {
@@ -219,7 +229,7 @@ const MOTIONS: [MotionChoice; 8] = [
     MotionChoice(Some(MotionKind::ZoomIn)),
 ];
 
-pub fn view<'a>(project: &'a Project, clip: &'a Clip) -> Element<'a, Message> {
+pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>) -> Element<'a, Message> {
     let id = clip.id;
     let e = move |edit: Edit| Message::Edit(id, edit);
     let kind = clip.asset().and_then(|a| project.asset(a)).map(|a| a.kind);
@@ -386,6 +396,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip) -> Element<'a, Message> {
         let mut zooms = column![].spacing(S3);
         for (i, z) in clip.zooms.iter().enumerate() {
             let zid = z.id;
+            let editing = zoom_edit == Some(zid);
             zooms = zooms.push(
                 container(
                     column![
@@ -394,6 +405,12 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip) -> Element<'a, Message> {
                             text(format!("Zoom {}", i + 1)).font(INTER_SEMIBOLD).size(T_SMALL),
                             text(format!("{:.1}s – {:.1}s", z.at, z.at + z.duration)).size(T_CAPTION).color(TEXT_3),
                             space().width(Fill),
+                            widgets::tip(
+                                widgets::icon_toggle(code::SCAN, editing, Message::ZoomEdit(if editing { None } else { Some((id, zid)) })).width(24).height(24),
+                                if editing { "Done editing" } else { "Edit on canvas" },
+                                None,
+                                iced::widget::tooltip::Position::Left,
+                            ),
                             widgets::icon_button(code::TRASH_2, Some(e(Edit::RemoveZoom(zid)))).width(24).height(24),
                         ]
                         .spacing(6)
@@ -405,7 +422,13 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip) -> Element<'a, Message> {
                     .spacing(S2),
                 )
                 .padding(S3)
-                .style(style::inset),
+                .style(move |t| {
+                    let mut s = style::inset(t);
+                    if editing {
+                        s.border = iced::Border { color: BRAND_2, width: 1.5, radius: R_MD.into() };
+                    }
+                    s
+                }),
             );
         }
         zooms = zooms.push(widgets::secondary_button(Some(code::PLUS), "Add zoom at playhead", Some(e(Edit::AddZoom))).width(Fill));

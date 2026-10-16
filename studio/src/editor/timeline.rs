@@ -284,6 +284,17 @@ impl Lanes<'_> {
         Some((clip, zone))
     }
 
+    /// The zoom marker under `p`, as (clip, zoom).
+    fn zoom_pill(&self, p: Point) -> Option<(Id, Id)> {
+        let (clip, _) = self.hit(p)?;
+        let (_, _, top, h) = self.row_of(clip.track)?;
+        if p.y < top + h - 13.0 {
+            return None;
+        }
+        let local = self.view.t(p.x) - clip.start;
+        clip.zooms.iter().find(|z| local >= z.at && local <= z.at + z.duration).map(|z| (clip.id, z.id))
+    }
+
     fn snap_points(&self, exclude: Option<Id>) -> Vec<f64> {
         let mut pts = vec![0.0, self.playhead];
         for c in self.project.clips.iter().filter(|c| Some(c.id) != exclude) {
@@ -367,6 +378,10 @@ impl canvas::Program<Message> for Lanes<'_> {
                         state.guide = guide;
                         state.drag = Some(Drag::Range { anchor: t, current: t });
                         Some(Action::capture())
+                    }
+                    Tool::Select if self.zoom_pill(p).is_some() => {
+                        let (clip, zoom) = self.zoom_pill(p)?;
+                        Some(Action::publish(Message::ZoomEdit(Some((clip, zoom)))).and_capture())
                     }
                     Tool::Select => match self.hit(p) {
                         Some((clip, Zone::Edge(edge))) => {
