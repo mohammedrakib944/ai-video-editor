@@ -4,6 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
+Two apps live in this workspace:
+- **`studio/`** (binary `ai-video-studio`) — the Iced rewrite: a motion graphics editor for product showcases. All new work goes here.
+- **root crate** (binary `ai-video-editor`) — the original egui app, kept working until the rewrite reaches parity. Treat it as reference.
+
+The rest of this section describes the original app; see "Studio (the rewrite)" below for the new one.
+
+
 A Rust (egui/eframe) desktop video editor for Windows that Claude edits live through MCP. FFmpeg and ffprobe are external binaries invoked as subprocesses (no ffmpeg bindings). See README.md for the user-facing feature list, keyboard shortcuts and the MCP tool list.
 
 ## Commands
@@ -47,3 +54,21 @@ powershell -ExecutionPolicy Bypass -File scripts\package.ps1                    
 The project is built on both Windows (GNU toolchain: `x86_64-pc-windows-gnu` + MinGW-w64) and Linux, so changes must keep both compiling. OS differences go in `src/platform.rs` (home dir, fonts via `WINDIR\Fonts` vs `fc-match`, `explorer` vs `xdg-open`, example paths, FFmpeg hint) or behind `#[cfg(windows)]`; keep Windows behavior unchanged when adding Linux support. Other OS-specific spots: `ffmpeg.rs` (`.exe`, `CREATE_NO_WINDOW`, `filter_script_option()` picks `-/filter_complex` for FFmpeg ≥ 7 or `-filter_complex_script` for 6.x), `chat::find_claude`, `integrations::connect` (`cmd /C claude` on Windows), `shared::strip_verbatim`, and the Linux-only eframe `wayland`/`x11` features in `Cargo.toml`.
 
 Linux build needs `libasound2-dev` (cpal/ALSA) and FFmpeg on PATH. `cargo check --target x86_64-pc-windows-gnu` from Linux additionally needs `mingw-w64` (the `ring` crate compiles C).
+
+## Studio (the rewrite)
+
+```sh
+cargo run -p studio                      # start screen
+cargo run -p studio -- path/to/x.aivp    # open a project
+cargo test -p studio                     # unit + FFmpeg/GPU integration tests (export, decoder, audio clock)
+```
+
+Layout of `studio/src`:
+- `model.rs` / `clip.rs` — project document (`.aivp` JSON). Positions are canvas fractions; lengths are "canvas units" (px at a 1080 short side). Clips carry transform, look (corners/border/shadow), grade, audio, Camtasia-style `zooms` (`camera_at` pans between adjacent zooms), keyframes, intro/outro motions, transitions.
+- `edit.rs` — every edit; clips never overlap on a track; new clips keep their time and go to a free track. `doc.rs` — undo history (`apply` / `apply_merge` for slider drags).
+- `render/` — `scene::evaluate(project, t, size, sources)` → layers; `compositor` (wgpu, `layer.wgsl`) draws them in the preview (inside iced's render pass, `editor/preview.rs`) and headless for export/snapshots (`export.rs::Offscreen`). `frames.rs` runs one FFmpeg decoder per visible clip; `text.rs` rasterizes with cosmic-text (Bangla shaping); `audio.rs` builds the FFmpeg mix graph used by export and by `playback.rs` (cpal; audio is the master clock).
+- `editor/` — panes, `timeline.rs` (two stacked canvases: iced draws images above meshes within one layer), `inspector.rs` (`Edit` enum), `canvas_overlay.rs` (select/move/scale/rotate, zoom focus editing), `tools.rs` (MCP tool schemas + handlers), `assistant_panel.rs`.
+- `mcp.rs` — MCP server on 127.0.0.1:47822 (`AIVE_STUDIO_MCP_PORT`); calls reach the UI thread via a subscription and answer through a reply channel. `assistant.rs` runs the user's Claude Code headless against it.
+- `ui/` — design system: `tokens.rs` (all colors/sizes/fonts), `style.rs`, `widgets.rs`, Lucide icons (`icons.rs`), window chrome (frameless; Windows uses native rounded corners/shadow, Linux draws them on a transparent window).
+
+Conventions: every visual value comes from `ui/tokens.rs`; the user wants every screen premium-polished, so check new UI with a screenshot. FFmpeg filter-script files must outlive the FFmpeg process that reads them.
