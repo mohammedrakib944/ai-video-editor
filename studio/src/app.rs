@@ -65,12 +65,16 @@ impl App {
     pub fn title(&self) -> String {
         match &self.screen {
             Screen::Start(_) => "AI Video Editor".into(),
-            Screen::Editor(e) => format!("{}{} — AI Video Editor", e.project.name, if e.dirty { " •" } else { "" }),
+            Screen::Editor(e) => format!("{}{} — AI Video Editor", e.project().name, if e.doc.is_dirty() { " •" } else { "" }),
         }
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([window::resize_events().map(|_| Message::WindowResized), event::listen_with(shortcut)])
+        let editor = match &self.screen {
+            Screen::Editor(e) => e.subscription().map(Message::Editor),
+            Screen::Start(_) => Subscription::none(),
+        };
+        Subscription::batch([window::resize_events().map(|_| Message::WindowResized), event::listen_with(shortcut), editor])
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -83,9 +87,9 @@ impl App {
                     start.update(&msg);
                 }
                 match msg {
-                    start::Message::Create => self.create_project(),
+                    start::Message::Create => return self.create_project(),
                     start::Message::Open => return self.update(Message::Open),
-                    start::Message::OpenRecent(p) => self.open_project(&p),
+                    start::Message::OpenRecent(p) => return self.open_project(&p),
                     start::Message::ForgetRecent(p) => {
                         self.settings.recent.retain(|r| r.path != p);
                         self.settings.save();
@@ -96,10 +100,11 @@ impl App {
             Message::Editor(msg) => {
                 if let Screen::Editor(e) = &mut self.screen {
                     let resized = matches!(msg, editor::Message::PaneResized(_));
-                    e.update(msg);
+                    let task = e.update(msg).map(Message::Editor);
                     if resized {
                         self.settings.layout = e.layout();
                     }
+                    return task;
                 }
             }
             Message::AppMenu(open) => self.app_menu = open,
@@ -121,7 +126,7 @@ impl App {
                     Message::OpenPicked,
                 );
             }
-            Message::OpenPicked(Some(p)) => self.open_project(&p),
+            Message::OpenPicked(Some(p)) => return self.open_project(&p),
             Message::OpenPicked(None) | Message::SavePicked(None) | Message::Noop => {}
             Message::Save => {
                 self.app_menu = false;
@@ -135,7 +140,7 @@ impl App {
             Message::SaveAs => {
                 self.app_menu = false;
                 let Screen::Editor(e) = &self.screen else { return Task::none() };
-                let name = format!("{}.{FILE_EXTENSION}", e.project.name);
+                let name = format!("{}.{FILE_EXTENSION}", e.project().name);
                 let dir = settings::projects_dir();
                 return Task::perform(
                     async move {
@@ -178,8 +183,8 @@ impl App {
         self.settings.save();
     }
 
-    fn create_project(&mut self) {
-        let Screen::Start(start) = &self.screen else { return };
+    fn create_project(&mut self) -> Task<Message> {
+        let Screen::Start(start) = &self.screen else { return Task::none() };
         let name = if start.name.trim().is_empty() { "Untitled project".to_string() } else { start.name.trim().to_string() };
         let project = Project::new(&name, start.canvas);
         let dir = settings::projects_dir();
@@ -196,18 +201,28 @@ impl App {
                 None
             }
         };
-        self.screen = Screen::Editor(Box::new(Editor::new(project, path, self.settings.layout)));
+        self.show_editor(project, path)
     }
 
-    fn open_project(&mut self, path: &Path) {
+    fn show_editor(&mut self, project: Project, path: Option<PathBuf>) -> Task<Message> {
+        let mut editor = Editor::new(project, path, self.settings.layout);
+        let task = editor.boot().map(Message::Editor);
+        self.screen = Screen::Editor(Box::new(editor));
+        task
+    }
+
+    fn open_project(&mut self, path: &Path) -> Task<Message> {
         match Project::load(path) {
             Ok(project) => {
                 self.settings.touch_recent(&project.name, path, project.canvas.summary());
                 self.settings.save();
-                self.screen = Screen::Editor(Box::new(Editor::new(project, Some(path.to_path_buf()), self.settings.layout)));
                 self.error = None;
+                self.show_editor(project, Some(path.to_path_buf()))
             }
-            Err(e) => self.error = Some(format!("Could not open {}: {e}", path.display())),
+            Err(e) => {
+                self.error = Some(format!("Could not open {}: {e}", path.display()));
+                Task::none()
+            }
         }
     }
 
@@ -217,10 +232,10 @@ impl App {
             e.path = Some(p);
         }
         let Some(path) = e.path.clone() else { return };
-        match e.project.save(&path) {
+        match e.doc.project.save(&path) {
             Ok(()) => {
-                e.dirty = false;
-                self.settings.touch_recent(&e.project.name, &path, e.project.canvas.summary());
+                e.doc.mark_saved();
+                self.settings.touch_recent(&e.doc.project.name, &path, e.doc.project.canvas.summary());
                 self.settings.layout = e.layout();
                 self.settings.save();
             }
@@ -256,7 +271,19 @@ impl App {
                     .style(style::badge(DANGER)),
             );
         }
-        chrome::frame(content.into(), self.maximized, Message::Window)
+        let mut window_content: Element<'_, Message> = content.into();
+        if let Screen::Editor(e) = &self.screen {
+            if let Some(asset) = e.dnd.and_then(|id| e.project().asset(id)) {
+                let ghost = container(row![icon(code::FILM, 13), text(&asset.name).size(T_SMALL)].spacing(6).align_y(Alignment::Center)).padding([6, 10]).style(style::popover);
+                let inset = if chrome::draws_frame(self.maximized) { chrome::SHADOW_INSET + 1.0 } else { 0.0 };
+                window_content = iced::widget::stack![
+                    window_content,
+                    iced::widget::pin(iced::widget::opaque(ghost)).x(e.cursor.x - inset + 12.0).y(e.cursor.y - inset + 10.0),
+                ]
+                .into();
+            }
+        }
+        chrome::frame(window_content, self.maximized, Message::Window)
     }
 
     fn editor_title<'a>(&'a self, e: &'a Editor) -> (Element<'a, Message>, Element<'a, Message>, Element<'a, Message>) {
@@ -281,22 +308,22 @@ impl App {
             .on_dismiss(Message::AppMenu(false))
             .alignment(iced_aw::drop_down::Alignment::BottomEnd)
             .offset(6.0);
-        let status = if e.dirty { ("Unsaved", WARNING) } else if e.path.is_some() { ("Saved", TEXT_4) } else { ("Not saved", WARNING) };
+        let status = if e.doc.is_dirty() { ("Unsaved", WARNING) } else if e.path.is_some() { ("Saved", TEXT_4) } else { ("Not saved", WARNING) };
         let left = row![
             dropdown,
-            text(&e.project.name).font(INTER_SEMIBOLD).size(T_BODY),
+            text(&e.doc.project.name).font(INTER_SEMIBOLD).size(T_BODY),
             container(row![container(space().width(6).height(6)).style(style::swatch(status.1, 3.0)), text(status.0).size(T_CAPTION).color(TEXT_3)].spacing(5).align_y(Alignment::Center))
                 .padding([0, 4]),
         ]
         .spacing(S2)
         .align_y(Alignment::Center);
-        let center = container(row![icon(code::MONITOR, 12).color(TEXT_3), text(e.project.canvas.summary()).font(INTER_MEDIUM).size(T_SMALL).color(TEXT_2)].spacing(6).align_y(Alignment::Center))
+        let center = container(row![icon(code::MONITOR, 12).color(TEXT_3), text(e.doc.project.canvas.summary()).font(INTER_MEDIUM).size(T_SMALL).color(TEXT_2)].spacing(6).align_y(Alignment::Center))
             .padding([5, 10])
             .style(style::segmented_track);
         let pos = iced::widget::tooltip::Position::Bottom;
         let right = row![
-            widgets::tip(widgets::icon_button(code::UNDO_2, None), "Undo", Some("Ctrl+Z"), pos),
-            widgets::tip(widgets::icon_button(code::REDO_2, None), "Redo", Some("Ctrl+Shift+Z"), pos),
+            widgets::tip(widgets::icon_button(code::UNDO_2, e.doc.can_undo().then_some(Message::Editor(editor::Message::Undo))), e.doc.undo_label().unwrap_or("Undo"), Some("Ctrl+Z"), pos),
+            widgets::tip(widgets::icon_button(code::REDO_2, e.doc.can_redo().then_some(Message::Editor(editor::Message::Redo))), e.doc.redo_label().unwrap_or("Redo"), Some("Ctrl+Shift+Z"), pos),
             container(widgets::vdivider(18.0)).padding([0, 6]),
             widgets::tip(widgets::icon_toggle(code::SPARKLES, e.side_tab == SideTab::Assistant, Message::ToggleAssistant), "Assistant", Some("Ctrl+K"), pos),
             space().width(6),

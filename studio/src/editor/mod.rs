@@ -1,15 +1,31 @@
 //! The editor screen: library, preview, inspector and timeline in resizable panes.
 
+pub mod inspector;
+pub mod media_cache;
+pub mod timeline;
+
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use iced::widget::{button, column, container, pane_grid, responsive, row, space, text};
-use iced::{Alignment, Color, Element, Fill, Length, Size};
+use iced::keyboard::{self, Key, key};
+use iced::widget::{button, column, container, image, mouse_area, pane_grid, responsive, row, space, stack, text, text_input};
+use iced::{Alignment, Color, Element, Event, Fill, Length, Point, Size, Subscription, Task, event, mouse, window};
+use iced_aw::ContextMenu;
 
-use crate::model::{Project, TrackKind};
+use self::inspector::Edit;
+use self::media_cache::{AssetMedia, MediaCache};
+use self::timeline::{HEADER_W, Lanes, RULER_H, Ruler, View};
+use crate::clip::{TextLayer, Zoom};
+use crate::doc::Doc;
+use crate::edit::Edge;
+use crate::media::{self, ProbeInfo};
+use crate::model::{Id, MediaKind, Project, TrackKind};
 use crate::settings::Layout;
 use crate::ui::icons::{code, icon, tinted};
 use crate::ui::tokens::*;
-use crate::ui::{style, widgets};
+use crate::ui::widgets::{self, MenuItem};
+use crate::ui::style;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
@@ -54,6 +70,19 @@ pub enum Tool {
     Range,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum TrackAction {
+    Rename,
+    ToggleHidden,
+    ToggleLocked,
+    ToggleMuted,
+    MoveUp,
+    MoveDown,
+    Delete,
+    AddVideo,
+    AddAudio,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     PaneResized(pane_grid::ResizeEvent),
@@ -63,19 +92,67 @@ pub enum Message {
     TogglePlay,
     ToggleSnapping,
     Import,
+    ImportPicked(Vec<PathBuf>),
+    Probed(PathBuf, Result<ProbeInfo, String>),
+    MediaLoaded(Id, AssetMedia),
+    LibraryPress(Id),
+    LibraryAdd(Id),
+    LibraryRemove(Id),
+    CursorMoved(Point),
+    MouseReleased,
+    Seek(f64),
+    SetView(View),
+    ZoomBy(f64),
+    ZoomFit,
+    Select(Option<Id>, bool),
+    MoveClip { clip: Id, track: Id, start: f64 },
+    Trim { clip: Id, edge: Edge, t: f64 },
+    Split(Id, f64),
+    SplitAtPlayhead,
+    DeleteSelection,
+    DuplicateSelection,
+    SetRange(Option<(f64, f64)>),
+    DropAsset { asset: Id, track: Option<Id>, t: f64 },
+    Edit(Id, Edit),
+    Undo,
+    Redo,
+    Tick(Instant),
+    AddText,
+    Track(Id, TrackAction),
+    RenameInput(String),
+    RenameCommit,
+    Step(i32),
+    GoStart,
+    GoEnd,
+    Escape,
+    DismissToast,
+    Noop,
 }
 
 pub struct Editor {
-    pub project: Project,
+    pub doc: Doc,
     pub path: Option<PathBuf>,
-    pub dirty: bool,
     panes: pane_grid::State<Pane>,
     library_tab: LibraryTab,
     pub side_tab: SideTab,
     tool: Tool,
-    playing: bool,
+    playing: Option<(Instant, f64)>,
     snapping: bool,
     playhead: f64,
+    view: View,
+    selection: Vec<Id>,
+    range: Option<(f64, f64)>,
+    media: MediaCache,
+    lanes_cache: timeline::Caches,
+    importing: Vec<PathBuf>,
+    library_selected: Option<Id>,
+    /// Library item pressed (drag starts once the cursor moves).
+    press: Option<(Id, Point)>,
+    pub dnd: Option<Id>,
+    pub cursor: Point,
+    renaming: Option<(Id, String)>,
+    toast: Option<(String, bool, Instant)>,
+    timeline_size: Cell<Size>,
 }
 
 impl Editor {
@@ -98,17 +175,39 @@ impl Editor {
             b: Box::new(C::Pane(Pane::Timeline)),
         };
         Editor {
-            project,
+            doc: Doc::new(project),
             path,
-            dirty: false,
             panes: pane_grid::State::with_configuration(config),
             library_tab: LibraryTab::Media,
             side_tab: SideTab::Inspector,
             tool: Tool::Select,
-            playing: false,
+            playing: None,
             snapping: true,
             playhead: 0.0,
+            view: View::default(),
+            selection: Vec::new(),
+            range: None,
+            media: MediaCache::default(),
+            lanes_cache: timeline::Caches::default(),
+            importing: Vec::new(),
+            library_selected: None,
+            press: None,
+            dnd: None,
+            cursor: Point::ORIGIN,
+            renaming: None,
+            toast: None,
+            timeline_size: Cell::new(Size::new(1000.0, 300.0)),
         }
+    }
+
+    pub fn project(&self) -> &Project {
+        &self.doc.project
+    }
+
+    /// Starts loading thumbnails and waveforms for the project's media.
+    pub fn boot(&mut self) -> Task<Message> {
+        let assets = self.doc.project.assets.clone();
+        self.media.ensure(&assets, Message::MediaLoaded)
     }
 
     /// Current split ratios, for saving the layout.
@@ -127,23 +226,420 @@ impl Editor {
         l
     }
 
-    pub fn update(&mut self, message: Message) {
+    pub fn subscription(&self) -> Subscription<Message> {
+        let mut subs = vec![event::listen_with(editor_event)];
+        if self.playing.is_some() {
+            subs.push(window::frames().map(Message::Tick));
+        }
+        if self.toast.is_some() {
+            subs.push(iced::time::every(Duration::from_millis(500)).map(|_| Message::DismissToast));
+        }
+        Subscription::batch(subs)
+    }
+
+    fn notify(&mut self, text: impl Into<String>, error: bool) {
+        self.toast = Some((text.into(), error, Instant::now()));
+    }
+
+    /// Runs an edit; on failure shows the reason instead.
+    fn edit<T>(&mut self, desc: &str, f: impl FnOnce(&mut Project) -> anyhow::Result<T>) -> Option<T> {
+        self.edit_merge(desc, None, f)
+    }
+
+    fn edit_merge<T>(&mut self, desc: &str, key: Option<&str>, f: impl FnOnce(&mut Project) -> anyhow::Result<T>) -> Option<T> {
+        match self.doc.apply_merge(desc, key, f) {
+            Ok(v) => {
+                self.lanes_cache.clear();
+                Some(v)
+            }
+            Err(e) => {
+                self.notify(e.to_string(), true);
+                None
+            }
+        }
+    }
+
+    fn seek(&mut self, t: f64) {
+        self.playhead = t.max(0.0);
+        if let Some((_, _)) = self.playing {
+            self.playing = Some((Instant::now(), self.playhead));
+        }
+        self.follow_playhead();
+    }
+
+    /// Scrolls the timeline so the playhead stays visible.
+    fn follow_playhead(&mut self) {
+        let width = (self.timeline_size.get().width - HEADER_W).max(100.0) as f64;
+        let x = (self.playhead - self.view.scroll) * self.view.zoom;
+        if x < 0.0 || x > width - 40.0 {
+            self.view.scroll = (self.playhead - width * 0.2 / self.view.zoom).max(0.0);
+            self.lanes_cache.clear();
+        }
+    }
+
+    pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => self.panes.resize(split, ratio),
             Message::LibraryTab(t) => self.library_tab = t,
             Message::SideTab(t) => self.side_tab = t,
             Message::Tool(t) => self.tool = t,
-            Message::TogglePlay => self.playing = !self.playing,
             Message::ToggleSnapping => self.snapping = !self.snapping,
-            Message::Import => {}
+            Message::TogglePlay => {
+                self.playing = match self.playing {
+                    Some(_) => None,
+                    None => {
+                        let end = self.doc.project.duration();
+                        if self.playhead >= end - 0.01 {
+                            self.playhead = 0.0;
+                        }
+                        Some((Instant::now(), self.playhead))
+                    }
+                };
+            }
+            Message::Tick(now) => {
+                if let Some((started, from)) = self.playing {
+                    let t = from + now.duration_since(started).as_secs_f64();
+                    let end = self.doc.project.duration();
+                    if t >= end {
+                        self.playhead = end;
+                        self.playing = None;
+                    } else {
+                        self.playhead = t;
+                    }
+                    self.follow_playhead();
+                }
+            }
+            Message::Import => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Import media")
+                            .add_filter("Video, audio and images", media::MEDIA_EXTENSIONS)
+                            .pick_files()
+                            .await
+                            .map(|files| files.into_iter().map(|f| f.path().to_path_buf()).collect())
+                            .unwrap_or_default()
+                    },
+                    Message::ImportPicked,
+                );
+            }
+            Message::ImportPicked(paths) => {
+                let mut tasks = Vec::new();
+                for path in paths.into_iter().filter(|p| media::is_media_path(p)) {
+                    if self.importing.contains(&path) || self.doc.project.assets.iter().any(|a| a.path == path) {
+                        continue;
+                    }
+                    self.importing.push(path.clone());
+                    tasks.push(Task::perform(
+                        async move {
+                            let p = path.clone();
+                            let r = tokio::task::spawn_blocking(move || media::probe(&p).map_err(|e| e.to_string())).await.unwrap_or_else(|e| Err(e.to_string()));
+                            (path, r)
+                        },
+                        |(path, r)| Message::Probed(path, r),
+                    ));
+                }
+                self.library_tab = LibraryTab::Media;
+                return Task::batch(tasks);
+            }
+            Message::Probed(path, result) => {
+                self.importing.retain(|p| p != &path);
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                match result {
+                    Ok(info) => {
+                        if let Some(id) = self.edit(&format!("Import {name}"), |p| Ok(p.add_asset(&path, &info))) {
+                            self.library_selected = Some(id);
+                            let assets = self.doc.project.assets.clone();
+                            return self.media.ensure(&assets, Message::MediaLoaded);
+                        }
+                    }
+                    Err(e) => self.notify(format!("Couldn't import {name}: {e}"), true),
+                }
+            }
+            Message::MediaLoaded(id, m) => {
+                self.media.insert(id, m);
+                self.lanes_cache.clear();
+            }
+            Message::LibraryPress(id) => {
+                self.library_selected = Some(id);
+                self.press = Some((id, self.cursor));
+            }
+            Message::LibraryAdd(id) => {
+                self.press = None;
+                let at = self.playhead;
+                if let Some(clip) = self.edit("Add to timeline", |p| p.add_media_clip(id, None, at)) {
+                    self.selection = vec![clip];
+                }
+            }
+            Message::LibraryRemove(id) => {
+                if self.edit("Remove media", |p| p.remove_asset(id)).is_some() && self.library_selected == Some(id) {
+                    self.library_selected = None;
+                }
+            }
+            Message::CursorMoved(p) => {
+                self.cursor = p;
+                if let Some((id, origin)) = self.press {
+                    if self.dnd.is_none() && origin.distance(p) > 6.0 {
+                        self.dnd = Some(id);
+                    }
+                }
+            }
+            Message::MouseReleased => {
+                self.press = None;
+                self.dnd = None;
+            }
+            Message::DropAsset { asset, track, t } => {
+                self.press = None;
+                self.dnd = None;
+                // Fall back to the default track if the hovered one doesn't fit this media.
+                let fits = |p: &Project| {
+                    track.is_some_and(|tr| {
+                        let (Some(tk), Some(a)) = (p.track(tr), p.asset(asset)) else { return false };
+                        (tk.kind == TrackKind::Audio) == (a.kind == MediaKind::Audio) && !tk.locked
+                    })
+                };
+                if let Some(clip) = self.edit("Add to timeline", |p| {
+                    let track = if fits(p) { track } else { None };
+                    p.add_media_clip(asset, track, t)
+                }) {
+                    self.selection = vec![clip];
+                }
+            }
+            Message::Seek(t) => {
+                self.seek(t);
+            }
+            Message::SetView(v) => {
+                self.view = v;
+                self.lanes_cache.clear();
+            }
+            Message::ZoomBy(f) => {
+                let anchor = self.view.x(self.playhead).clamp(0.0, self.timeline_size.get().width - HEADER_W);
+                self.view = self.view.zoomed(f, anchor);
+                self.lanes_cache.clear();
+            }
+            Message::ZoomFit => {
+                let width = (self.timeline_size.get().width - HEADER_W - 40.0).max(200.0) as f64;
+                let dur = self.doc.project.duration().max(10.0);
+                self.view = View { scroll: 0.0, zoom: (width / dur).clamp(2.0, 2400.0) };
+                self.lanes_cache.clear();
+            }
+            Message::Select(id, additive) => {
+                match id {
+                    Some(id) if additive => {
+                        if let Some(i) = self.selection.iter().position(|&s| s == id) {
+                            self.selection.remove(i);
+                        } else {
+                            self.selection.push(id);
+                        }
+                    }
+                    Some(id) => {
+                        if !self.selection.contains(&id) {
+                            self.selection = vec![id];
+                        }
+                    }
+                    None => self.selection.clear(),
+                }
+                if !self.selection.is_empty() {
+                    self.side_tab = SideTab::Inspector;
+                }
+                self.lanes_cache.clear();
+            }
+            Message::MoveClip { clip, track, start } => {
+                self.edit("Move clip", |p| p.move_clip(clip, track, start));
+            }
+            Message::Trim { clip, edge, t } => {
+                self.edit("Trim clip", |p| p.trim(clip, edge, t));
+            }
+            Message::Split(clip, t) => {
+                if let Some(right) = self.edit("Split clip", |p| p.split(clip, t)) {
+                    self.selection = vec![right];
+                }
+            }
+            Message::SplitAtPlayhead => {
+                let t = self.playhead;
+                let targets: Vec<Id> = if self.selection.is_empty() {
+                    self.doc.project.clips.iter().filter(|c| t > c.start && t < c.end()).map(|c| c.id).collect()
+                } else {
+                    self.selection.clone()
+                };
+                if targets.is_empty() {
+                    self.notify("Move the playhead over a clip to split it", false);
+                } else {
+                    self.edit("Split", |p| {
+                        let mut any = false;
+                        for id in targets {
+                            if p.clip(id).is_some_and(|c| t > c.start + 0.1 && t < c.end() - 0.1) {
+                                p.split(id, t)?;
+                                any = true;
+                            }
+                        }
+                        anyhow::ensure!(any, "Move the playhead inside the clip to split it");
+                        Ok(())
+                    });
+                }
+            }
+            Message::DeleteSelection => {
+                let ids = std::mem::take(&mut self.selection);
+                if !ids.is_empty() {
+                    self.edit(if ids.len() == 1 { "Delete clip" } else { "Delete clips" }, |p| p.delete_clips(&ids));
+                }
+            }
+            Message::DuplicateSelection => {
+                let ids = self.selection.clone();
+                if let Some(new) = self.edit("Duplicate", |p| ids.iter().map(|&id| p.duplicate_clip(id)).collect::<anyhow::Result<Vec<_>>>()) {
+                    self.selection = new;
+                }
+            }
+            Message::SetRange(r) => {
+                self.range = r;
+                if r.is_some() {
+                    self.side_tab = SideTab::Assistant;
+                }
+            }
+            Message::Edit(id, edit) => {
+                let (key, desc) = edit.describe();
+                let key = format!("{key}:{id}");
+                let playhead = self.playhead;
+                self.edit_merge(desc, Some(&key), |p| {
+                    match edit {
+                        Edit::Speed(s) => return p.set_speed(id, s),
+                        Edit::AddZoom => {
+                            let zid = p.alloc_id();
+                            let c = p.clip_mut(id)?;
+                            let at = (playhead - c.start).clamp(0.0, (c.duration - 2.0).max(0.0));
+                            c.zooms.push(Zoom { id: zid, at, duration: 2.5f64.min(c.duration - at), scale: 1.8, focus_x: 0.5, focus_y: 0.5, ramp: 0.6 });
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                    edit.apply(p.clip_mut(id)?);
+                    Ok(())
+                });
+            }
+            Message::Undo => match self.doc.undo() {
+                Some(d) => {
+                    self.notify(format!("Undid: {d}"), false);
+                    self.after_history();
+                }
+                None => self.notify("Nothing to undo", false),
+            },
+            Message::Redo => match self.doc.redo() {
+                Some(d) => {
+                    self.notify(format!("Redid: {d}"), false);
+                    self.after_history();
+                }
+                None => self.notify("Nothing to redo", false),
+            },
+            Message::AddText => {
+                let at = self.playhead;
+                if let Some(id) = self.edit("Add text", |p| p.add_text_clip(None, at, TextLayer::default())) {
+                    self.selection = vec![id];
+                    self.side_tab = SideTab::Inspector;
+                }
+            }
+            Message::Track(id, action) => self.track_action(id, action),
+            Message::RenameInput(s) => {
+                if let Some((_, name)) = &mut self.renaming {
+                    *name = s;
+                }
+            }
+            Message::RenameCommit => {
+                if let Some((id, name)) = self.renaming.take() {
+                    self.edit("Rename track", |p| p.rename_track(id, &name));
+                }
+            }
+            Message::Step(frames) => {
+                let fps = self.doc.project.canvas.fps as f64;
+                let t = ((self.playhead * fps).round() + frames as f64) / fps;
+                self.seek(t);
+            }
+            Message::GoStart => self.seek(0.0),
+            Message::GoEnd => {
+                let end = self.doc.project.duration();
+                self.seek(end);
+            }
+            Message::Escape => {
+                if self.renaming.take().is_none() {
+                    self.range = None;
+                    self.selection.clear();
+                    self.tool = Tool::Select;
+                    self.lanes_cache.clear();
+                }
+            }
+            Message::DismissToast => {
+                if self.toast.as_ref().is_some_and(|(_, err, at)| at.elapsed() > Duration::from_secs(if *err { 5 } else { 2 })) {
+                    self.toast = None;
+                }
+            }
+            Message::Noop => {}
+        }
+        Task::none()
+    }
+
+    fn after_history(&mut self) {
+        let p = &self.doc.project;
+        self.selection.retain(|id| p.clip(*id).is_some());
+        self.lanes_cache.clear();
+    }
+
+    fn track_action(&mut self, id: Id, action: TrackAction) {
+        match action {
+            TrackAction::Rename => {
+                if let Some(t) = self.doc.project.track(id) {
+                    self.renaming = Some((id, t.name.clone()));
+                }
+            }
+            TrackAction::ToggleHidden => {
+                self.edit("Toggle track visibility", |p| {
+                    let t = p.track_mut(id)?;
+                    t.hidden = !t.hidden;
+                    Ok(())
+                });
+            }
+            TrackAction::ToggleLocked => {
+                self.edit("Toggle track lock", |p| {
+                    let t = p.track_mut(id)?;
+                    t.locked = !t.locked;
+                    Ok(())
+                });
+            }
+            TrackAction::ToggleMuted => {
+                self.edit("Toggle track mute", |p| {
+                    let t = p.track_mut(id)?;
+                    t.muted = !t.muted;
+                    Ok(())
+                });
+            }
+            TrackAction::MoveUp => {
+                self.edit("Move track", |p| p.move_track(id, -1));
+            }
+            TrackAction::MoveDown => {
+                self.edit("Move track", |p| p.move_track(id, 1));
+            }
+            TrackAction::Delete => {
+                self.edit("Delete track", |p| p.delete_track(id));
+                self.after_history();
+            }
+            TrackAction::AddVideo => {
+                let index = self.doc.project.track_index(id);
+                let n = self.doc.project.tracks.iter().filter(|t| t.kind == TrackKind::Visual).count() + 1;
+                self.edit("Add track", |p| Ok(p.add_track(TrackKind::Visual, &format!("Video {n}"), index)));
+            }
+            TrackAction::AddAudio => {
+                let index = self.doc.project.track_index(id).map(|i| i + 1);
+                let n = self.doc.project.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count() + 1;
+                self.edit("Add track", |p| Ok(p.add_track(TrackKind::Audio, &format!("Audio {n}"), index)));
+            }
         }
     }
+
+    // ------------------------------------------------------------ view
 
     pub fn view(&self) -> Element<'_, Message> {
         let grid = pane_grid(&self.panes, |_, pane, _| {
             let (header, body): (Element<'_, Message>, Element<'_, Message>) = match pane {
                 Pane::Library => (self.library_header(), self.library()),
-                Pane::Preview => (pane_title("Preview", Some(self.project.canvas.summary())), self.preview()),
+                Pane::Preview => (pane_title("Preview", Some(self.doc.project.canvas.summary())), self.preview()),
                 Pane::Inspector => (self.side_header(), self.inspector()),
                 Pane::Timeline => (self.timeline_header(), self.timeline()),
             };
@@ -159,7 +655,19 @@ impl Editor {
             picked_split: pane_grid::Line { color: ACCENT, width: 2.0 },
             hovered_split: pane_grid::Line { color: Color { a: 0.55, ..ACCENT }, width: 2.0 },
         });
-        container(grid).padding(5).width(Fill).height(Fill).into()
+        let body = container(grid).padding(5).width(Fill).height(Fill);
+        let mut layers: Vec<Element<'_, Message>> = vec![body.into()];
+        if let Some((msg, error, _)) = &self.toast {
+            let toast = container(
+                row![icon(if *error { code::TRIANGLE_ALERT } else { code::CIRCLE_CHECK }, 14).color(if *error { DANGER } else { SUCCESS }), text(msg).size(T_SMALL)]
+                    .spacing(S2)
+                    .align_y(Alignment::Center),
+            )
+            .padding([9, 14])
+            .style(style::popover);
+            layers.push(container(toast).center_x(Fill).align_bottom(Fill).padding(iced::Padding { bottom: 22.0, ..Default::default() }).into());
+        }
+        stack(layers).into()
     }
 
     fn library_header(&self) -> Element<'_, Message> {
@@ -178,43 +686,145 @@ impl Editor {
 
     fn library(&self) -> Element<'_, Message> {
         match self.library_tab {
-            LibraryTab::Media => widgets::empty_state(
-                code::UPLOAD,
-                "Bring in your media",
-                "Drop screen recordings, face-cam videos, voiceovers, images or logos here.",
-                Some(widgets::primary_button(Some(code::PLUS), "Import media", Some(Message::Import)).into()),
-            ),
-            LibraryTab::Text => widgets::empty_state(code::TYPE, "Text styles", "Titles, lower thirds and captions — coming with the motion engine.", None),
-            LibraryTab::Transitions => widgets::empty_state(code::BLEND, "Effects & transitions", "Fades, slides, zooms and animated reveals.", None),
+            LibraryTab::Media => self.media_library(),
+            LibraryTab::Text => {
+                let card = |title: &'static str, sub: &'static str, font: iced::Font, size: f32| {
+                    button(column![text(title).font(font).size(size), text(sub).size(T_CAPTION).color(TEXT_3)].spacing(4))
+                        .width(Fill)
+                        .padding([12, 12])
+                        .style(style::choice_card(false))
+                        .on_press(Message::AddText)
+                };
+                widgets::scroll(
+                    column![
+                        widgets::section("Add text"),
+                        card("Headline", "Big bold title", INTER_BOLD, 20.0),
+                        card("Subtitle", "Supporting line", INTER_MEDIUM, 15.0),
+                        card("শিরোনাম", "Bangla headline · Hind Siliguri", HIND_SEMIBOLD, 19.0),
+                        text("Click to add at the playhead. Press T anytime.").size(T_CAPTION).color(TEXT_4),
+                    ]
+                    .spacing(S2)
+                    .padding([8, 10]),
+                )
+                .height(Fill)
+                .into()
+            }
+            LibraryTab::Transitions => widgets::empty_state(code::BLEND, "Effects & transitions", "Fades, slides, zooms and animated reveals — next up in the motion engine.", None),
             LibraryTab::Sounds => widgets::empty_state(code::AUDIO_WAVEFORM, "Sound effects", "Whooshes, pops, clicks and risers you can drag onto the timeline.", None),
         }
     }
 
+    fn media_library(&self) -> Element<'_, Message> {
+        let project = &self.doc.project;
+        if project.assets.is_empty() && self.importing.is_empty() {
+            return widgets::empty_state(
+                code::UPLOAD,
+                "Bring in your media",
+                "Drop screen recordings, face-cam videos, voiceovers, images or logos here.",
+                Some(widgets::primary_button(Some(code::PLUS), "Import media", Some(Message::Import)).into()),
+            );
+        }
+        let mut cards: Vec<Element<'_, Message>> = project.assets.iter().map(|a| self.media_card(a)).collect();
+        for path in &self.importing {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            cards.push(
+                container(
+                    column![
+                        container(iced_aw::Spinner::new().width(Length::Fixed(20.0)).height(Length::Fixed(20.0)).circle_radius(2.0)).center_x(Fill).height(76).align_y(Alignment::Center).style(style::inset),
+                        text(name).size(T_CAPTION).color(TEXT_3).wrapping(text::Wrapping::None),
+                    ]
+                    .spacing(6),
+                )
+                .padding(6)
+                .into(),
+            );
+        }
+        let grid = iced::widget::grid(cards).fluid(190).spacing(6).height(iced::widget::grid::Sizing::EvenlyDistribute(Length::Shrink));
+        widgets::scroll(container(grid).padding([6, 8])).height(Fill).into()
+    }
+
+    fn media_card<'a>(&'a self, a: &'a crate::model::Asset) -> Element<'a, Message> {
+        let selected = self.library_selected == Some(a.id);
+        let thumb: Element<'a, Message> = match self.media.get(a.id).and_then(|m| m.cover.clone()) {
+            Some(h) => image(h).width(Fill).height(76).content_fit(iced::ContentFit::Cover).border_radius(6.0).into(),
+            None => {
+                let glyph = match a.kind {
+                    MediaKind::Audio => code::AUDIO_WAVEFORM,
+                    MediaKind::Image => code::IMAGE,
+                    MediaKind::Video => code::FILM,
+                };
+                let color = if a.kind == MediaKind::Audio { clip::AUDIO } else { TEXT_3 };
+                container(tinted(glyph, 22, color)).center_x(Fill).height(76).align_y(Alignment::Center).style(style::inset).into()
+            }
+        };
+        let badge = if a.kind == MediaKind::Image { "IMG".to_string() } else { fmt_duration(a.duration) };
+        let thumb = stack![
+            thumb,
+            container(container(text(badge).font(INTER_SEMIBOLD).size(10)).padding([1, 5]).style(|_| container::Style {
+                background: Some(Color { a: 0.7, ..Color::BLACK }.into()),
+                text_color: Some(Color::WHITE),
+                border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                ..Default::default()
+            }))
+            .align_right(Fill)
+            .align_bottom(76)
+            .padding(5),
+        ];
+        let name_font = if a.name.is_ascii() { INTER_MEDIUM } else { HIND };
+        let card = container(column![thumb, text(&a.name).font(name_font).size(T_CAPTION).wrapping(text::Wrapping::None)].spacing(6))
+            .padding(5)
+            .width(Fill)
+            .style(move |t| {
+                let mut s = style::card(t);
+                if selected {
+                    s.border = iced::Border { color: ACCENT, width: 1.5, radius: R_LG.into() };
+                    s.background = Some(Color { a: 0.08, ..ACCENT }.into());
+                } else {
+                    s.background = None;
+                    s.border.color = Color::TRANSPARENT;
+                }
+                s
+            });
+        let id = a.id;
+        let area = mouse_area(card).on_press(Message::LibraryPress(id)).on_double_click(Message::LibraryAdd(id)).interaction(mouse::Interaction::Grab);
+        ContextMenu::new(area, move || {
+            widgets::menu(
+                vec![
+                    MenuItem::new(code::PLUS, "Add to timeline", Message::LibraryAdd(id)).shortcut("Double-click"),
+                    MenuItem::Separator,
+                    MenuItem::new(code::TRASH_2, "Remove from project", Message::LibraryRemove(id)).danger(),
+                ],
+                220.0,
+            )
+        })
+        .style(|_, _| iced_aw::style::context_menu::Style { background: Color::TRANSPARENT.into() })
+        .into()
+    }
+
     fn preview(&self) -> Element<'_, Message> {
-        let (cw, ch) = self.project.canvas.size();
+        let (cw, ch) = self.doc.project.canvas.size();
         let stage = responsive(move |size: Size| {
             let fit = (size.width / cw as f32).min(size.height / ch as f32).min(1.0);
             let (w, h) = ((cw as f32 * fit).floor(), (ch as f32 * fit).floor());
-            let frame = container(
-                column![tinted(code::CLAPPERBOARD, 22, TEXT_4), text("Your canvas").size(T_SMALL).color(TEXT_4)].spacing(6).align_x(Alignment::Center),
-            )
-            .center_x(w)
-            .center_y(h)
-            .style(|_| container::Style {
-                background: Some(Color::BLACK.into()),
-                border: iced::Border { color: LINE, width: 1.0, radius: 2.0.into() },
-                shadow: iced::Shadow { color: Color { a: 0.5, ..Color::BLACK }, offset: iced::Vector::new(0.0, 6.0), blur_radius: 24.0 },
-                ..Default::default()
-            });
+            let frame = container(column![tinted(code::CLAPPERBOARD, 22, TEXT_4), text("Preview renderer coming next").size(T_SMALL).color(TEXT_4)].spacing(6).align_x(Alignment::Center))
+                .center_x(w)
+                .center_y(h)
+                .style(|_| container::Style {
+                    background: Some(Color::BLACK.into()),
+                    border: iced::Border { color: LINE, width: 1.0, radius: 2.0.into() },
+                    shadow: iced::Shadow { color: Color { a: 0.5, ..Color::BLACK }, offset: iced::Vector::new(0.0, 6.0), blur_radius: 24.0 },
+                    ..Default::default()
+                });
             container(frame).center(Fill).into()
         });
+        let duration = self.doc.project.duration();
         let transport = row![
-            text(fmt_timecode(self.playhead)).font(INTER_MEDIUM).size(T_BODY),
-            text(" / 00:00:00").size(T_BODY).color(TEXT_4),
+            text(fmt_timecode_frames(self.playhead, self.doc.project.canvas.fps)).font(INTER_MEDIUM).size(T_BODY),
+            text(format!(" / {}", fmt_timecode(duration))).size(T_BODY).color(TEXT_4),
             space().width(Fill),
-            widgets::tip(widgets::icon_button(code::SKIP_BACK, Some(Message::TogglePlay)), "Go to start", Some("Home"), tip_pos()),
-            widgets::tip(play_button(self.playing), if self.playing { "Pause" } else { "Play" }, Some("Space"), tip_pos()),
-            widgets::tip(widgets::icon_button(code::SKIP_FORWARD, Some(Message::TogglePlay)), "Go to end", Some("End"), tip_pos()),
+            widgets::tip(widgets::icon_button(code::SKIP_BACK, Some(Message::GoStart)), "Go to start", Some("Home"), tip_pos()),
+            widgets::tip(play_button(self.playing.is_some()), if self.playing.is_some() { "Pause" } else { "Play" }, Some("Space"), tip_pos()),
+            widgets::tip(widgets::icon_button(code::SKIP_FORWARD, Some(Message::GoEnd)), "Go to end", Some("End"), tip_pos()),
             space().width(Fill),
             widgets::tip(widgets::icon_button(code::VOLUME_2, None), "Mute preview", Some("M"), tip_pos()),
             widgets::tip(widgets::icon_button(code::MAXIMIZE_2, None), "Full screen", Some("F"), tip_pos()),
@@ -226,64 +836,227 @@ impl Editor {
 
     fn inspector(&self) -> Element<'_, Message> {
         match self.side_tab {
-            SideTab::Inspector => widgets::empty_state(code::MOUSE_POINTER_2, "Nothing selected", "Select a clip on the timeline to edit its position, style, color and animation.", None),
-            SideTab::Assistant => widgets::empty_state(
-                code::SPARKLES,
-                "Assistant",
-                "Select part of the timeline and describe the animation you want. Uses your Claude Code login.",
-                None,
-            ),
+            SideTab::Inspector => match self.selection.as_slice() {
+                [] => inspector::empty(),
+                [id] => match self.doc.project.clip(*id) {
+                    Some(c) => inspector::view(&self.doc.project, c),
+                    None => inspector::empty(),
+                },
+                many => inspector::multiple(many.len()),
+            },
+            SideTab::Assistant => {
+                let range: Element<'_, Message> = match self.range {
+                    Some((a, b)) => container(
+                        row![tinted(code::SQUARE_DASHED, 14, ACCENT_HOVER), text(format!("Selected {} – {}  ({:.1}s)", fmt_ruler(a), fmt_ruler(b), b - a)).size(T_SMALL)]
+                            .spacing(S2)
+                            .align_y(Alignment::Center),
+                    )
+                    .padding([8, 10])
+                    .width(Fill)
+                    .style(style::badge(ACCENT_HOVER))
+                    .into(),
+                    None => space().into(),
+                };
+                column![
+                    container(range).padding([4, 10]),
+                    widgets::empty_state(
+                        code::SPARKLES,
+                        "Assistant",
+                        "Use the Range tool (R) to select part of the timeline, then describe the animation you want. Uses your Claude Code login.",
+                        None,
+                    )
+                ]
+                .into()
+            }
         }
     }
 
     fn timeline_header(&self) -> Element<'_, Message> {
         let tools = row![
             widgets::tip(widgets::icon_toggle(code::MOUSE_POINTER_2, self.tool == Tool::Select, Message::Tool(Tool::Select)), "Select", Some("V"), tip_pos()),
-            widgets::tip(widgets::icon_toggle(code::SCISSORS, self.tool == Tool::Blade, Message::Tool(Tool::Blade)), "Blade — split clips", Some("B"), tip_pos()),
-            widgets::tip(
-                widgets::icon_toggle(code::SQUARE_DASHED, self.tool == Tool::Range, Message::Tool(Tool::Range)),
-                "Range — select a part to animate",
-                Some("R"),
-                tip_pos(),
-            ),
+            widgets::tip(widgets::icon_toggle(code::SCISSORS, self.tool == Tool::Blade, Message::Tool(Tool::Blade)), "Blade — click a clip to split", Some("B"), tip_pos()),
+            widgets::tip(widgets::icon_toggle(code::SQUARE_DASHED, self.tool == Tool::Range, Message::Tool(Tool::Range)), "Range — select a part to animate", Some("R"), tip_pos()),
+            container(widgets::vdivider(16.0)).padding([0, 4]),
+            widgets::tip(widgets::icon_button(code::SPLIT, Some(Message::SplitAtPlayhead)), "Split at playhead", Some("S"), tip_pos()),
+            widgets::tip(widgets::icon_button(code::TRASH_2, (!self.selection.is_empty()).then_some(Message::DeleteSelection)), "Delete", Some("Del"), tip_pos()),
             container(widgets::vdivider(16.0)).padding([0, 4]),
             widgets::tip(widgets::icon_toggle(code::MAGNET, self.snapping, Message::ToggleSnapping), "Snapping", Some("N"), tip_pos()),
         ]
         .spacing(2)
         .align_y(Alignment::Center);
-        let zoom = row![widgets::icon_button(code::ZOOM_OUT, None), widgets::icon_button(code::ZOOM_IN, None)].spacing(2);
+        let zoom = row![
+            widgets::tip(widgets::icon_button(code::ZOOM_OUT, Some(Message::ZoomBy(1.0 / 1.4))), "Zoom out", Some("−"), tip_pos()),
+            widgets::tip(widgets::icon_button(code::SCAN, Some(Message::ZoomFit)), "Fit timeline", Some("Shift+Z"), tip_pos()),
+            widgets::tip(widgets::icon_button(code::ZOOM_IN, Some(Message::ZoomBy(1.4))), "Zoom in", Some("+"), tip_pos()),
+        ]
+        .spacing(2);
         header_row(row![text("Timeline").font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_2), container(tools).padding([0, 10])].align_y(Alignment::Center).into(), zoom.into())
     }
 
     fn timeline(&self) -> Element<'_, Message> {
-        let headers = column(self.project.tracks.iter().map(|t| {
+        responsive(move |size| {
+            self.timeline_size.set(size);
+            let project = &self.doc.project;
+            let content_h = timeline::content_height(project);
+            let overflow = content_h > size.height - RULER_H;
+            let add = DropDownless::add_track_button(project);
+            let ruler = row![
+                container(add).width(HEADER_W).height(RULER_H).padding([0, 8]).center_y(RULER_H),
+                iced::widget::canvas(Ruler { view: self.view, playhead: self.playhead, range: self.range }).width(Fill).height(RULER_H),
+            ];
+            let lanes = Lanes {
+                project,
+                media: &self.media,
+                selection: &self.selection,
+                playhead: self.playhead,
+                view: self.view,
+                tool: self.tool,
+                snapping: self.snapping,
+                range: self.range,
+                dnd: self.dnd,
+                cache: &self.lanes_cache,
+                overflow,
+            };
+            let body = row![
+                container(self.track_headers()).width(HEADER_W),
+                stack![
+                    iced::widget::canvas(timeline::LanesBase(lanes)).width(Fill).height(content_h),
+                    iced::widget::canvas(lanes).width(Fill).height(content_h),
+                ],
+            ];
+            column![ruler, widgets::scroll(body).height(Fill)].into()
+        })
+        .into()
+    }
+
+    fn track_headers(&self) -> Element<'_, Message> {
+        let project = &self.doc.project;
+        let mut col = column![space().height(timeline::TOP_PAD)].spacing(0);
+        for t in &project.tracks {
+            let h = timeline::track_height(t.kind);
+            let id = t.id;
             let (glyph, color) = match t.kind {
                 TrackKind::Visual => (code::LAYERS, clip::VIDEO),
                 TrackKind::Audio => (code::AUDIO_LINES, clip::AUDIO),
             };
-            container(
-                row![
-                    tinted(glyph, 13, color),
-                    text(&t.name).font(INTER_MEDIUM).size(T_SMALL).width(Fill).wrapping(text::Wrapping::None),
-                    tinted(if t.hidden { code::EYE_OFF } else { code::EYE }, 13, TEXT_4),
-                    tinted(if t.locked { code::LOCK } else { code::LOCK_OPEN }, 13, TEXT_4),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            )
-            .padding([0, 10])
-            .height(44)
-            .center_y(44)
-            .style(style::card)
-            .into()
-        }))
-        .spacing(4)
-        .width(196);
-        let lanes = container(widgets::empty_state(code::FILM, "Your timeline is empty", "Import media and drag it here, or double-click a file in the library.", None))
-            .width(Fill)
-            .height(Fill)
-            .style(style::inset);
-        row![container(headers).padding([8, 8]), container(lanes).padding(iced::Padding { top: 8.0, right: 8.0, bottom: 8.0, left: 0.0 })].into()
+            let name: Element<'_, Message> = match &self.renaming {
+                Some((rid, value)) if *rid == id => text_input("Track name", value)
+                    .id("track-rename")
+                    .on_input(Message::RenameInput)
+                    .on_submit(Message::RenameCommit)
+                    .padding([3, 6])
+                    .size(T_SMALL)
+                    .style(style::input)
+                    .into(),
+                _ => {
+                    let font = if t.name.is_ascii() { INTER_MEDIUM } else { HIND_SEMIBOLD };
+                    mouse_area(text(&t.name).font(font).size(T_SMALL).wrapping(text::Wrapping::None)).on_double_click(Message::Track(id, TrackAction::Rename)).into()
+                }
+            };
+            let small = |glyph: char, active: bool, action: TrackAction, tip: &'static str| {
+                widgets::tip(
+                    button(container(icon(glyph, 12).color(if active { WARNING } else { TEXT_3 })).center(22)).width(22).height(22).padding(0).style(style::ghost).on_press(Message::Track(id, action)),
+                    tip,
+                    None,
+                    tip_pos(),
+                )
+            };
+            let mut toggles = row![].spacing(0);
+            if t.kind == TrackKind::Audio {
+                toggles = toggles.push(small(if t.muted { code::VOLUME_X } else { code::VOLUME_2 }, t.muted, TrackAction::ToggleMuted, "Mute track"));
+            } else {
+                toggles = toggles.push(small(if t.hidden { code::EYE_OFF } else { code::EYE }, t.hidden, TrackAction::ToggleHidden, "Hide track"));
+            }
+            toggles = toggles.push(small(if t.locked { code::LOCK } else { code::LOCK_OPEN }, t.locked, TrackAction::ToggleLocked, "Lock track"));
+            let header = container(row![tinted(glyph, 13, color), container(name).width(Fill).clip(true), toggles].spacing(8).align_y(Alignment::Center))
+                .padding(iced::Padding { left: 10.0, right: 4.0, ..Default::default() })
+                .height(h)
+                .center_y(h)
+                .style(style::card);
+            let menu = ContextMenu::new(header, move || {
+                widgets::menu(
+                    vec![
+                        MenuItem::new(code::PENCIL, "Rename track", Message::Track(id, TrackAction::Rename)),
+                        MenuItem::Separator,
+                        MenuItem::new(code::LAYERS, "Add video track", Message::Track(id, TrackAction::AddVideo)),
+                        MenuItem::new(code::AUDIO_LINES, "Add audio track", Message::Track(id, TrackAction::AddAudio)),
+                        MenuItem::Separator,
+                        MenuItem::new(code::CHEVRON_UP, "Move up", Message::Track(id, TrackAction::MoveUp)),
+                        MenuItem::new(code::CHEVRON_DOWN, "Move down", Message::Track(id, TrackAction::MoveDown)),
+                        MenuItem::Separator,
+                        MenuItem::new(code::TRASH_2, "Delete track", Message::Track(id, TrackAction::Delete)).danger(),
+                    ],
+                    210.0,
+                )
+            })
+            .style(|_, _| iced_aw::style::context_menu::Style { background: Color::TRANSPARENT.into() });
+            col = col.push(container(menu).padding(iced::Padding { left: 8.0, right: 6.0, bottom: timeline::GAP, top: 0.0 }));
+        }
+        col.into()
+    }
+}
+
+/// Track creation button above the headers.
+struct DropDownless;
+
+impl DropDownless {
+    fn add_track_button<'a>(project: &Project) -> Element<'a, Message> {
+        let first_visual = project.tracks.iter().find(|t| t.kind == TrackKind::Visual).map(|t| t.id).unwrap_or(0);
+        let last = project.tracks.last().map(|t| t.id).unwrap_or(0);
+        row![
+            widgets::tip(
+                button(row![icon(code::PLUS, 12), text("Video").size(T_CAPTION)].spacing(4).align_y(Alignment::Center)).padding([3, 7]).style(style::ghost).on_press(Message::Track(first_visual, TrackAction::AddVideo)),
+                "Add video track",
+                None,
+                tip_pos(),
+            ),
+            widgets::tip(
+                button(row![icon(code::PLUS, 12), text("Audio").size(T_CAPTION)].spacing(4).align_y(Alignment::Center)).padding([3, 7]).style(style::ghost).on_press(Message::Track(last, TrackAction::AddAudio)),
+                "Add audio track",
+                None,
+                tip_pos(),
+            ),
+        ]
+        .spacing(2)
+        .into()
+    }
+}
+
+/// Global events the editor cares about: cursor, mouse release, file drops and shortcuts.
+fn editor_event(event: Event, status: event::Status, _window: window::Id) -> Option<Message> {
+    match event {
+        Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::CursorMoved(position)),
+        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => Some(Message::MouseReleased),
+        Event::Window(window::Event::FileDropped(path)) => Some(Message::ImportPicked(vec![path])),
+        Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) if status == event::Status::Ignored => {
+            let cmd = modifiers.command();
+            match key.as_ref() {
+                Key::Named(key::Named::Space) => Some(Message::TogglePlay),
+                Key::Named(key::Named::Delete | key::Named::Backspace) => Some(Message::DeleteSelection),
+                Key::Named(key::Named::Home) => Some(Message::GoStart),
+                Key::Named(key::Named::End) => Some(Message::GoEnd),
+                Key::Named(key::Named::ArrowLeft) => Some(Message::Step(if modifiers.shift() { -10 } else { -1 })),
+                Key::Named(key::Named::ArrowRight) => Some(Message::Step(if modifiers.shift() { 10 } else { 1 })),
+                Key::Named(key::Named::Escape) => Some(Message::Escape),
+                Key::Character("z") if cmd && modifiers.shift() => Some(Message::Redo),
+                Key::Character("z") if cmd => Some(Message::Undo),
+                Key::Character("y") if cmd => Some(Message::Redo),
+                Key::Character("d") if cmd => Some(Message::DuplicateSelection),
+                Key::Character("i") if cmd => Some(Message::Import),
+                Key::Character("b") if cmd => Some(Message::SplitAtPlayhead),
+                Key::Character("s") if !cmd => Some(Message::SplitAtPlayhead),
+                Key::Character("v") if !cmd => Some(Message::Tool(Tool::Select)),
+                Key::Character("b") => Some(Message::Tool(Tool::Blade)),
+                Key::Character("r") if !cmd => Some(Message::Tool(Tool::Range)),
+                Key::Character("n") if !cmd => Some(Message::ToggleSnapping),
+                Key::Character("t") if !cmd => Some(Message::AddText),
+                Key::Character("=" | "+") => Some(Message::ZoomBy(1.4)),
+                Key::Character("-") => Some(Message::ZoomBy(1.0 / 1.4)),
+                Key::Character("Z") | Key::Character("z") if modifiers.shift() => Some(Message::ZoomFit),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -313,17 +1086,26 @@ fn tab_icon<'a>(glyph: char, label: &'a str, active: bool, on_press: Message) ->
 }
 
 fn play_button<'a>(playing: bool) -> Element<'a, Message> {
-    button(container(icon(if playing { code::PAUSE } else { code::PLAY }, 15)).center(Length::Fill))
-        .width(38)
-        .height(38)
-        .padding(0)
-        .style(style::primary)
-        .on_press(Message::TogglePlay)
-        .into()
+    button(container(icon(if playing { code::PAUSE } else { code::PLAY }, 15)).center(Length::Fill)).width(38).height(38).padding(0).style(style::primary).on_press(Message::TogglePlay).into()
 }
 
 pub fn fmt_timecode(t: f64) -> String {
-    let t = t.max(0.0);
-    let total = t.floor() as u64;
+    let total = t.max(0.0).floor() as u64;
     format!("{:02}:{:02}:{:02}", total / 3600, (total / 60) % 60, total % 60)
+}
+
+fn fmt_timecode_frames(t: f64, fps: u32) -> String {
+    let frames = (t.max(0.0) * fps as f64).round() as u64;
+    let fps = fps.max(1) as u64;
+    let secs = frames / fps;
+    format!("{:02}:{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60, frames % fps)
+}
+
+fn fmt_ruler(t: f64) -> String {
+    timeline::fmt_ruler(t, true)
+}
+
+fn fmt_duration(d: f64) -> String {
+    let s = d.round() as u64;
+    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
 }
