@@ -2,7 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod clip;
+mod doc;
+mod edit;
 mod editor;
+mod ffmpeg;
+mod media;
 mod model;
 mod settings;
 mod start;

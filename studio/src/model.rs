@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::clip::Clip;
+
 pub const FILE_EXTENSION: &str = "aivp";
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -124,7 +126,15 @@ pub struct Asset {
     pub duration: f64,
     pub width: u32,
     pub height: u32,
+    #[serde(default)]
+    pub fps: f64,
     pub has_audio: bool,
+}
+
+impl Asset {
+    pub fn is_visual(&self) -> bool {
+        self.kind != MediaKind::Audio
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,16 +159,18 @@ pub struct Project {
     pub name: String,
     pub canvas: Canvas,
     pub assets: Vec<Asset>,
+    /// Top to bottom: earlier visual tracks draw on top of later ones.
     pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub clips: Vec<Clip>,
     pub next_id: Id,
 }
 
 impl Project {
     pub fn new(name: &str, canvas: Canvas) -> Project {
-        let mut p = Project { version: FORMAT_VERSION, name: name.to_string(), canvas, assets: Vec::new(), tracks: Vec::new(), next_id: 1 };
+        let mut p = Project { version: FORMAT_VERSION, name: name.to_string(), canvas, assets: Vec::new(), tracks: Vec::new(), clips: Vec::new(), next_id: 1 };
         for (name, kind) in [("Text", TrackKind::Visual), ("Overlay", TrackKind::Visual), ("Main", TrackKind::Visual), ("Voiceover", TrackKind::Audio), ("Music", TrackKind::Audio)] {
-            let id = p.alloc_id();
-            p.tracks.push(Track { id, name: name.into(), kind, muted: false, locked: false, hidden: false });
+            p.add_track(kind, name, None);
         }
         p
     }
