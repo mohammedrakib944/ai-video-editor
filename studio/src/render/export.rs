@@ -119,12 +119,24 @@ pub fn export(project: &Project, path: &Path, quality: Quality, cancel: &AtomicB
         s
     });
 
-    let cleanup = |child: &mut std::process::Child| {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_file(&part);
-        let _ = std::fs::remove_file(&graph_file);
-    };
+    // Whatever goes wrong below, the encoder is stopped and the partial file removed.
+    struct Cleanup<'a> {
+        child: &'a mut std::process::Child,
+        files: [&'a Path; 2],
+        done: bool,
+    }
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            if !self.done {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                for f in self.files {
+                    let _ = std::fs::remove_file(f);
+                }
+            }
+        }
+    }
+    let mut guard = Cleanup { child: &mut child, files: [&part, &graph_file], done: false };
 
     let server = FrameServer::default();
     server.set_preview_width(w as f32);
@@ -133,7 +145,6 @@ pub fn export(project: &Project, path: &Path, quality: Quality, cancel: &AtomicB
     for n in 0..frames_total {
         if cancel.load(Ordering::Relaxed) {
             drop(stdin);
-            cleanup(&mut child);
             bail!("cancelled");
         }
         let t = n as f64 / fps as f64;
@@ -150,14 +161,15 @@ pub fn export(project: &Project, path: &Path, quality: Quality, cancel: &AtomicB
         }
     }
     drop(stdin);
-    let status = child.wait().context("FFmpeg stopped unexpectedly")?;
+    let status = guard.child.wait().context("FFmpeg stopped unexpectedly")?;
     let log = err_thread.join().unwrap_or_default();
-    let _ = std::fs::remove_file(&graph_file);
     if !status.success() {
-        let _ = std::fs::remove_file(&part);
         bail!("Encoding failed: {}", log.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("unknown error").trim());
     }
     std::fs::rename(&part, path).with_context(|| format!("could not move the video to {}", path.display()))?;
+    guard.done = true;
+    drop(guard);
+    let _ = std::fs::remove_file(&graph_file);
     Ok(path.to_path_buf())
 }
 
@@ -287,7 +299,8 @@ impl scene::Sources for ExactSources<'_> {
             if let Some(f) = self.inner.image(asset) {
                 return Some(f);
             }
-            if Instant::now() > deadline {
+            self.server.settle();
+            if self.server.image_failed(asset) || Instant::now() > deadline {
                 return None;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));

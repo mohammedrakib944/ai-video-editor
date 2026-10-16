@@ -76,6 +76,13 @@ impl Project {
         }
     }
 
+    /// Fails if the clip sits on a locked track.
+    fn ensure_unlocked(&self, clip: Id) -> anyhow::Result<()> {
+        let c = self.clip(clip).context("That clip no longer exists")?;
+        ensure!(!self.track(c.track).is_some_and(|t| t.locked), "That track is locked");
+        Ok(())
+    }
+
     fn overlaps(&self, track: Id, start: f64, duration: f64, ignore: &[Id]) -> bool {
         const EPS: f64 = 1e-6;
         self.clips_on(track).any(|c| !ignore.contains(&c.id) && start < c.end() - EPS && start + duration > c.start + EPS)
@@ -241,6 +248,7 @@ impl Project {
 
     /// Drags one edge of a clip to timeline time `t`, clamped to the media and the neighbours.
     pub fn trim(&mut self, id: Id, edge: Edge, t: f64) -> anyhow::Result<()> {
+        self.ensure_unlocked(id)?;
         let clip = self.clip(id).context("That clip no longer exists")?.clone();
         let neighbours: Vec<&Clip> = self.clips_on(clip.track).filter(|c| c.id != id).collect();
         let prev_end = neighbours.iter().filter(|c| c.end() <= clip.start + 1e-6).map(|c| c.end()).fold(0.0, f64::max);
@@ -249,7 +257,8 @@ impl Project {
         let c = self.clip_mut(id)?;
         match edge {
             Edge::Start => {
-                let mut new_start = t.clamp(prev_end, clip.end() - MIN_CLIP);
+                // max/min rather than clamp: neighbours can overlap by a rounding error.
+                let mut new_start = t.max(prev_end).min(clip.end() - MIN_CLIP);
                 if let Content::Media { src_in, .. } = &mut c.content {
                     // Can't reveal footage before the start of the file (unless it's a still image).
                     let earliest = clip.start - *src_in / speed;
@@ -278,11 +287,26 @@ impl Project {
         let max = self.max_duration(&self.clip(id).unwrap().clone());
         let c = self.clip_mut(id)?;
         c.duration = c.duration.min(max);
+        // Drop or shorten zooms and range volumes that now fall outside the clip.
+        let len = c.duration;
+        c.zooms.retain(|z| z.at + z.duration > 0.05 && z.at < len - 0.05);
+        for z in &mut c.zooms {
+            let end = (z.at + z.duration).min(len);
+            z.at = z.at.max(0.0);
+            z.duration = end - z.at;
+        }
+        c.audio.gains.retain(|g| g.at + g.duration > 0.01 && g.at < len - 0.01);
+        for g in &mut c.audio.gains {
+            let end = (g.at + g.duration).min(len);
+            g.at = g.at.max(0.0);
+            g.duration = end - g.at;
+        }
         Ok(())
     }
 
     /// Splits a clip at timeline time `t`. Returns the id of the new right-hand clip.
     pub fn split(&mut self, id: Id, t: f64) -> anyhow::Result<Id> {
+        self.ensure_unlocked(id)?;
         let clip = self.clip(id).context("That clip no longer exists")?.clone();
         ensure!(t > clip.start + MIN_CLIP && t < clip.end() - MIN_CLIP, "Move the playhead inside the clip to split it");
         let new_id = self.alloc_id();
@@ -312,23 +336,44 @@ impl Project {
 
     pub fn delete_clips(&mut self, ids: &[Id]) -> anyhow::Result<()> {
         ensure!(!ids.is_empty(), "Nothing selected");
+        for &id in ids {
+            self.ensure_unlocked(id)?;
+        }
         self.clips.retain(|c| !ids.contains(&c.id));
         Ok(())
     }
 
-    /// Changes playback speed, keeping the same source footage (so the clip gets shorter or longer).
+    /// Changes playback speed, keeping the same footage: the clip gets shorter or longer,
+    /// later clips on its track move along so none of it is lost, and zooms and range
+    /// volumes stay on the same footage.
     pub fn set_speed(&mut self, id: Id, new_speed: f64) -> anyhow::Result<()> {
         ensure!((0.1..=8.0).contains(&new_speed), "Speed must be between 0.1× and 8×");
+        self.ensure_unlocked(id)?;
         let clip = self.clip(id).context("That clip no longer exists")?.clone();
         let Content::Media { speed, .. } = clip.content else { bail!("Only video and audio clips have a speed") };
-        let source_len = clip.duration * speed;
-        let new_duration = (source_len / new_speed).max(MIN_CLIP);
-        let next_start = self.clips_on(clip.track).filter(|c| c.id != id && c.start >= clip.end() - 1e-6).map(|c| c.start).fold(f64::INFINITY, f64::min);
+        let ratio = speed / new_speed;
+        let new_duration = (clip.duration * ratio).max(MIN_CLIP);
+        let delta = new_duration - clip.duration;
+        let old_end = clip.end();
+        for c in self.clips.iter_mut().filter(|c| c.track == clip.track && c.id != id && c.start >= old_end - 1e-6) {
+            c.start = (c.start + delta).max(0.0);
+        }
         let c = self.clip_mut(id)?;
         if let Content::Media { speed, .. } = &mut c.content {
             *speed = new_speed;
         }
-        c.duration = new_duration.min(next_start - clip.start);
+        c.duration = new_duration;
+        for z in &mut c.zooms {
+            z.at *= ratio;
+            z.duration *= ratio;
+        }
+        for g in &mut c.audio.gains {
+            g.at *= ratio;
+            g.duration *= ratio;
+        }
+        for k in c.keyframes.values_mut().flatten() {
+            k.t *= ratio;
+        }
         Ok(())
     }
 
@@ -346,7 +391,7 @@ impl Project {
         let hi = others.iter().filter(|(s, _)| *s >= mid).map(|(s, _)| *s).fold(len, f64::min);
         ensure!(hi - lo >= 0.3, "There's no room for the zoom there");
         duration = duration.min(hi - lo);
-        at = at.clamp(lo, hi - duration);
+        at = at.max(lo).min(hi - duration);
         z.at = at;
         z.duration = duration;
         Ok(())
@@ -370,6 +415,7 @@ impl Project {
 
     /// Duplicates a clip right after itself (or the nearest free spot).
     pub fn duplicate_clip(&mut self, id: Id) -> anyhow::Result<Id> {
+        self.ensure_unlocked(id)?;
         let clip = self.clip(id).context("That clip no longer exists")?.clone();
         let start = self.nearest_free(clip.track, clip.end(), clip.duration, &[]);
         let new_id = self.alloc_id();
@@ -456,6 +502,34 @@ mod tests {
         p.set_speed(c, 2.0).unwrap();
         assert_eq!(p.clip(c).unwrap().duration, 5.0);
         assert_eq!(p.clip(c).unwrap().source_time(5.0), 10.0);
+    }
+
+    #[test]
+    fn slowing_down_next_to_a_neighbour_loses_nothing() {
+        let (mut p, a) = project_with_video(10.0);
+        let c = p.add_media_clip(a, None, 0.0).unwrap();
+        let track = p.clip(c).unwrap().track;
+        let next = p.add_media_clip(a, Some(track), 10.0).unwrap();
+        p.clip_mut(c).unwrap().zooms.push(crate::clip::Zoom { id: 99, at: 4.0, duration: 2.0, scale: 2.0, focus_x: 0.5, focus_y: 0.5, ramp: 0.5 });
+        p.set_speed(c, 0.5).unwrap();
+        assert_eq!(p.clip(c).unwrap().duration, 20.0);
+        assert_eq!(p.clip(next).unwrap().start, 20.0, "the neighbour moves along");
+        assert_eq!(p.clip(c).unwrap().zooms[0].at, 8.0, "the zoom stays on the same footage");
+        p.set_speed(c, 1.0).unwrap();
+        assert_eq!(p.clip(c).unwrap().duration, 10.0, "back to the full original length");
+        assert_eq!(p.clip(next).unwrap().start, 10.0);
+    }
+
+    #[test]
+    fn locked_tracks_refuse_edits() {
+        let (mut p, a) = project_with_video(10.0);
+        let c = p.add_media_clip(a, None, 0.0).unwrap();
+        let track = p.clip(c).unwrap().track;
+        p.track_mut(track).unwrap().locked = true;
+        assert!(p.trim(c, Edge::End, 5.0).is_err());
+        assert!(p.split(c, 5.0).is_err());
+        assert!(p.delete_clips(&[c]).is_err());
+        assert!(p.set_speed(c, 2.0).is_err());
     }
 
     #[test]

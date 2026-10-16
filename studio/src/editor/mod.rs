@@ -22,7 +22,7 @@ use iced_aw::ContextMenu;
 use self::inspector::Edit;
 use self::media_cache::{AssetMedia, MediaCache};
 use self::timeline::{HEADER_W, Lanes, RULER_H, Ruler, View};
-use crate::clip::{TextLayer, Zoom};
+use crate::clip::{Rgba, TextLayer, Zoom};
 use crate::doc::Doc;
 use crate::edit::Edge;
 use crate::media::{self, ProbeInfo};
@@ -121,6 +121,7 @@ pub enum Message {
     RangeVolume(Id, f64),
     RemoveGain(Id, Id),
     TrackResizeStart(Id),
+    HexDraft(Id, &'static str, String),
     /// Point a library item at a new file (for moved or missing media).
     Relink(Id),
     Relinked(Id, Option<PathBuf>),
@@ -211,6 +212,7 @@ pub struct Editor {
     frames: FrameServer,
     export: Option<export_dialog::ExportDialog>,
     audio: Option<crate::playback::AudioPlayer>,
+    /// Fingerprint of the sound the running audio player was started with.
     audio_revision: u64,
     muted: bool,
     sound_preview: Option<(&'static str, crate::playback::AudioPlayer, Instant)>,
@@ -220,6 +222,7 @@ pub struct Editor {
     resizing_track: Option<(Id, f32, f32)>,
     /// Library items whose file can't be found.
     missing: std::collections::HashSet<Id>,
+    hex_draft: Option<inspector::HexDraft>,
     agent: crate::assistant::Agent,
     chat: Vec<assistant_panel::ChatItem>,
     chat_input: iced::widget::text_editor::Content,
@@ -280,6 +283,7 @@ impl Editor {
             file_hover: false,
             resizing_track: None,
             missing: Default::default(),
+            hex_draft: None,
             agent: crate::assistant::Agent::default(),
             chat: Vec::new(),
             chat_input: iced::widget::text_editor::Content::new(),
@@ -290,6 +294,16 @@ impl Editor {
     fn refresh_missing(&mut self) {
         self.missing = self.doc.project.assets.iter().filter(|a| !a.path.is_file()).map(|a| a.id).collect();
         self.lanes_cache.clear();
+    }
+
+    /// Stops playback, previews and any running export (before the editor is closed or replaced).
+    pub fn shutdown(&mut self) {
+        self.stop_playback();
+        self.sound_preview = None;
+        if let Some(export_dialog::ExportDialog { phase: export_dialog::Phase::Running { cancel, .. }, .. }) = &self.export {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.agent.stop();
     }
 
     /// Turns the assistant on or off when the user connects or disconnects an AI.
@@ -391,7 +405,7 @@ impl Editor {
         self.sound_preview = None;
         self.playing = Some((Instant::now(), self.playhead));
         self.audio = crate::playback::AudioPlayer::start(&self.doc.project, self.playhead, self.muted).ok();
-        self.audio_revision = self.doc.revision;
+        self.audio_revision = audio_fingerprint(&self.doc.project);
     }
 
     fn stop_playback(&mut self) {
@@ -410,6 +424,9 @@ impl Editor {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if self.export.is_some() && blocked_by_dialog(&message) {
+            return Task::none();
+        }
         match message {
             Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => self.panes.resize(split, ratio),
             Message::LibraryTab(t) => self.library_tab = t,
@@ -436,7 +453,8 @@ impl Editor {
                 self.frames.collect_idle();
                 if let Some((started, from)) = self.playing {
                     // Edits during playback change the sound: restart the mix where we are.
-                    if self.audio.is_some() && self.doc.revision != self.audio_revision {
+                    // Only edits that change the sound restart the mix (moving a layer doesn't).
+                    if self.audio.is_some() && audio_fingerprint(&self.doc.project) != self.audio_revision {
                         self.start_playback();
                         return Task::none();
                     }
@@ -733,6 +751,15 @@ impl Editor {
                     Err(e) => self.notify(format!("Couldn't use that file: {e}"), true),
                 }
             }
+            Message::HexDraft(clip, field, text) => {
+                let parsed = Rgba::parse(&text);
+                self.hex_draft = Some((clip, field, text));
+                if let (Some(c), Some(current)) = (parsed, self.doc.project.clip(clip).and_then(|c| inspector::current_color(c, field))) {
+                    if let Some(edit) = inspector::hex_edit(field, Rgba(c.0, c.1, c.2, current.3)) {
+                        return self.update(Message::Edit(clip, edit));
+                    }
+                }
+            }
             Message::TrackResizeStart(id) => {
                 if let Some(t) = self.doc.project.track(id) {
                     self.resizing_track = Some((id, self.cursor.y, timeline::track_height(t)));
@@ -975,7 +1002,7 @@ impl Editor {
                     self.lanes_cache.clear();
                 }
             }
-            Message::Track(id, action) => self.track_action(id, action),
+            Message::Track(id, action) => return self.track_action(id, action),
             Message::RenameInput(s) => {
                 if let Some((_, name)) = &mut self.renaming {
                     *name = s;
@@ -997,6 +1024,13 @@ impl Editor {
                 self.seek(end);
             }
             Message::Escape => {
+                if self.export.as_ref().is_some_and(|e| !e.is_running()) {
+                    self.export = None;
+                    return Task::none();
+                }
+                if self.renaming.take().is_some() {
+                    return Task::none();
+                }
                 if self.zoom_edit.take().is_some() {
                     self.lanes_cache.clear();
                     return Task::none();
@@ -1136,7 +1170,11 @@ impl Editor {
                         }
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => tokio::time::sleep(Duration::from_millis(40)).await,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // The export thread ended without a result (it crashed): say so instead of hanging.
+                        let _ = tx.send(Progress::Failed("The export stopped unexpectedly. Please try again.".into())).await;
+                        break;
+                    }
                 }
             }
         });
@@ -1193,17 +1231,31 @@ impl Editor {
         }
     }
 
+    /// Drops UI state that points at things an undo, redo or delete removed.
     fn after_history(&mut self) {
         let p = &self.doc.project;
         self.selection.retain(|id| p.clip(*id).is_some());
+        if self.zoom_edit.is_some_and(|(c, z)| !p.clip(c).is_some_and(|c| c.zooms.iter().any(|zz| zz.id == z))) {
+            self.zoom_edit = None;
+        }
+        if self.renaming.as_ref().is_some_and(|(t, _)| p.track(*t).is_none()) {
+            self.renaming = None;
+        }
+        if self.library_selected.is_some_and(|a| p.asset(a).is_none()) {
+            self.library_selected = None;
+        }
+        if self.hex_draft.as_ref().is_some_and(|(c, _, _)| !self.selection.contains(c)) {
+            self.hex_draft = None;
+        }
         self.lanes_cache.clear();
     }
 
-    fn track_action(&mut self, id: Id, action: TrackAction) {
+    fn track_action(&mut self, id: Id, action: TrackAction) -> Task<Message> {
         match action {
             TrackAction::Rename => {
                 if let Some(t) = self.doc.project.track(id) {
                     self.renaming = Some((id, t.name.clone()));
+                    return iced::widget::operation::focus("track-rename");
                 }
             }
             TrackAction::ToggleHidden => {
@@ -1248,6 +1300,7 @@ impl Editor {
                 self.edit("Add track", |p| Ok(p.add_track(TrackKind::Audio, &format!("Audio {n}"), index)));
             }
         }
+        Task::none()
     }
 
     // ------------------------------------------------------------ view
@@ -1340,6 +1393,7 @@ impl Editor {
             let origin = iced::Vector::new(((size.width - w) / 2.0).floor(), ((size.height - h) / 2.0).floor());
             // Decode a little above the on-screen size so high-DPI screens stay sharp.
             self.frames.set_preview_width(w * 1.5);
+            self.frames.collect_idle();
             let project = &self.doc.project;
             // While editing a zoom, show that clip unzoomed so the whole frame is visible.
             let editing = self.zoom_edit.and_then(|(clip, zoom)| project.clip(clip).and_then(|c| c.zooms.iter().find(|z| z.id == zoom).map(|z| (clip, *z))));
@@ -1388,7 +1442,7 @@ impl Editor {
             SideTab::Inspector => match self.selection.as_slice() {
                 [] => inspector::empty(),
                 [id] => match self.doc.project.clip(*id) {
-                    Some(c) => inspector::view(&self.doc.project, c, self.zoom_edit.map(|(_, z)| z), self.range),
+                    Some(c) => inspector::view(&self.doc.project, c, self.zoom_edit.map(|(_, z)| z), self.range, self.hex_draft.as_ref()),
                     None => inspector::empty(),
                 },
                 many => inspector::multiple(many.len()),
@@ -1557,6 +1611,54 @@ impl Editor {
     }
 }
 
+/// Editing actions (mostly from shortcuts) that a modal dialog keeps from reaching the project.
+pub fn blocked_by_dialog(m: &Message) -> bool {
+    matches!(
+        m,
+        Message::TogglePlay
+            | Message::DeleteSelection
+            | Message::DuplicateSelection
+            | Message::SplitAtPlayhead
+            | Message::MarkRange
+            | Message::MarkIn
+            | Message::MarkOut
+            | Message::AddZoomAtPlayhead
+            | Message::AddText
+            | Message::Undo
+            | Message::Redo
+            | Message::Step(_)
+            | Message::GoStart
+            | Message::GoEnd
+            | Message::ToggleSnapping
+            | Message::ImportPicked(_)
+    )
+}
+
+/// A hash of everything that affects the audio mix, so playback restarts only when the sound changes.
+fn audio_fingerprint(p: &Project) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for c in &p.clips {
+        if let crate::clip::Content::Media { asset, src_in, speed } = c.content {
+            (c.id, asset, c.track).hash(&mut h);
+            for v in [c.start, c.duration, src_in, speed, c.audio.volume, c.audio.fade_in, c.audio.fade_out] {
+                v.to_bits().hash(&mut h);
+            }
+            c.audio.muted.hash(&mut h);
+            for g in &c.audio.gains {
+                (g.at.to_bits(), g.duration.to_bits(), g.volume.to_bits()).hash(&mut h);
+            }
+        }
+    }
+    for t in &p.tracks {
+        (t.id, t.muted, t.hidden).hash(&mut h);
+    }
+    for a in &p.assets {
+        a.path.hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Synthesizes (if needed) and probes a built-in sound in the background.
 fn sound_task(id: &'static str, done: fn(&'static str, Result<(PathBuf, ProbeInfo), String>) -> Message) -> Task<Message> {
     Task::perform(
@@ -1607,6 +1709,7 @@ fn editor_event(event: Event, status: event::Status, _window: window::Id) -> Opt
         Event::Window(window::Event::FileDropped(path)) => Some(Message::ImportPicked(vec![path])),
         Event::Window(window::Event::FileHovered(_)) => Some(Message::FileHover(true)),
         Event::Window(window::Event::FilesHoveredLeft) => Some(Message::FileHover(false)),
+        Event::Keyboard(keyboard::Event::KeyPressed { key: Key::Named(key::Named::Escape), .. }) => Some(Message::Escape),
         Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) if status == event::Status::Ignored => {
             let cmd = modifiers.command();
             match key.as_ref() {

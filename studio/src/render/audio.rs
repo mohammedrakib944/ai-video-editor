@@ -21,7 +21,8 @@ pub fn mix_graph(project: &Project, first_input: usize, total: f64) -> (Vec<Audi
         let Content::Media { asset, src_in, speed } = clip.content else { continue };
         let Some(a) = project.asset(asset) else { continue };
         let Some(track) = project.track(clip.track) else { continue };
-        let audible = a.has_audio && a.kind != MediaKind::Image && !clip.audio.muted && clip.audio.volume > 0.0 && !(track.kind == TrackKind::Audio && track.muted);
+        // Muted audio tracks and hidden video tracks are silent.
+        let audible = a.has_audio && a.kind != MediaKind::Image && !clip.audio.muted && clip.audio.volume > 0.0 && !track.muted && !(track.kind == TrackKind::Visual && track.hidden);
         if !audible || clip.start >= total {
             continue;
         }

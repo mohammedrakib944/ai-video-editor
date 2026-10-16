@@ -301,6 +301,10 @@ impl Lanes<'_> {
         if p.y < top || p.y > top + h {
             return None;
         }
+        // Clips on locked tracks can't be picked up.
+        if self.project.track(track).is_some_and(|t| t.locked) {
+            return None;
+        }
         let t = self.view.t(p.x);
         let clip = self.project.clips_on(track).find(|c| t >= c.start && t <= c.end())?;
         let (x0, x1) = (self.view.x(clip.start), self.view.x(clip.end()));
@@ -818,7 +822,8 @@ impl Lanes<'_> {
 
         // Transition into the clip: a soft wedge at its start.
         if let Some(tr) = clip.transition {
-            let tw = ((tr.duration * self.view.zoom) as f32).clamp(6.0, r.width);
+            // min/max, not clamp: very short clips are narrower than the 6 px minimum.
+            let tw = ((tr.duration * self.view.zoom) as f32).max(6.0).min(r.width);
             let wedge = Path::new(|b| {
                 b.move_to(Point::new(r.x, r.y));
                 b.line_to(Point::new(r.x + tw, r.y));

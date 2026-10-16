@@ -122,6 +122,9 @@ impl App {
                 }
             }
             Message::Editor(editor::Message::OpenAiConnect) | Message::OpenAi => self.ai_dialog = true,
+            // The Connect AI dialog is modal: shortcuts don't edit the project behind it.
+            Message::Editor(ref m) if self.ai_dialog && editor::blocked_by_dialog(m) => {}
+            Message::Editor(editor::Message::Escape) if self.ai_dialog => self.ai_dialog = false,
             Message::Ai(msg) => match msg {
                 crate::ai_connect::Message::Close => self.ai_dialog = false,
                 crate::ai_connect::Message::Connect(provider) => {
@@ -257,6 +260,9 @@ impl App {
             Message::Quit => {
                 self.app_menu = false;
                 self.persist();
+                if let Screen::Editor(e) = &mut self.screen {
+                    e.shutdown();
+                }
                 return window::latest().and_then(window::close);
             }
         }
@@ -298,6 +304,11 @@ impl App {
     }
 
     fn show_editor(&mut self, project: Project, path: Option<PathBuf>) -> Task<Message> {
+        // Save and stop the current project first.
+        self.persist();
+        if let Screen::Editor(old) = &mut self.screen {
+            old.shutdown();
+        }
         let mut editor = Editor::new(project, path, self.settings.layout);
         editor.set_ai(self.settings.ai);
         let task = editor.boot().map(Message::Editor);
@@ -339,6 +350,9 @@ impl App {
 
     fn close_project(&mut self) {
         self.persist();
+        if let Screen::Editor(e) = &mut self.screen {
+            e.shutdown();
+        }
         self.screen = Screen::Start(Start::default());
     }
 

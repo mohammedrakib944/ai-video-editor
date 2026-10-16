@@ -699,6 +699,7 @@ impl Editor {
                     canvas.resolution = Resolution::ALL.into_iter().find(|x| x.label().eq_ignore_ascii_case(v)).context("Unknown resolution")?;
                 }
                 if let Some(v) = s(&a, "fps").and_then(|v| v.parse().ok()).or_else(|| a.get("fps").and_then(Value::as_u64).map(|v| v as u32)) {
+                    anyhow::ensure!(crate::model::FRAME_RATES.contains(&v), "Frame rate must be one of 24, 25, 30 or 60");
                     canvas.fps = v;
                 }
                 self.ai_edit("Change format", |p| {

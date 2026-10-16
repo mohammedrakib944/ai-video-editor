@@ -254,7 +254,7 @@ const MOTIONS: [MotionChoice; 8] = [
     MotionChoice(Some(MotionKind::ZoomIn)),
 ];
 
-pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, range: Option<(f64, f64)>) -> Element<'a, Message> {
+pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, range: Option<(f64, f64)>, hex: Option<&'a HexDraft>) -> Element<'a, Message> {
     let id = clip.id;
     let e = move |edit: Edit| Message::Edit(id, edit);
     let kind = clip.asset().and_then(|a| project.asset(a)).map(|a| a.kind);
@@ -321,7 +321,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
                 .align_y(Alignment::Center),
                 widgets::segmented(&weights.map(|w| w.0), t.weight, move |w| weights.iter().find(|x| x.0 == *w).map(|x| x.1).unwrap_or("").to_string(), move |w| e(Edit::Weight(w))),
                 slider_row("Size", t.size, 12.0..=400.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::FontSize(v))),
-                color_row("Color", t.color, move |c| e(Edit::TextColor(c))),
+                color_row("Color", t.color, (id, "text", hex), move |c| e(Edit::TextColor(c))),
                 toggle_row("Background box", t.background.is_some(), move |on| e(Edit::TextBox(on))),
             ]
             .spacing(S3)
@@ -345,10 +345,10 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
         if s.kind == crate::clip::ShapeKind::Ring {
             body = body.push(slider_row("Thickness", s.thickness, 1.0..=200.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::ShapeThickness(v))));
         }
-        body = body.push(color_row(if s.fill_to.is_some() { "Color 1" } else { "Fill" }, s.fill, move |c| e(Edit::ShapeFill(c))));
+        body = body.push(color_row(if s.fill_to.is_some() { "Color 1" } else { "Fill" }, s.fill, (id, "shape1", hex), move |c| e(Edit::ShapeFill(c))));
         body = body.push(toggle_row("Gradient", s.fill_to.is_some(), move |on| e(Edit::ShapeGradient(on))));
         if let Some(to) = s.fill_to {
-            body = body.push(color_row("Color 2", to, move |c| e(Edit::ShapeFillTo(c))));
+            body = body.push(color_row("Color 2", to, (id, "shape2", hex), move |c| e(Edit::ShapeFillTo(c))));
             body = body.push(row![
                 text("Style").size(T_SMALL).color(TEXT_2).width(84),
                 widgets::segmented(&[false, true], s.radial, |r| if *r { "Radial".into() } else { "Linear".into() }, move |r| e(Edit::ShapeRadial(r))),
@@ -389,7 +389,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
             ]
             .spacing(S3);
             if l.border_width > 0.0 {
-                frame = frame.push(color_row("Border color", l.border_color, move |c| e(Edit::BorderColor(c))));
+                frame = frame.push(color_row("Border color", l.border_color, (id, "border", hex), move |c| e(Edit::BorderColor(c))));
             }
             frame = frame.push(toggle_row("Drop shadow", l.shadow.enabled, move |on| e(Edit::Shadow(on))));
             if l.shadow.enabled {
@@ -585,7 +585,32 @@ fn toggle_row<'a>(name: &'a str, on: bool, on_toggle: impl Fn(bool) -> Message +
     row![text(name).size(T_SMALL).color(TEXT_2).width(Fill), toggler(on).on_toggle(on_toggle).size(18).style(style::toggler)].align_y(Alignment::Center).into()
 }
 
-fn color_row<'a>(name: &'a str, value: Rgba, on_pick: impl Fn(Rgba) -> Message + Clone + 'a) -> Element<'a, Message> {
+/// Hex color being typed: (clip, field, text). Kept until it parses, so typing works letter by letter.
+pub type HexDraft = (Id, &'static str, String);
+
+/// The color a hex field edits, so a typed value keeps the current transparency.
+pub fn current_color(clip: &Clip, field: &str) -> Option<Rgba> {
+    match (field, &clip.content) {
+        ("text", Content::Text(t)) => Some(t.color),
+        ("shape1", Content::Shape(s)) => Some(s.fill),
+        ("shape2", Content::Shape(s)) => s.fill_to,
+        ("border", _) => Some(clip.look.border_color),
+        _ => None,
+    }
+}
+
+/// The edit that sets a hex field's color.
+pub fn hex_edit(field: &str, c: Rgba) -> Option<Edit> {
+    Some(match field {
+        "text" => Edit::TextColor(c),
+        "shape1" => Edit::ShapeFill(c),
+        "shape2" => Edit::ShapeFillTo(c),
+        "border" => Edit::BorderColor(c),
+        _ => return None,
+    })
+}
+
+fn color_row<'a>(name: &'a str, value: Rgba, field: (Id, &'static str, Option<&'a HexDraft>), on_pick: impl Fn(Rgba) -> Message + Clone + 'a) -> Element<'a, Message> {
     let swatches = row(PALETTE.iter().map(|&hex| {
         let c = Rgba::hex(hex);
         let selected = c.to_hex() == value.to_hex();
@@ -605,9 +630,13 @@ fn color_row<'a>(name: &'a str, value: Rgba, on_pick: impl Fn(Rgba) -> Message +
             .into()
     }))
     .spacing(5);
-    let on_hex = on_pick.clone();
-    let hex = text_input("#FFFFFF", &value.to_hex())
-        .on_input(move |s| Rgba::parse(&s).map(|c| on_hex(Rgba(c.0, c.1, c.2, value.3))).unwrap_or(Message::Noop))
+    let (clip, key, draft) = field;
+    let shown = match draft {
+        Some((c, k, text)) if *c == clip && *k == key => text.clone(),
+        _ => value.to_hex(),
+    };
+    let hex = text_input("#FFFFFF", &shown)
+        .on_input(move |s| Message::HexDraft(clip, key, s))
         .padding([4, 7])
         .size(T_CAPTION)
         .width(74)

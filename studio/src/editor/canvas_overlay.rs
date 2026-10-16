@@ -151,7 +151,8 @@ impl canvas::Program<Message> for Overlay<'_> {
                         return Some(Action::capture());
                     }
                 }
-                let hit = self.scene.layers.iter().rev().find(|l| contains(l, p));
+                let locked = |l: &LayerSpec| self.project.clip(l.clip).and_then(|c| self.project.track(c.track)).is_some_and(|t| t.locked);
+                let hit = self.scene.layers.iter().rev().find(|l| contains(l, p) && !locked(l));
                 match hit {
                     Some(l) => {
                         let clip = self.project.clip(l.clip)?;

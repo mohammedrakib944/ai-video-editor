@@ -158,6 +158,8 @@ pub struct FrameServer {
     decoders: RefCell<HashMap<Id, Decoder>>,
     images: Arc<Mutex<HashMap<Id, Arc<Frame>>>>,
     images_loading: RefCell<HashSet<Id>>,
+    /// Images that couldn't be decoded; not retried until the file changes.
+    images_failed: Arc<Mutex<HashSet<Id>>>,
     texts: RefCell<HashMap<u64, Arc<Frame>>>,
     /// Widest frame worth decoding (the preview's size in physical pixels).
     max_width: Cell<u32>,
@@ -171,6 +173,7 @@ impl Default for FrameServer {
             decoders: RefCell::default(),
             images: Arc::default(),
             images_loading: RefCell::default(),
+            images_failed: Arc::default(),
             texts: RefCell::default(),
             max_width: Cell::new(1280),
             signal: Arc::default(),
@@ -211,6 +214,7 @@ impl FrameServer {
     pub fn forget_asset(&self, asset: Id) {
         self.images.lock().unwrap().remove(&asset);
         self.images_loading.borrow_mut().remove(&asset);
+        self.images_failed.lock().unwrap().remove(&asset);
         // Decoders are per clip; drop them all so none keeps reading the old file.
         self.decoders.borrow_mut().clear();
     }
@@ -277,22 +281,26 @@ impl Sources for Bound<'_> {
             return Some(f.clone());
         }
         let a = self.project.asset(asset)?;
-        if a.kind != MediaKind::Image || !server.images_loading.borrow_mut().insert(asset) {
+        if a.kind != MediaKind::Image || server.images_failed.lock().unwrap().contains(&asset) || !server.images_loading.borrow_mut().insert(asset) {
             return None;
         }
-        let (path, images, sig) = (a.path.clone(), server.images.clone(), server.signal.clone());
+        let (path, images, sig, failed) = (a.path.clone(), server.images.clone(), server.signal.clone(), server.images_failed.clone());
         let scale = (2048.0 / a.width.max(a.height).max(1) as f64).min(1.0);
         let (w, h) = (((a.width as f64 * scale) as u32).max(1), ((a.height as f64 * scale) as u32).max(1));
         std::thread::spawn(move || {
-            let mut cmd = match ffmpeg::ffmpeg() {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            cmd.arg("-i").arg(&path).args(["-frames:v", "1", "-vf", &format!("scale={w}:{h},format=rgba"), "-f", "rawvideo", "pipe:1"]);
-            if let Ok(rgba) = crate::media::read_raw(cmd, (w * h * 4) as usize) {
-                images.lock().unwrap().insert(asset, Arc::new(Frame::new(w, h, rgba)));
-                sig.store(true, Ordering::Relaxed);
+            let decoded = ffmpeg::ffmpeg().and_then(|mut cmd| {
+                cmd.arg("-i").arg(&path).args(["-frames:v", "1", "-vf", &format!("scale={w}:{h},format=rgba"), "-f", "rawvideo", "pipe:1"]);
+                crate::media::read_raw(cmd, (w * h * 4) as usize)
+            });
+            match decoded {
+                Ok(rgba) => {
+                    images.lock().unwrap().insert(asset, Arc::new(Frame::new(w, h, rgba)));
+                }
+                Err(_) => {
+                    failed.lock().unwrap().insert(asset);
+                }
             }
+            sig.store(true, Ordering::Relaxed);
         });
         None
     }
@@ -308,7 +316,13 @@ impl FrameServer {
     /// Marks image loads that finished, so `busy` turns false.
     pub fn settle(&self) {
         let loaded: Vec<Id> = self.images.lock().unwrap().keys().copied().collect();
-        self.images_loading.borrow_mut().retain(|id| !loaded.contains(id));
+        let failed = self.images_failed.lock().unwrap();
+        self.images_loading.borrow_mut().retain(|id| !loaded.contains(id) && !failed.contains(id));
+    }
+
+    /// Whether an image couldn't be decoded (so waiting for it is pointless).
+    pub fn image_failed(&self, asset: Id) -> bool {
+        self.images_failed.lock().unwrap().contains(&asset)
     }
 }
 

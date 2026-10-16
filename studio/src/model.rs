@@ -117,7 +117,7 @@ pub enum MediaKind {
     Image,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Asset {
     pub id: Id,
     pub path: PathBuf,
@@ -143,7 +143,7 @@ pub enum TrackKind {
     Audio,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     pub id: Id,
     pub name: String,
@@ -156,7 +156,7 @@ pub struct Track {
     pub height: Option<f32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub version: u32,
     pub name: String,

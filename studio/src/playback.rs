@@ -107,6 +107,8 @@ impl AudioPlayer {
         let cap = (rate as f64 * BUFFER_SECONDS) as usize * channels;
         std::thread::Builder::new().name("audio-reader".into()).spawn(move || {
             let mut buf = vec![0u8; 4096 * 4 * channels];
+            // Bytes of a sample split across two reads.
+            let mut carry: Vec<u8> = Vec::with_capacity(4);
             loop {
                 if reader.stop.load(Ordering::Relaxed) {
                     break;
@@ -118,9 +120,12 @@ impl AudioPlayer {
                 match stdout.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let n = n - n % 4;
+                        let mut bytes = std::mem::take(&mut carry);
+                        bytes.extend_from_slice(&buf[..n]);
+                        let whole = bytes.len() - bytes.len() % 4;
+                        carry = bytes[whole..].to_vec();
                         let mut q = reader.samples.lock().unwrap();
-                        q.extend(buf[..n].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+                        q.extend(bytes[..whole].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
                     }
                 }
             }
