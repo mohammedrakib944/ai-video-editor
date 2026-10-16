@@ -1,5 +1,6 @@
 //! The editor screen: library, preview, inspector and timeline in resizable panes.
 
+mod assistant_panel;
 mod canvas_overlay;
 pub mod export_dialog;
 pub mod inspector;
@@ -136,6 +137,13 @@ pub enum Message {
     SoundPreviewTick,
     ZoomEdit(Option<(Id, Id)>),
     AiTool(crate::mcp::Call),
+    ChatInput(String),
+    ChatSend,
+    ChatSuggestion(String),
+    ChatStop,
+    ChatNew,
+    ChatPoll,
+    ChatRecheck,
     ToolImported(crate::mcp::Call, Vec<(PathBuf, Result<ProbeInfo, String>)>, bool),
     ToolSound(crate::mcp::Call, &'static str, Result<(PathBuf, ProbeInfo), String>),
     Track(Id, TrackAction),
@@ -192,6 +200,9 @@ pub struct Editor {
     muted: bool,
     sound_preview: Option<(&'static str, crate::playback::AudioPlayer, Instant)>,
     zoom_edit: Option<(Id, Id)>,
+    agent: crate::assistant::Agent,
+    chat: Vec<assistant_panel::ChatItem>,
+    chat_input: String,
 }
 
 impl Editor {
@@ -243,6 +254,9 @@ impl Editor {
             muted: false,
             sound_preview: None,
             zoom_edit: None,
+            agent: crate::assistant::Agent::default(),
+            chat: Vec::new(),
+            chat_input: String::new(),
         }
     }
 
@@ -280,6 +294,9 @@ impl Editor {
         }
         if self.toast.is_some() {
             subs.push(iced::time::every(Duration::from_millis(500)).map(|_| Message::DismissToast));
+        }
+        if self.agent.busy {
+            subs.push(iced::time::every(Duration::from_millis(60)).map(|_| Message::ChatPoll));
         }
         if self.sound_preview.is_some() {
             subs.push(iced::time::every(Duration::from_millis(250)).map(|_| Message::SoundPreviewTick));
@@ -711,6 +728,71 @@ impl Editor {
                 }
             }
             Message::AiTool(call) => return self.handle_tool(call),
+            Message::ChatInput(s) => self.chat_input = s,
+            Message::ChatSuggestion(s) => {
+                self.chat_input = s;
+                return self.update(Message::ChatSend);
+            }
+            Message::ChatSend => {
+                let text = self.chat_input.trim().to_string();
+                if text.is_empty() || self.agent.busy {
+                    return Task::none();
+                }
+                let context = self.context_line();
+                let label = self.range.map(|(a, b)| format!("Range {} – {}", fmt_ruler(a), fmt_ruler(b)));
+                let cwd = self.path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()).unwrap_or_else(crate::settings::home_dir);
+                match self.agent.send(&text, &context, &cwd) {
+                    Ok(()) => {
+                        self.chat.push(assistant_panel::ChatItem::User { text, context: label });
+                        self.chat_input.clear();
+                    }
+                    Err(e) => self.chat.push(assistant_panel::ChatItem::Notice(e.to_string())),
+                }
+                return iced::widget::operation::snap_to_end(assistant_panel::SCROLL_ID);
+            }
+            Message::ChatStop => self.agent.stop(),
+            Message::ChatNew => {
+                self.agent.reset();
+                self.chat.clear();
+            }
+            Message::ChatRecheck => self.agent.recheck(),
+            Message::ChatPoll => {
+                use assistant_panel::{ChatItem, ToolState};
+                let events = self.agent.poll();
+                if events.is_empty() {
+                    return Task::none();
+                }
+                for ev in events {
+                    match ev {
+                        crate::assistant::Event::TextDelta(t) => match self.chat.last_mut() {
+                            Some(ChatItem::Reply(r)) => r.push_str(&t),
+                            _ => self.chat.push(ChatItem::Reply(t)),
+                        },
+                        crate::assistant::Event::Text(t) => self.chat.push(ChatItem::Reply(t)),
+                        crate::assistant::Event::ToolStart { id, name, input } => {
+                            self.chat.push(ChatItem::Tool { id, label: crate::assistant::describe_tool(&name, &input), state: ToolState::Running, detail: String::new(), image: None })
+                        }
+                        crate::assistant::Event::ToolDone { id, ok, summary, image } => {
+                            if let Some(ChatItem::Tool { state, detail, image: img, .. }) = self.chat.iter_mut().rev().find(|i| matches!(i, ChatItem::Tool { id: tid, .. } if *tid == id)) {
+                                *state = if ok { ToolState::Done } else { ToolState::Failed };
+                                *detail = summary;
+                                *img = image.map(iced::widget::image::Handle::from_bytes);
+                            }
+                        }
+                        crate::assistant::Event::TurnDone { error } => {
+                            for item in &mut self.chat {
+                                if let ChatItem::Tool { state: s @ ToolState::Running, .. } = item {
+                                    *s = ToolState::Done;
+                                }
+                            }
+                            if let Some(e) = error {
+                                self.chat.push(ChatItem::Notice(e));
+                            }
+                        }
+                    }
+                }
+                return iced::widget::operation::snap_to_end(assistant_panel::SCROLL_ID);
+            }
             Message::ToolImported(call, results, add) => return self.finish_tool_import(call, results, add),
             Message::ToolSound(call, sound, r) => return self.finish_tool_sound(call, sound, r),
             Message::ZoomEdit(target) => {
@@ -1003,7 +1085,12 @@ impl Editor {
             tab_icon(code::SPARKLES, "Assistant", self.side_tab == SideTab::Assistant, Message::SideTab(SideTab::Assistant)),
         ]
         .spacing(2);
-        header_row(tabs.into(), space().into())
+        let right: Element<'_, Message> = if self.side_tab == SideTab::Assistant && !self.chat.is_empty() {
+            widgets::tip(widgets::icon_button(code::FILE_PLUS, Some(Message::ChatNew)), "New conversation", None, tip_pos())
+        } else {
+            space().into()
+        };
+        header_row(tabs.into(), right)
     }
 
     fn preview(&self) -> Element<'_, Message> {
@@ -1068,31 +1155,27 @@ impl Editor {
                 },
                 many => inspector::multiple(many.len()),
             },
-            SideTab::Assistant => {
-                let range: Element<'_, Message> = match self.range {
-                    Some((a, b)) => container(
-                        row![tinted(code::SQUARE_DASHED, 14, ACCENT_HOVER), text(format!("Selected {} – {}  ({:.1}s)", fmt_ruler(a), fmt_ruler(b), b - a)).size(T_SMALL)]
-                            .spacing(S2)
-                            .align_y(Alignment::Center),
-                    )
-                    .padding([8, 10])
-                    .width(Fill)
-                    .style(style::badge(ACCENT_HOVER))
-                    .into(),
-                    None => space().into(),
-                };
-                column![
-                    container(range).padding([4, 10]),
-                    widgets::empty_state(
-                        code::SPARKLES,
-                        "Assistant",
-                        "Use the Range tool (R) to select part of the timeline, then describe the animation you want. Uses your Claude Code login.",
-                        None,
-                    )
-                ]
-                .into()
-            }
+            SideTab::Assistant => self.assistant_view(),
         }
+    }
+
+    /// One line describing the editor state, sent with each assistant message.
+    fn context_line(&self) -> String {
+        let p = &self.doc.project;
+        let mut parts = vec![format!("playhead {:.2}s", self.playhead), format!("canvas {}", p.canvas.summary())];
+        match self.selection.as_slice() {
+            [] => parts.push("no clip selected".into()),
+            [id] => {
+                if let Some(c) = p.clip(*id) {
+                    parts.push(format!("selected clip #{} \"{}\" ({:.2}–{:.2}s)", c.id, timeline::clip_label(p, c), c.start, c.end()));
+                }
+            }
+            many => parts.push(format!("selected clips {many:?}")),
+        }
+        if let Some((a, b)) = self.range {
+            parts.push(format!("selected range {a:.2}–{b:.2}s"));
+        }
+        parts.join("; ")
     }
 
     fn timeline_header(&self) -> Element<'_, Message> {
