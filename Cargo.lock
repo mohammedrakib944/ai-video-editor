@@ -4836,6 +4836,7 @@ dependencies = [
  "bytemuck",
  "iced",
  "iced_aw",
+ "pollster",
  "rfd",
  "serde",
  "serde_json",

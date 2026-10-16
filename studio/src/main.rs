@@ -7,8 +7,10 @@ mod doc;
 mod edit;
 mod editor;
 mod ffmpeg;
+mod fonts;
 mod media;
 mod model;
+mod platform;
 mod render;
 mod settings;
 mod start;
@@ -19,18 +21,6 @@ use iced::{Size, window};
 use crate::ui::tokens;
 
 fn main() -> iced::Result {
-    let fonts: [&'static [u8]; 10] = [
-        include_bytes!("../assets/fonts/Inter-Regular.ttf"),
-        include_bytes!("../assets/fonts/Inter-Medium.ttf"),
-        include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
-        include_bytes!("../assets/fonts/Inter-Bold.ttf"),
-        include_bytes!("../assets/fonts/HindSiliguri-Regular.ttf"),
-        include_bytes!("../assets/fonts/HindSiliguri-SemiBold.ttf"),
-        include_bytes!("../assets/fonts/Poppins-Regular.ttf"),
-        include_bytes!("../assets/fonts/Poppins-Medium.ttf"),
-        include_bytes!("../assets/fonts/Poppins-SemiBold.ttf"),
-        include_bytes!("../assets/icons/lucide.ttf"),
-    ];
     let mut application = iced::application(app::App::new, app::App::update, app::App::view)
         .title(app::App::title)
         .subscription(app::App::subscription)
@@ -38,7 +28,7 @@ fn main() -> iced::Result {
         .default_font(tokens::INTER)
         .antialiasing(true)
         .window(window_settings());
-    for font in fonts {
+    for font in fonts::BUNDLED {
         application = application.font(font);
     }
     application.run()

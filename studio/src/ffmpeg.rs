@@ -82,3 +82,45 @@ pub fn ffprobe() -> anyhow::Result<Command> {
 pub fn secs(t: f64) -> String {
     format!("{:.6}", t.max(0.0))
 }
+
+/// The option that reads a filter graph from a file: `-/filter_complex` since
+/// FFmpeg 7, `-filter_complex_script` before (e.g. the 6.1 in Ubuntu 24.04).
+pub fn filter_script_option() -> &'static str {
+    static OPTION: OnceLock<&'static str> = OnceLock::new();
+    OPTION.get_or_init(|| {
+        let major = binaries()
+            .ok()
+            .and_then(|b| quiet(Command::new(&b.ffmpeg)).arg("-version").output().ok())
+            .and_then(|out| parse_major_version(&String::from_utf8_lossy(&out.stdout)));
+        match major {
+            Some(v) if v < 7 => "-filter_complex_script",
+            _ => "-/filter_complex",
+        }
+    })
+}
+
+/// `ffmpeg version 6.1.1-3ubuntu5 ...` -> 6, `n7.1-...` -> 7. Git builds (`N-118000-...`) give None.
+fn parse_major_version(version_output: &str) -> Option<u32> {
+    let v = version_output.split_whitespace().nth(2)?;
+    v.strip_prefix('n').unwrap_or(v).split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+}
+
+/// Per-user scratch folder for filter graphs and other temporary files.
+pub fn work_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("ai-video-editor");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_major_version;
+
+    #[test]
+    fn reads_ffmpeg_major_version() {
+        assert_eq!(parse_major_version("ffmpeg version 6.1.1-3ubuntu5 Copyright"), Some(6));
+        assert_eq!(parse_major_version("ffmpeg version n7.1-12-g1234 Copyright"), Some(7));
+        assert_eq!(parse_major_version("ffmpeg version 7.1-full_build-www.gyan.dev Copyright"), Some(7));
+        assert_eq!(parse_major_version("ffmpeg version N-118000-gabc Copyright"), None);
+    }
+}

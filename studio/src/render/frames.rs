@@ -198,6 +198,15 @@ impl FrameServer {
         decoding || !self.images_loading.borrow().is_empty()
     }
 
+    /// Whether the decoder for `clip` holds the frame for `src_time` (or reached the end of the file).
+    pub fn has_frame(&self, clip: Id, src_time: f64) -> bool {
+        let decoders = self.decoders.borrow();
+        let Some(d) = decoders.get(&clip) else { return false };
+        let s = d.shared.state.lock().unwrap();
+        let dur = d.shared.frame_dur;
+        s.eof || s.frames.iter().any(|f| f.pts <= src_time + dur * 0.5 && f.pts + dur > src_time - dur * 0.5)
+    }
+
     /// Stops decoders for clips that haven't been shown for a while.
     pub fn collect_idle(&self) {
         self.decoders.borrow_mut().retain(|_, d| d.last_used.get().elapsed() < IDLE_DROP);

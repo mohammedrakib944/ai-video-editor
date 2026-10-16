@@ -40,7 +40,6 @@ pub enum Message {
     CloseProject,
     ToggleAssistant,
     Quit,
-    Noop,
 }
 
 pub struct App {
@@ -128,7 +127,7 @@ impl App {
                 );
             }
             Message::OpenPicked(Some(p)) => return self.open_project(&p),
-            Message::OpenPicked(None) | Message::SavePicked(None) | Message::Noop => {}
+            Message::OpenPicked(None) | Message::SavePicked(None) => {}
             Message::Save => {
                 self.app_menu = false;
                 let has_path = matches!(&self.screen, Screen::Editor(e) if e.path.is_some());
@@ -328,7 +327,7 @@ impl App {
             container(widgets::vdivider(18.0)).padding([0, 6]),
             widgets::tip(widgets::icon_toggle(code::SPARKLES, e.side_tab == SideTab::Assistant, Message::ToggleAssistant), "Assistant", Some("Ctrl+K"), pos),
             space().width(6),
-            widgets::primary_button(Some(code::DOWNLOAD), "Export", Some(Message::Noop)),
+            widgets::tip(widgets::primary_button(Some(code::DOWNLOAD), "Export", Some(Message::Editor(editor::Message::OpenExport))), "Export video", Some("Ctrl+E"), pos),
         ]
         .spacing(2)
         .align_y(Alignment::Center);
@@ -357,6 +356,7 @@ fn shortcut(event: Event, status: event::Status, _window: window::Id) -> Option<
         Key::Character("s") if modifiers.shift() => Some(Message::SaveAs),
         Key::Character("s") => Some(Message::Save),
         Key::Character("k") => Some(Message::ToggleAssistant),
+        Key::Character("e") => Some(Message::Editor(editor::Message::OpenExport)),
         Key::Character("q") => Some(Message::Quit),
         Key::Named(key::Named::Escape) => Some(Message::AppMenu(false)),
         _ => None,

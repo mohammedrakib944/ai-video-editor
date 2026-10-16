@@ -2,7 +2,9 @@
 //! (`frames`, `text`) and how they are drawn on the GPU (`compositor`).
 //! Preview and export share all of it, so the preview matches the file.
 
+pub mod audio;
 pub mod compositor;
+pub mod export;
 pub mod frames;
 pub mod scene;
 pub mod text;

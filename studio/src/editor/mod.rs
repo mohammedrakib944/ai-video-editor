@@ -1,5 +1,6 @@
 //! The editor screen: library, preview, inspector and timeline in resizable panes.
 
+pub mod export_dialog;
 pub mod inspector;
 pub mod media_cache;
 pub mod preview;
@@ -130,6 +131,18 @@ pub enum Message {
     GoEnd,
     Escape,
     DismissToast,
+    OpenExport,
+    CloseExport,
+    ExportPath(String),
+    ExportBrowse,
+    ExportBrowsed(Option<PathBuf>),
+    ExportQuality(crate::render::export::Quality),
+    StartExport,
+    ExportProgress(crate::render::export::Progress),
+    CancelExport,
+    ExportRetry,
+    RevealExport,
+    PlayExport,
     Noop,
 }
 
@@ -158,6 +171,7 @@ pub struct Editor {
     toast: Option<(String, bool, Instant)>,
     timeline_size: Cell<Size>,
     frames: FrameServer,
+    export: Option<export_dialog::ExportDialog>,
 }
 
 impl Editor {
@@ -203,6 +217,7 @@ impl Editor {
             toast: None,
             timeline_size: Cell::new(Size::new(1000.0, 300.0)),
             frames: FrameServer::default(),
+            export: None,
         }
     }
 
@@ -604,9 +619,132 @@ impl Editor {
                     self.toast = None;
                 }
             }
+            Message::OpenExport => {
+                if self.doc.project.duration() <= 0.0 {
+                    self.notify("Add something to the timeline before exporting", false);
+                } else if self.export.as_ref().is_none_or(|e| !e.is_running()) {
+                    self.playing = None;
+                    self.export = Some(export_dialog::ExportDialog::new(&self.doc.project, self.path.as_deref()));
+                }
+            }
+            Message::CloseExport => {
+                if self.export.as_ref().is_some_and(|e| !e.is_running()) {
+                    self.export = None;
+                }
+            }
+            Message::ExportPath(p) => {
+                if let Some(e) = &mut self.export {
+                    e.path = p;
+                }
+            }
+            Message::ExportBrowse => {
+                let Some(e) = &self.export else { return Task::none() };
+                let current = PathBuf::from(&e.path);
+                let dir = current.parent().map(|d| d.to_path_buf()).filter(|d| d.is_dir()).unwrap_or_else(crate::settings::home_dir);
+                let name = current.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "video.mp4".into());
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new().set_title("Export video").set_directory(dir).set_file_name(name).add_filter("MP4 video", &["mp4"]).save_file().await.map(|h| h.path().to_path_buf())
+                    },
+                    Message::ExportBrowsed,
+                );
+            }
+            Message::ExportBrowsed(Some(p)) => {
+                if let Some(e) = &mut self.export {
+                    e.path = p.with_extension("mp4").display().to_string();
+                }
+            }
+            Message::ExportBrowsed(None) => {}
+            Message::ExportQuality(q) => {
+                if let Some(e) = &mut self.export {
+                    e.quality = q;
+                }
+            }
+            Message::StartExport => return self.start_export(),
+            Message::ExportProgress(p) => {
+                use crate::render::export::Progress;
+                if let Some(e) = &mut self.export {
+                    match p {
+                        Progress::Rendering { done, total, eta } => {
+                            if let export_dialog::Phase::Running { done: d, total: t, eta: e2, .. } = &mut e.phase {
+                                (*d, *t, *e2) = (done, total, eta);
+                            }
+                        }
+                        Progress::Finished { path, seconds } => e.phase = export_dialog::Phase::Done { path, seconds },
+                        Progress::Failed(err) => e.phase = export_dialog::Phase::Failed(err),
+                        Progress::Cancelled => e.phase = export_dialog::Phase::Setup,
+                    }
+                }
+            }
+            Message::CancelExport => {
+                if let Some(export_dialog::ExportDialog { phase: export_dialog::Phase::Running { cancel, .. }, .. }) = &self.export {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Message::ExportRetry => {
+                if let Some(e) = &mut self.export {
+                    e.phase = export_dialog::Phase::Setup;
+                }
+            }
+            Message::RevealExport | Message::PlayExport => {
+                if let Some(export_dialog::ExportDialog { phase: export_dialog::Phase::Done { path, .. }, .. }) = &self.export {
+                    if matches!(message, Message::RevealExport) {
+                        crate::platform::reveal(path);
+                    } else {
+                        crate::platform::open(path);
+                    }
+                }
+            }
             Message::Noop => {}
         }
         Task::none()
+    }
+
+    fn start_export(&mut self) -> Task<Message> {
+        use crate::render::export::{self, Progress};
+        use iced::futures::SinkExt;
+        let Some(dialog) = &mut self.export else { return Task::none() };
+        let mut path = PathBuf::from(dialog.path.trim());
+        if path.extension().is_none_or(|e| !e.eq_ignore_ascii_case("mp4")) {
+            path.set_extension("mp4");
+        }
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        dialog.phase = export_dialog::Phase::Running { done: 0, total: 1, eta: None, cancel: cancel.clone() };
+        let project = self.doc.project.clone();
+        let quality = dialog.quality;
+        let stream = iced::stream::channel(64, async move |mut tx: iced::futures::channel::mpsc::Sender<Progress>| {
+            let (stx, srx) = std::sync::mpsc::channel::<Progress>();
+            std::thread::Builder::new()
+                .name("export".into())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    let progress = |p: Progress| {
+                        let _ = stx.send(p);
+                    };
+                    let result = export::export(&project, &path, quality, &cancel, &progress);
+                    let last = match result {
+                        Ok(path) => Progress::Finished { path, seconds: started.elapsed().as_secs_f64() },
+                        Err(e) if e.to_string() == "cancelled" => Progress::Cancelled,
+                        Err(e) => Progress::Failed(e.to_string()),
+                    };
+                    let _ = stx.send(last);
+                })
+                .ok();
+            loop {
+                match srx.try_recv() {
+                    Ok(p) => {
+                        let end = !matches!(p, Progress::Rendering { .. });
+                        let _ = tx.send(p).await;
+                        if end {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => tokio::time::sleep(Duration::from_millis(40)).await,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        });
+        Task::run(stream, Message::ExportProgress)
     }
 
     fn after_history(&mut self) {
@@ -699,6 +837,9 @@ impl Editor {
             .padding([9, 14])
             .style(style::popover);
             layers.push(container(toast).center_x(Fill).align_bottom(Fill).padding(iced::Padding { bottom: 22.0, ..Default::default() }).into());
+        }
+        if let Some(dialog) = &self.export {
+            layers.push(dialog.view(&self.doc.project));
         }
         stack(layers).into()
     }
