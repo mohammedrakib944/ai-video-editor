@@ -48,6 +48,15 @@ pub enum Edit {
     TextColor(Rgba),
     Align(Align),
     TextBox(bool),
+    ShapeKind(crate::clip::ShapeKind),
+    ShapeWidth(f64),
+    ShapeHeight(f64),
+    ShapeFill(Rgba),
+    ShapeGradient(bool),
+    ShapeFillTo(Rgba),
+    ShapeRadial(bool),
+    ShapeAngle(f64),
+    ShapeThickness(f64),
     Intro(Option<MotionKind>),
     Outro(Option<MotionKind>),
     IntroDuration(f64),
@@ -83,6 +92,8 @@ impl Edit {
             Edit::Text(_) => ("text", "Edit text"),
             Edit::Font(_) | Edit::FontSize(_) | Edit::Weight(_) | Edit::TextColor(_) | Edit::Align(_) | Edit::TextBox(_) => ("text-style", "Text style"),
             Edit::Intro(_) | Edit::Outro(_) | Edit::IntroDuration(_) | Edit::OutroDuration(_) => ("motion", "Animation"),
+            Edit::ShapeKind(_) | Edit::ShapeWidth(_) | Edit::ShapeHeight(_) | Edit::ShapeThickness(_) => ("shape", "Shape"),
+            Edit::ShapeFill(_) | Edit::ShapeGradient(_) | Edit::ShapeFillTo(_) | Edit::ShapeRadial(_) | Edit::ShapeAngle(_) => ("shape-fill", "Shape fill"),
             Edit::Transition(_) | Edit::TransitionDuration(_) => ("transition", "Transition"),
             Edit::RemoveZoom(_) => ("remove-zoom", "Remove zoom"),
             Edit::ZoomScale(..) | Edit::ZoomFocusX(..) | Edit::ZoomFocusY(..) | Edit::ZoomFocus(..) => ("zoom", "Zoom"),
@@ -149,6 +160,22 @@ impl Edit {
                 z.focus_x = x;
                 z.focus_y = y;
             }),
+            edit if matches!(c.content, Content::Shape(_)) => {
+                if let Content::Shape(s) = &mut c.content {
+                    match edit {
+                        Edit::ShapeKind(k) => s.kind = k,
+                        Edit::ShapeWidth(v) => s.width = v,
+                        Edit::ShapeHeight(v) => s.height = v,
+                        Edit::ShapeFill(col) => s.fill = col,
+                        Edit::ShapeGradient(on) => s.fill_to = on.then(|| s.fill_to.unwrap_or(Rgba::hex(0x2EF2A2))),
+                        Edit::ShapeFillTo(col) => s.fill_to = Some(col),
+                        Edit::ShapeRadial(r) => s.radial = r,
+                        Edit::ShapeAngle(a) => s.gradient_angle = a,
+                        Edit::ShapeThickness(v) => s.thickness = v,
+                        _ => {}
+                    }
+                }
+            }
             edit => {
                 if let Content::Text(tl) = &mut c.content {
                     match edit {
@@ -169,7 +196,7 @@ impl Edit {
 
 pub const FONTS: [&str; 3] = ["Inter", "Poppins", "Hind Siliguri"];
 
-const PALETTE: [u32; 8] = [0xFFFFFF, 0x0B0B0F, 0x7C6DFF, 0xC56BFF, 0x4C8DFF, 0x34D399, 0xFBBF24, 0xF26B6B];
+const PALETTE: [u32; 8] = [0xFFFFFF, 0x050605, 0xD6FF00, 0x2EF2A2, 0x4C8DFF, 0x8B7CF6, 0xFFB547, 0xFF6363];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MotionChoice(Option<MotionKind>);
@@ -300,6 +327,37 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>) -> 
             .spacing(S3)
             .into(),
         ));
+    }
+
+    if let Content::Shape(s) = &clip.content {
+        let kind_pick = pick_list(&crate::clip::ShapeKind::ALL[..], Some(s.kind), move |k| e(Edit::ShapeKind(k)))
+            .padding([6, 9])
+            .text_size(T_BODY)
+            .width(Fill)
+            .style(style::select)
+            .menu_style(style::select_menu);
+        let mut body = column![
+            row![text("Shape").size(T_SMALL).color(TEXT_2).width(84), kind_pick].align_y(Alignment::Center),
+            slider_row("Width", s.width, 10.0..=2400.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::ShapeWidth(v))),
+            slider_row("Height", s.height, 10.0..=2400.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::ShapeHeight(v))),
+        ]
+        .spacing(S3);
+        if s.kind == crate::clip::ShapeKind::Ring {
+            body = body.push(slider_row("Thickness", s.thickness, 1.0..=200.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::ShapeThickness(v))));
+        }
+        body = body.push(color_row(if s.fill_to.is_some() { "Color 1" } else { "Fill" }, s.fill, move |c| e(Edit::ShapeFill(c))));
+        body = body.push(toggle_row("Gradient", s.fill_to.is_some(), move |on| e(Edit::ShapeGradient(on))));
+        if let Some(to) = s.fill_to {
+            body = body.push(color_row("Color 2", to, move |c| e(Edit::ShapeFillTo(c))));
+            body = body.push(row![
+                text("Style").size(T_SMALL).color(TEXT_2).width(84),
+                widgets::segmented(&[false, true], s.radial, |r| if *r { "Radial".into() } else { "Linear".into() }, move |r| e(Edit::ShapeRadial(r))),
+            ].align_y(Alignment::Center));
+            if !s.radial {
+                body = body.push(slider_row("Direction", s.gradient_angle, 0.0..=360.0, 1.0, |v| format!("{v:.0}°"), move |v| e(Edit::ShapeAngle(v))));
+            }
+        }
+        col = col.push(section(code::SQUARE, "Shape", body.into()));
     }
 
     if is_visual {

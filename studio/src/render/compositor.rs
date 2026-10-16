@@ -9,7 +9,7 @@ use super::scene::{LayerSpec, Scene};
 
 /// Uniforms per layer, padded to the dynamic-offset alignment.
 const STRIDE: u64 = 256;
-const UNIFORM_SIZE: u64 = 160;
+const UNIFORM_SIZE: u64 = 176;
 
 struct Slot {
     texture: wgpu::Texture,
@@ -137,6 +137,7 @@ impl Compositor {
             tint_top: scene.background,
             tint_bottom: scene.background,
             grade: [0.0; 4],
+            shape: [0.0, 0.0, 0.0, std::f32::consts::PI],
         };
         let mut staging = vec![0u8; (count * STRIDE) as usize];
         self.draws.clear();
@@ -167,7 +168,7 @@ impl Compositor {
                 layer.slot
             });
             let pad = if layer.shadow_color[3] > 0.0 { layer.shadow_blur * 2.0 + layer.shadow_y.abs() + 2.0 } else { 2.0 * aa };
-            let u: [f32; 40] = [
+            let u: [f32; 44] = [
                 layer.center[0], layer.center[1], layer.size[0] / 2.0, layer.size[1] / 2.0,
                 layer.rotation, layer.opacity, layer.radius, layer.border,
                 layer.shadow_blur, layer.shadow_y, pad, aa,
@@ -178,6 +179,7 @@ impl Compositor {
                 layer.shadow_color[0], layer.shadow_color[1], layer.shadow_color[2], layer.shadow_color[3],
                 layer.grade[0], layer.grade[1], layer.grade[2], layer.grade[3],
                 w, h, if self.srgb_target { 1.0 } else { 0.0 }, if has_texture { 1.0 } else { 0.0 },
+                layer.shape[0], layer.shape[1], layer.shape[2], layer.shape[3],
             ];
             let offset = i as u64 * STRIDE;
             staging[offset as usize..(offset + UNIFORM_SIZE) as usize].copy_from_slice(bytemuck::cast_slice(&u));

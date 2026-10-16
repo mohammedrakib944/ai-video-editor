@@ -13,6 +13,7 @@ struct Layer {
     shadow_color: vec4<f32>, // sRGB rgb + strength
     grade: vec4<f32>,        // brightness, contrast, saturation, temperature
     canvas: vec4<f32>,       // width, height, target is sRGB (1/0), has texture (1/0)
+    shape: vec4<f32>,        // outline kind, ring thickness, gradient kind (0 linear / 1 radial), gradient angle (rad)
 };
 
 @group(0) @binding(0) var<uniform> layer: Layer;
@@ -41,6 +42,64 @@ fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
 fn sd_round_box(p: vec2<f32>, half: vec2<f32>, r: f32) -> f32 {
     let q = abs(p) - half + vec2<f32>(r);
     return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+// Signed distances (negative inside) for the shape outlines, in pixels.
+fn sd_ellipse(p: vec2<f32>, half: vec2<f32>) -> f32 {
+    let k = length(p / half);
+    return (k - 1.0) * min(half.x, half.y);
+}
+
+fn sd_triangle(p_in: vec2<f32>, half: vec2<f32>) -> f32 {
+    // Isosceles, pointing up, filling the box: apex moved to the origin, base below it
+    // (screen y grows downwards, so the base is at +2·half.y).
+    var p = vec2<f32>(abs(p_in.x), p_in.y + half.y);
+    let q = vec2<f32>(half.x, 2.0 * half.y);
+    let a = p - q * clamp(dot(p, q) / dot(q, q), 0.0, 1.0);
+    let b = p - q * vec2<f32>(clamp(p.x / q.x, 0.0, 1.0), 1.0);
+    let s = -sign(q.y);
+    let d = min(vec2<f32>(dot(a, a), s * (p.x * q.y - p.y * q.x)), vec2<f32>(dot(b, b), s * (p.y - q.y)));
+    return -sqrt(d.x) * sign(d.y);
+}
+
+fn sd_star(p_in: vec2<f32>, r: f32) -> f32 {
+    // Five-pointed star (after Inigo Quilez).
+    let k1 = vec2<f32>(0.809016994375, -0.587785252292);
+    let k2 = vec2<f32>(-k1.x, k1.y);
+    var p = vec2<f32>(abs(p_in.x), -p_in.y);
+    p = p - 2.0 * max(dot(k1, p), 0.0) * k1;
+    p = p - 2.0 * max(dot(k2, p), 0.0) * k2;
+    p.x = abs(p.x);
+    p.y = p.y - r;
+    let rf = 0.45;
+    let ba = rf * vec2<f32>(-k1.y, k1.x) - vec2<f32>(0.0, 1.0);
+    let h = clamp(dot(p, ba) / dot(ba, ba), 0.0, r);
+    return length(p - ba * h) * sign(p.y * ba.x - p.x * ba.y);
+}
+
+fn sd_hexagon(p_in: vec2<f32>, r: f32) -> f32 {
+    let k = vec3<f32>(-0.866025404, 0.5, 0.577350269);
+    var p = abs(p_in);
+    p = p - 2.0 * min(dot(k.xy, p), 0.0) * k.xy;
+    p = p - vec2<f32>(clamp(p.x, -k.z * r, k.z * r), r);
+    return length(p) * sign(p.y);
+}
+
+fn sd_shape(p: vec2<f32>, half: vec2<f32>, radius: f32) -> f32 {
+    let kind = layer.shape.x;
+    let m = min(half.x, half.y);
+    if (kind < 0.5) {
+        return sd_round_box(p, half, radius);
+    } else if (kind < 1.5) {
+        return sd_ellipse(p, half);
+    } else if (kind < 2.5) {
+        return sd_triangle(p, half - vec2<f32>(radius)) - radius;
+    } else if (kind < 3.5) {
+        return sd_star(p, m - radius) - radius;
+    } else if (kind < 4.5) {
+        return sd_hexagon(p, m * 0.866 - radius) - radius;
+    }
+    return abs(sd_ellipse(p, half - vec2<f32>(layer.shape.y * 0.5))) - layer.shape.y * 0.5;
 }
 
 fn to_linear(c: vec3<f32>) -> vec3<f32> {
@@ -77,7 +136,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let border = layer.params.w;
     let opacity = layer.params.y;
     let aa = max(layer.shadow.w, 0.0001);
-    let d = sd_round_box(in.local, half, radius);
+    let d = sd_shape(in.local, half, radius);
     let cover = clamp(0.5 - d / aa, 0.0, 1.0);
 
     var texel = vec4<f32>(1.0);
@@ -85,7 +144,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let f = in.local / max(half, vec2<f32>(0.0001)) * 0.5 + 0.5;
         texel = textureSample(tex, samp, mix(layer.uv.xy, layer.uv.zw, f));
     }
-    let g = clamp(in.local.y / max(half.y, 0.0001) * 0.5 + 0.5, 0.0, 1.0);
+    // Gradient position: along the angle (CSS-style, 180° = top to bottom) or out from the center.
+    let n = in.local / max(half, vec2<f32>(0.0001));
+    let dir = vec2<f32>(sin(layer.shape.w), -cos(layer.shape.w));
+    var g = clamp(dot(n, dir) * 0.5 + 0.5, 0.0, 1.0);
+    if (layer.shape.z > 0.5) {
+        g = clamp(length(n), 0.0, 1.0);
+    }
     let tint = mix(layer.tint_top, layer.tint_bottom, g);
     var rgb = apply_grade(texel.rgb * to_linear(tint.rgb), layer.grade);
     var a = texel.a * tint.a;
@@ -102,7 +167,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let strength = layer.shadow_color.a;
     if (strength > 0.0) {
         let blur = max(layer.shadow.x, 1.0);
-        let ds = sd_round_box(in.local - vec2<f32>(0.0, layer.shadow.y), half, radius);
+        let ds = sd_shape(in.local - vec2<f32>(0.0, layer.shadow.y), half, radius);
         let sa = strength * opacity * (1.0 - smoothstep(-blur, blur, ds));
         out = out + vec4<f32>(to_linear(layer.shadow_color.rgb) * sa, sa) * (1.0 - alpha);
     }

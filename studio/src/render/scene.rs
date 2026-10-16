@@ -40,6 +40,9 @@ pub struct LayerSpec {
     pub tint_bottom: [f32; 4],
     /// Brightness, contrast, saturation, temperature (0 = unchanged).
     pub grade: [f32; 4],
+    /// Outline: kind (0 rectangle, 1 ellipse, 2 triangle, 3 star, 4 hexagon, 5 ring),
+    /// ring thickness in px, gradient kind (0 linear, 1 radial), gradient angle in radians.
+    pub shape: [f32; 4],
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +129,7 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
         }
     }
 
+    let mut shape = [0.0, 0.0, 0.0, std::f32::consts::PI];
     let (frame, natural, slot, tint_top, tint_bottom, is_media) = match &clip.content {
         Content::Media { asset, .. } => {
             let a = project.asset(*asset)?;
@@ -143,6 +147,15 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
         }
         Content::Shape(s) => {
             let natural = [(s.width as f32 * unit).max(1.0), (s.height as f32 * unit).max(1.0)];
+            let kind = match s.kind {
+                crate::clip::ShapeKind::Rectangle => 0.0,
+                crate::clip::ShapeKind::Ellipse => 1.0,
+                crate::clip::ShapeKind::Triangle => 2.0,
+                crate::clip::ShapeKind::Star => 3.0,
+                crate::clip::ShapeKind::Hexagon => 4.0,
+                crate::clip::ShapeKind::Ring => 5.0,
+            };
+            shape = [kind, s.thickness as f32 * unit * scale, if s.radial { 1.0 } else { 0.0 }, (s.gradient_angle as f32).to_radians()];
             let top = [s.fill.0, s.fill.1, s.fill.2, s.fill.3];
             let bottom = s.fill_to.map(|c| [c.0, c.1, c.2, c.3]).unwrap_or(top);
             (None, natural, 0, top, bottom, false)
@@ -221,6 +234,7 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
         tint_top,
         tint_bottom,
         grade: [g.brightness as f32, g.contrast as f32, g.saturation as f32, g.temperature as f32],
+        shape,
     })
 }
 

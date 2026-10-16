@@ -331,7 +331,7 @@ mod tests {
         p.set_speed(v, 2.0).unwrap();
         let t = p.add_text_clip(None, 0.2, crate::edit::DEFAULT_STILL, TextLayer { text: "নতুন Studio".into(), ..Default::default() }).unwrap();
         p.clip_mut(t).unwrap().intro = Some(Motion { kind: MotionKind::Pop, duration: 0.4 });
-        p.add_shape_clip(Some(p.tracks[1].id), 0.0, crate::edit::DEFAULT_STILL, ShapeLayer { kind: ShapeKind::Rectangle, width: 200.0, height: 80.0, fill: Rgba::hex(0x7C6DFF), fill_to: None }).unwrap();
+        p.add_shape_clip(Some(p.tracks[1].id), 0.0, crate::edit::DEFAULT_STILL, ShapeLayer::new(ShapeKind::Rectangle, 200.0, 80.0, Rgba::hex(0x7C6DFF), None)).unwrap();
 
         let out = dir.join("out.mp4");
         let cancel = AtomicBool::new(false);

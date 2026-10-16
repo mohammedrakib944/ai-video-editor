@@ -111,9 +111,12 @@ pub fn schemas() -> Vec<Value> {
             "Add a rectangle or ellipse (cards, highlights, backgrounds). Returns the clip id.",
             merged(&[style_props()], json!({
                 "start": num("Timeline seconds"), "duration": num("Seconds (default 4)"),
-                "shape": choice(&["rectangle", "ellipse"], "Default rectangle"),
+                "shape": choice(&["rectangle", "ellipse", "triangle", "star", "hexagon", "ring"], "Default rectangle (use corner_radius for rounded cards and pills)"),
                 "width": num("Canvas units"), "height": num("Canvas units"),
-                "color": string("#RRGGBB fill"), "color_to": string("#RRGGBB second color for a vertical gradient"),
+                "color": string("#RRGGBB fill"), "color_to": string("#RRGGBB second color for a gradient"),
+                "gradient": choice(&["linear", "radial"], "Gradient style when color_to is set"),
+                "gradient_angle": num("Linear gradient direction in degrees: 180 top→bottom, 90 left→right"),
+                "thickness": num("Ring outline thickness, canvas units"),
                 "track_id": int("Optional video track"),
             })),
             &["start", "width", "height", "color"],
@@ -478,24 +481,31 @@ impl Editor {
             "add_shape" => (|| {
                 let start = req_f(&a, "start")?;
                 let fill = color(&a, "color")?.context("`color` is required")?;
-                let shape = ShapeLayer {
-                    kind: if s(&a, "shape") == Some("ellipse") { ShapeKind::Ellipse } else { ShapeKind::Rectangle },
-                    width: req_f(&a, "width")?.max(1.0),
-                    height: req_f(&a, "height")?.max(1.0),
-                    fill,
-                    fill_to: color(&a, "color_to")?,
+                let kind = match s(&a, "shape").unwrap_or("rectangle") {
+                    "ellipse" | "circle" => ShapeKind::Ellipse,
+                    "triangle" => ShapeKind::Triangle,
+                    "star" => ShapeKind::Star,
+                    "hexagon" => ShapeKind::Hexagon,
+                    "ring" => ShapeKind::Ring,
+                    _ => ShapeKind::Rectangle,
                 };
+                let mut shape = ShapeLayer::new(kind, req_f(&a, "width")?.max(1.0), req_f(&a, "height")?.max(1.0), fill, color(&a, "color_to")?);
+                if let Some(v) = f(&a, "gradient_angle") {
+                    shape.gradient_angle = v;
+                }
+                shape.radial = s(&a, "gradient") == Some("radial");
+                if let Some(v) = f(&a, "thickness") {
+                    shape.thickness = v.max(1.0);
+                }
                 let track = id(&a, "track_id");
                 let duration = f(&a, "duration").unwrap_or(4.0);
                 let clip = self.ai_edit("Add shape", |p| {
                     let id = p.add_shape_clip(track, start, duration.max(0.1), shape)?;
                     let c = p.clip_mut(id)?;
-                    if shape.kind == ShapeKind::Ellipse {
-                        c.look.corner_radius = shape.width.min(shape.height) / 2.0;
-                    }
                     apply_props(c, &a)?;
                     Ok(id)
                 })?;
+                self.selection = vec![clip];
                 Ok(format!("Added shape clip {clip}"))
             })(),
             "update_clip" => (|| {

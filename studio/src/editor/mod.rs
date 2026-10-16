@@ -4,7 +4,7 @@ mod assistant_panel;
 mod canvas_overlay;
 pub mod export_dialog;
 pub mod inspector;
-mod library;
+pub mod library;
 pub mod tools;
 pub mod media_cache;
 pub mod preview;
@@ -124,7 +124,7 @@ pub enum Message {
     Redo,
     Tick(Instant),
     AddText,
-    AddShape,
+    AddShape(library::ShapePreset),
     ApplyTransition(crate::clip::TransitionKind),
     ApplyMotion { intro: bool, kind: crate::clip::MotionKind },
     AddSound(&'static str),
@@ -690,18 +690,12 @@ impl Editor {
                     self.side_tab = SideTab::Inspector;
                 }
             }
-            Message::AddShape => {
+            Message::AddShape(preset) => {
                 let at = self.playhead;
-                let shape = crate::clip::ShapeLayer {
-                    kind: crate::clip::ShapeKind::Rectangle,
-                    width: 520.0,
-                    height: 160.0,
-                    fill: crate::clip::Rgba::hex(0x7C6DFF),
-                    fill_to: Some(crate::clip::Rgba::hex(0xC56BFF)),
-                };
+                let (shape, radius) = preset.build();
                 if let Some(id) = self.edit("Add shape", |p| {
                     let id = p.add_shape_clip(None, at, crate::edit::DEFAULT_STILL, shape)?;
-                    p.clip_mut(id)?.look.corner_radius = 48.0;
+                    p.clip_mut(id)?.look.corner_radius = radius;
                     Ok(id)
                 }) {
                     self.selection = vec![id];

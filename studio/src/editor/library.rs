@@ -33,15 +33,7 @@ impl Editor {
                         text("Click to add at the playhead. Press T anytime.").size(T_CAPTION).color(TEXT_4),
                         space().height(6),
                         widgets::section("Shapes"),
-                        button(row![container(space().width(36).height(22)).style(|_| container::Style {
-                            background: Some(style::brand_gradient()),
-                            border: iced::Border { radius: 6.0.into(), ..Default::default() },
-                            ..Default::default()
-                        }), column![text("Gradient card").font(INTER_SEMIBOLD).size(T_BODY), text("Rounded rectangle for callouts").size(T_CAPTION).color(TEXT_3)].spacing(2)].spacing(S3).align_y(Alignment::Center))
-                            .width(Fill)
-                            .padding([10, 12])
-                            .style(style::choice_card(false))
-                            .on_press(Message::AddShape),
+                        shape_grid(),
                     ]
                     .spacing(S2)
                     .padding([8, 10]),
@@ -220,3 +212,119 @@ impl Editor {
         .into()
     }
 }
+
+/// Ready-made shapes in the library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapePreset {
+    Card,
+    Pill,
+    Circle,
+    Triangle,
+    Star,
+    Hexagon,
+    Ring,
+    Spotlight,
+}
+
+impl ShapePreset {
+    const ALL: [ShapePreset; 8] = [ShapePreset::Card, ShapePreset::Pill, ShapePreset::Circle, ShapePreset::Triangle, ShapePreset::Star, ShapePreset::Hexagon, ShapePreset::Ring, ShapePreset::Spotlight];
+
+    fn label(self) -> &'static str {
+        match self {
+            ShapePreset::Card => "Card",
+            ShapePreset::Pill => "Pill",
+            ShapePreset::Circle => "Circle",
+            ShapePreset::Triangle => "Triangle",
+            ShapePreset::Star => "Star",
+            ShapePreset::Hexagon => "Hexagon",
+            ShapePreset::Ring => "Ring",
+            ShapePreset::Spotlight => "Spotlight",
+        }
+    }
+
+    /// The shape, and its corner radius.
+    pub fn build(self) -> (crate::clip::ShapeLayer, f64) {
+        use crate::clip::{Rgba, ShapeKind, ShapeLayer};
+        let (lime, mint) = (Rgba::hex(0xD6FF00), Rgba::hex(0x2EF2A2));
+        match self {
+            ShapePreset::Card => (ShapeLayer::new(ShapeKind::Rectangle, 560.0, 300.0, Rgba::hex(0x232720), Some(Rgba::hex(0x14160F))), 40.0),
+            ShapePreset::Pill => (ShapeLayer::new(ShapeKind::Rectangle, 420.0, 110.0, lime, Some(mint)), 55.0),
+            ShapePreset::Circle => (ShapeLayer::new(ShapeKind::Ellipse, 320.0, 320.0, lime, Some(mint)), 0.0),
+            ShapePreset::Triangle => (ShapeLayer::new(ShapeKind::Triangle, 320.0, 280.0, lime, Some(mint)), 16.0),
+            ShapePreset::Star => (ShapeLayer::new(ShapeKind::Star, 320.0, 320.0, lime, Some(mint)), 8.0),
+            ShapePreset::Hexagon => (ShapeLayer::new(ShapeKind::Hexagon, 320.0, 320.0, lime, Some(mint)), 12.0),
+            ShapePreset::Ring => (ShapeLayer::new(ShapeKind::Ring, 320.0, 320.0, lime, Some(mint)), 0.0),
+            ShapePreset::Spotlight => {
+                let mut s = ShapeLayer::new(ShapeKind::Ellipse, 900.0, 900.0, Rgba(0.84, 1.0, 0.0, 0.55), Some(Rgba(0.84, 1.0, 0.0, 0.0)));
+                s.radial = true;
+                (s, 0.0)
+            }
+        }
+    }
+}
+
+fn shape_grid<'a>() -> Element<'a, Message> {
+    let items = ShapePreset::ALL.iter().map(|&p| -> Element<'a, Message> {
+        button(column![iced::widget::canvas(ShapeIcon(p)).width(34).height(34), text(p.label()).font(INTER_MEDIUM).size(T_CAPTION)].spacing(6).align_x(Alignment::Center))
+            .width(Fill)
+            .padding([10, 4])
+            .style(style::choice_card(false))
+            .on_press(Message::AddShape(p))
+            .into()
+    });
+    iced::widget::grid(items.collect::<Vec<_>>()).fluid(84).spacing(6).height(iced::widget::grid::Sizing::EvenlyDistribute(Length::Shrink)).into()
+}
+
+/// A small drawing of a shape preset, in the brand gradient.
+struct ShapeIcon(ShapePreset);
+
+impl iced::widget::canvas::Program<Message> for ShapeIcon {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &iced::Renderer, _: &iced::Theme, bounds: iced::Rectangle, _: mouse::Cursor) -> Vec<iced::widget::canvas::Geometry> {
+        use iced::widget::canvas::{Frame, Gradient, Path, Stroke, gradient};
+        use iced::{Point, Size};
+        let mut f = Frame::new(renderer, bounds.size());
+        let s = bounds.width.min(bounds.height);
+        let c = Point::new(s / 2.0, s / 2.0);
+        let fill = Gradient::Linear(gradient::Linear::new(Point::new(0.0, 0.0), Point::new(0.0, s)).add_stop(0.0, ACCENT).add_stop(1.0, BRAND_2));
+        let poly = |pts: Vec<Point>| Path::new(|b| {
+            b.move_to(pts[0]);
+            for p in &pts[1..] {
+                b.line_to(*p);
+            }
+            b.close();
+        });
+        match self.0 {
+            ShapePreset::Card => f.fill(&Path::rounded_rectangle(Point::new(2.0, s * 0.2), Size::new(s - 4.0, s * 0.6), 6.0.into()), SURFACE_4),
+            ShapePreset::Pill => f.fill(&Path::rounded_rectangle(Point::new(2.0, s * 0.32), Size::new(s - 4.0, s * 0.36), (s * 0.18).into()), fill),
+            ShapePreset::Circle => f.fill(&Path::circle(c, s * 0.42), fill),
+            ShapePreset::Triangle => f.fill(&poly(vec![Point::new(c.x, s * 0.1), Point::new(s * 0.92, s * 0.88), Point::new(s * 0.08, s * 0.88)]), fill),
+            ShapePreset::Star => {
+                let pts = (0..10)
+                    .map(|i| {
+                        let r = if i % 2 == 0 { s * 0.46 } else { s * 0.2 };
+                        let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+                        Point::new(c.x + r * a.cos(), c.y + r * a.sin())
+                    })
+                    .collect();
+                f.fill(&poly(pts), fill);
+            }
+            ShapePreset::Hexagon => {
+                let pts = (0..6).map(|i| {
+                    let a = std::f32::consts::FRAC_PI_6 + i as f32 * std::f32::consts::FRAC_PI_3;
+                    Point::new(c.x + s * 0.44 * a.cos(), c.y + s * 0.44 * a.sin())
+                });
+                f.fill(&poly(pts.collect()), fill);
+            }
+            ShapePreset::Ring => f.stroke(&Path::circle(c, s * 0.36), Stroke::default().with_color(ACCENT).with_width(s * 0.13)),
+            ShapePreset::Spotlight => {
+                for (i, a) in [0.12, 0.2, 0.35].iter().enumerate() {
+                    f.fill(&Path::circle(c, s * (0.46 - i as f32 * 0.12)), iced::Color { a: *a, ..ACCENT });
+                }
+            }
+        }
+        vec![f.into_geometry()]
+    }
+}
+

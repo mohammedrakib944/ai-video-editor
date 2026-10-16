@@ -321,6 +321,40 @@ impl Default for TextLayer {
 pub enum ShapeKind {
     Rectangle,
     Ellipse,
+    Triangle,
+    Star,
+    Hexagon,
+    /// An outlined ellipse.
+    Ring,
+}
+
+impl std::fmt::Display for ShapeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl ShapeKind {
+    pub const ALL: [ShapeKind; 6] = [ShapeKind::Rectangle, ShapeKind::Ellipse, ShapeKind::Triangle, ShapeKind::Star, ShapeKind::Hexagon, ShapeKind::Ring];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShapeKind::Rectangle => "Rectangle",
+            ShapeKind::Ellipse => "Ellipse",
+            ShapeKind::Triangle => "Triangle",
+            ShapeKind::Star => "Star",
+            ShapeKind::Hexagon => "Hexagon",
+            ShapeKind::Ring => "Ring",
+        }
+    }
+}
+
+fn default_angle() -> f64 {
+    180.0
+}
+
+fn default_thickness() -> f64 {
+    24.0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -330,8 +364,23 @@ pub struct ShapeLayer {
     pub width: f64,
     pub height: f64,
     pub fill: Rgba,
-    /// Second color for a vertical gradient.
+    /// Second color, for a gradient.
     pub fill_to: Option<Rgba>,
+    /// Gradient direction in degrees, CSS-style: 180 runs top to bottom, 90 left to right.
+    #[serde(default = "default_angle")]
+    pub gradient_angle: f64,
+    /// A radial gradient from the center instead of a linear one.
+    #[serde(default)]
+    pub radial: bool,
+    /// Outline thickness for rings, canvas units.
+    #[serde(default = "default_thickness")]
+    pub thickness: f64,
+}
+
+impl ShapeLayer {
+    pub fn new(kind: ShapeKind, width: f64, height: f64, fill: Rgba, fill_to: Option<Rgba>) -> ShapeLayer {
+        ShapeLayer { kind, width, height, fill, fill_to, gradient_angle: 180.0, radial: false, thickness: 24.0 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
