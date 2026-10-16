@@ -94,6 +94,7 @@ pub enum Message {
     SideTab(SideTab),
     Tool(Tool),
     TogglePlay,
+    ToggleMute,
     ToggleSnapping,
     Import,
     ImportPicked(Vec<PathBuf>),
@@ -172,6 +173,9 @@ pub struct Editor {
     timeline_size: Cell<Size>,
     frames: FrameServer,
     export: Option<export_dialog::ExportDialog>,
+    audio: Option<crate::playback::AudioPlayer>,
+    audio_revision: u64,
+    muted: bool,
 }
 
 impl Editor {
@@ -218,6 +222,9 @@ impl Editor {
             timeline_size: Cell::new(Size::new(1000.0, 300.0)),
             frames: FrameServer::default(),
             export: None,
+            audio: None,
+            audio_revision: 0,
+            muted: false,
         }
     }
 
@@ -289,10 +296,22 @@ impl Editor {
 
     fn seek(&mut self, t: f64) {
         self.playhead = t.max(0.0);
-        if let Some((_, _)) = self.playing {
-            self.playing = Some((Instant::now(), self.playhead));
+        if self.playing.is_some() {
+            self.start_playback();
         }
         self.follow_playhead();
+    }
+
+    /// (Re)starts playback from the playhead, with audio if there is any.
+    fn start_playback(&mut self) {
+        self.playing = Some((Instant::now(), self.playhead));
+        self.audio = crate::playback::AudioPlayer::start(&self.doc.project, self.playhead, self.muted).ok();
+        self.audio_revision = self.doc.revision;
+    }
+
+    fn stop_playback(&mut self) {
+        self.playing = None;
+        self.audio = None;
     }
 
     /// Scrolls the timeline so the playhead stays visible.
@@ -313,26 +332,50 @@ impl Editor {
             Message::Tool(t) => self.tool = t,
             Message::ToggleSnapping => self.snapping = !self.snapping,
             Message::TogglePlay => {
-                self.playing = match self.playing {
-                    Some(_) => None,
-                    None => {
-                        let end = self.doc.project.duration();
-                        if self.playhead >= end - 0.01 {
-                            self.playhead = 0.0;
-                        }
-                        Some((Instant::now(), self.playhead))
+                if self.playing.is_some() {
+                    self.stop_playback();
+                } else {
+                    if self.playhead >= self.doc.project.duration() - 0.01 {
+                        self.playhead = 0.0;
                     }
-                };
+                    self.start_playback();
+                }
+            }
+            Message::ToggleMute => {
+                self.muted = !self.muted;
+                if let Some(a) = &self.audio {
+                    a.set_muted(self.muted);
+                }
             }
             Message::Tick(now) => {
                 self.frames.settle();
                 self.frames.collect_idle();
                 if let Some((started, from)) = self.playing {
-                    let t = from + now.duration_since(started).as_secs_f64();
+                    // Edits during playback change the sound: restart the mix where we are.
+                    if self.audio.is_some() && self.doc.revision != self.audio_revision {
+                        self.start_playback();
+                        return Task::none();
+                    }
+                    let t = match &self.audio {
+                        Some(a) => match a.position() {
+                            Some(p) => p,
+                            None if a.stalled() => {
+                                self.audio = None;
+                                self.playing = Some((now, from));
+                                from
+                            }
+                            // Wait for the first samples so picture and sound start together.
+                            None => {
+                                self.playing = Some((now, from));
+                                from
+                            }
+                        },
+                        None => from + now.duration_since(started).as_secs_f64(),
+                    };
                     let end = self.doc.project.duration();
                     if t >= end {
                         self.playhead = end;
-                        self.playing = None;
+                        self.stop_playback();
                     } else {
                         self.playhead = t;
                     }
@@ -623,7 +666,7 @@ impl Editor {
                 if self.doc.project.duration() <= 0.0 {
                     self.notify("Add something to the timeline before exporting", false);
                 } else if self.export.as_ref().is_none_or(|e| !e.is_running()) {
-                    self.playing = None;
+                    self.stop_playback();
                     self.export = Some(export_dialog::ExportDialog::new(&self.doc.project, self.path.as_deref()));
                 }
             }
@@ -1012,7 +1055,7 @@ impl Editor {
             widgets::tip(play_button(self.playing.is_some()), if self.playing.is_some() { "Pause" } else { "Play" }, Some("Space"), tip_pos()),
             widgets::tip(widgets::icon_button(code::SKIP_FORWARD, Some(Message::GoEnd)), "Go to end", Some("End"), tip_pos()),
             space().width(Fill),
-            widgets::tip(widgets::icon_button(code::VOLUME_2, None), "Mute preview", Some("M"), tip_pos()),
+            widgets::tip(widgets::icon_toggle(if self.muted { code::VOLUME_X } else { code::VOLUME_2 }, self.muted, Message::ToggleMute), if self.muted { "Unmute preview" } else { "Mute preview" }, Some("M"), tip_pos()),
             widgets::tip(widgets::icon_button(code::MAXIMIZE_2, None), "Full screen", Some("F"), tip_pos()),
         ]
         .spacing(4)
@@ -1236,6 +1279,7 @@ fn editor_event(event: Event, status: event::Status, _window: window::Id) -> Opt
                 Key::Character("r") if !cmd => Some(Message::Tool(Tool::Range)),
                 Key::Character("n") if !cmd => Some(Message::ToggleSnapping),
                 Key::Character("t") if !cmd => Some(Message::AddText),
+                Key::Character("m") if !cmd => Some(Message::ToggleMute),
                 Key::Character("=" | "+") => Some(Message::ZoomBy(1.4)),
                 Key::Character("-") => Some(Message::ZoomBy(1.0 / 1.4)),
                 Key::Character("Z") | Key::Character("z") if modifiers.shift() => Some(Message::ZoomFit),

@@ -11,6 +11,7 @@ mod fonts;
 mod media;
 mod model;
 mod platform;
+mod playback;
 mod render;
 mod settings;
 mod start;
