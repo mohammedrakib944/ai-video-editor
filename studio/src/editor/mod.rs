@@ -113,6 +113,8 @@ pub enum Message {
     MarkOut,
     AddZoomAtPlayhead,
     ZoomTiming { clip: Id, zoom: Id, at: f64, duration: f64 },
+    /// Scroll the track list by this many pixels (positive = down).
+    ScrollTracks(f32),
     DeleteSelection,
     DuplicateSelection,
     SetRange(Option<(f64, f64)>),
@@ -173,6 +175,8 @@ pub struct Editor {
     pub side_tab: SideTab,
     /// Range start marked with the playhead, waiting for the end.
     range_anchor: Option<f64>,
+    /// Track list scroll offset in pixels.
+    vscroll: f32,
     playing: Option<(Instant, f64)>,
     snapping: bool,
     playhead: f64,
@@ -228,6 +232,7 @@ impl Editor {
             library_tab: LibraryTab::Media,
             side_tab: SideTab::Inspector,
             range_anchor: None,
+            vscroll: 0.0,
             playing: None,
             snapping: true,
             playhead: 0.0,
@@ -619,6 +624,12 @@ impl Editor {
                 self.lanes_cache.clear();
             }
             Message::AddZoomAtPlayhead => self.add_zoom_at_playhead(),
+            Message::ScrollTracks(dy) => {
+                let visible = (self.timeline_size.get().height - RULER_H).max(1.0);
+                let max = (timeline::content_height(&self.doc.project) - visible).max(0.0);
+                self.vscroll = (self.vscroll + dy).clamp(0.0, max);
+                self.lanes_cache.clear();
+            }
             Message::ZoomTiming { clip, zoom, at, duration } => {
                 self.edit("Move zoom", |p| p.set_zoom_timing(clip, zoom, at, duration));
             }
@@ -1319,23 +1330,34 @@ impl Editor {
                 dnd: self.dnd,
                 cache: &self.lanes_cache,
                 overflow,
+                vscroll: self.vscroll.min((content_h - (size.height - RULER_H)).max(0.0)),
             };
+            // No scroll area: the lanes scroll themselves (always clipped to their bounds)
+            // and the headers follow the same offset inside a clipped column.
+            // Leave out tracks scrolled completely out of view; offset only the first visible one.
+            let rows = timeline::rows(project, lanes.vscroll);
+            let first = rows.iter().position(|r| r.2 + r.3 + timeline::GAP > 0.0).unwrap_or(0);
+            let offset = rows.get(first).map(|r| r.2 - timeline::TOP_PAD).unwrap_or(0.0);
+            let headers = mouse_area(
+                container(iced::widget::pin(self.track_headers(first)).y(offset)).width(HEADER_W).height(Fill).clip(true),
+            )
+            .on_scroll(|d| Message::ScrollTracks(-match d {
+                mouse::ScrollDelta::Lines { y, .. } => y * 48.0,
+                mouse::ScrollDelta::Pixels { y, .. } => y,
+            }));
             let body = row![
-                container(self.track_headers()).width(HEADER_W),
-                stack![
-                    iced::widget::canvas(timeline::LanesBase(lanes)).width(Fill).height(content_h),
-                    iced::widget::canvas(lanes).width(Fill).height(content_h),
-                ],
+                headers,
+                stack![iced::widget::canvas(timeline::LanesBase(lanes)).width(Fill).height(Fill), iced::widget::canvas(lanes).width(Fill).height(Fill)],
             ];
-            column![ruler, widgets::scroll(body).height(Fill)].into()
+            column![ruler, container(widgets::divider()), container(body).height(Fill).clip(true)].into()
         })
         .into()
     }
 
-    fn track_headers(&self) -> Element<'_, Message> {
+    fn track_headers(&self, skip: usize) -> Element<'_, Message> {
         let project = &self.doc.project;
         let mut col = column![space().height(timeline::TOP_PAD)].spacing(0);
-        for t in &project.tracks {
+        for t in project.tracks.iter().skip(skip) {
             let h = timeline::track_height(t.kind);
             let id = t.id;
             let (glyph, color) = match t.kind {

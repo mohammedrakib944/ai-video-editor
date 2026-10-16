@@ -61,9 +61,9 @@ impl View {
     }
 }
 
-/// Track rows: (track id, kind, top y, height).
-pub fn rows(project: &Project) -> Vec<(Id, TrackKind, f32, f32)> {
-    let mut y = TOP_PAD;
+/// Track rows: (track id, kind, top y, height), with the list scrolled up by `vscroll`.
+pub fn rows(project: &Project, vscroll: f32) -> Vec<(Id, TrackKind, f32, f32)> {
+    let mut y = TOP_PAD - vscroll;
     project
         .tracks
         .iter()
@@ -250,6 +250,8 @@ pub struct Lanes<'a> {
     pub cache: &'a Caches,
     /// Whether the tracks overflow vertically (then the plain wheel scrolls them).
     pub overflow: bool,
+    /// How far the track list is scrolled up, in pixels.
+    pub vscroll: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -278,11 +280,11 @@ enum Zone {
 
 impl Lanes<'_> {
     fn row_at(&self, y: f32) -> Option<(Id, TrackKind, f32, f32)> {
-        rows(self.project).into_iter().find(|&(_, _, top, h)| y >= top - GAP / 2.0 && y < top + h + GAP / 2.0)
+        rows(self.project, self.vscroll).into_iter().find(|&(_, _, top, h)| y >= top - GAP / 2.0 && y < top + h + GAP / 2.0)
     }
 
     fn row_of(&self, track: Id) -> Option<(Id, TrackKind, f32, f32)> {
-        rows(self.project).into_iter().find(|r| r.0 == track)
+        rows(self.project, self.vscroll).into_iter().find(|r| r.0 == track)
     }
 
     fn hit(&self, p: Point) -> Option<(&Clip, Zone)> {
@@ -383,7 +385,7 @@ impl canvas::Program<Message> for Lanes<'_> {
                     let px = if dx.abs() > dy.abs() { dx } else { dy };
                     return Some(Action::publish(Message::SetView(scrolled(self.view, px))).and_capture());
                 }
-                None
+                Some(Action::publish(Message::ScrollTracks(-dy)).and_capture())
             }
             canvas::Event::Mouse(mouse::Event::ButtonPressed(button)) => {
                 let p = local?;
@@ -579,6 +581,15 @@ impl canvas::Program<Message> for Lanes<'_> {
         let x = self.view.x(self.playhead);
         o.fill_rectangle(Point::new(x - 0.75, 0.0), Size::new(1.5, h), ACCENT);
 
+        // Thin scrollbar when the tracks don't fit.
+        let total = content_height(self.project);
+        if total > h + 1.0 {
+            let thumb_h = (h / total * h).max(24.0);
+            let y = self.vscroll / (total - h) * (h - thumb_h);
+            let thumb = Path::rounded_rectangle(Point::new(bounds.width - 6.0, y + 2.0), Size::new(4.0, thumb_h - 4.0), 2.0.into());
+            o.fill(&thumb, Color { a: 0.22, ..Color::WHITE });
+        }
+
         // Hovered clip edge.
         if state.drag.is_none() && self.zoom_hit(state.hover.unwrap_or(Point::new(-1.0, -1.0))).is_none() {
             if let Some((c, Zone::Edge(edge))) = state.hover.and_then(|p| self.hit(p)) {
@@ -663,7 +674,7 @@ impl Lanes<'_> {
             f.fill_rectangle(Point::ORIGIN, size, SURFACE_0);
         }
         let (t0, t1) = (self.view.scroll, self.view.t(size.width));
-        for (track, kind, top, h) in rows(self.project) {
+        for (track, kind, top, h) in rows(self.project, self.vscroll).into_iter().filter(|r| r.2 + r.3 > 0.0 && r.2 < size.height) {
             if layer == Layer::Base {
                 let lane = Path::rounded_rectangle(Point::new(0.0, top), Size::new(size.width, h), 6.0.into());
                 f.fill(&lane, if kind == TrackKind::Audio { Color::from_rgb8(0x10, 0x13, 0x13) } else { SURFACE_1 });

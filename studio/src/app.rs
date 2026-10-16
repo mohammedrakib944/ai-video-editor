@@ -43,6 +43,8 @@ pub enum Message {
     ToggleAssistant,
     Quit,
     Mcp(crate::mcp::Call),
+    /// Debug builds: `STUDIO_SNAPSHOT=out.png` saves a picture of the window (only this app's pixels).
+    Snapshot(window::Screenshot),
 }
 
 pub struct App {
@@ -66,7 +68,7 @@ impl App {
             Some(p) => Task::done(Message::OpenPicked(Some(p))),
             None => Task::none(),
         };
-        (app, task)
+        (app, task.chain(snapshot_task()))
     }
 
     pub fn title(&self) -> String {
@@ -193,6 +195,12 @@ impl App {
                 Screen::Editor(e) => return e.update(editor::Message::AiTool(call)).map(Message::Editor),
                 Screen::Start(_) => call.answer(Err("No project is open. Ask the user to create or open a project first.".into())),
             },
+            Message::Snapshot(shot) => {
+                if let Ok(path) = std::env::var("STUDIO_SNAPSHOT") {
+                    let _ = image::save_buffer(&path, &shot.rgba, shot.size.width, shot.size.height, image::ExtendedColorType::Rgba8);
+                    return iced::exit();
+                }
+            }
             Message::Quit => {
                 self.app_menu = false;
                 self.persist();
@@ -397,6 +405,19 @@ impl App {
         .align_y(Alignment::Center);
         (left.into(), center.into(), right.into())
     }
+}
+
+/// Debug builds only: after `STUDIO_SNAPSHOT_DELAY` seconds (default 5), capture the window to `STUDIO_SNAPSHOT`.
+fn snapshot_task() -> Task<Message> {
+    if !cfg!(debug_assertions) || std::env::var("STUDIO_SNAPSHOT").is_err() {
+        return Task::none();
+    }
+    let delay = std::env::var("STUDIO_SNAPSHOT_DELAY").ok().and_then(|d| d.parse().ok()).unwrap_or(5.0);
+    // Optionally scroll the track list first (`STUDIO_SNAPSHOT_SCROLL=pixels`).
+    let scroll: f32 = std::env::var("STUDIO_SNAPSHOT_SCROLL").ok().and_then(|d| d.parse().ok()).unwrap_or(0.0);
+    let scroll_first = Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay)), move |_| Message::Editor(editor::Message::ScrollTracks(scroll)));
+    let shot = Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay + 0.5)), |_| ()).then(|_| window::latest()).and_then(window::screenshot).map(Message::Snapshot);
+    Task::batch([scroll_first, shot])
 }
 
 fn window_task(action: WindowAction) -> Task<Message> {
