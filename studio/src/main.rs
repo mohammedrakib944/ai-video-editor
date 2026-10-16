@@ -8,6 +8,7 @@ mod edit;
 mod editor;
 mod ffmpeg;
 mod fonts;
+mod mcp;
 mod media;
 mod model;
 mod platform;

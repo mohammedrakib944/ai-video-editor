@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn media_fits_the_canvas_and_stacks_tracks() {
         let (mut p, _) = project();
-        p.add_text_clip(None, 0.0, Default::default()).unwrap();
+        p.add_text_clip(None, 0.0, crate::edit::DEFAULT_STILL, Default::default()).unwrap();
         let s = evaluate(&p, 1.0, (1920, 1080), &NoSources, false);
         assert_eq!(s.layers.len(), 2);
         assert_eq!(s.layers[0].size, [1920.0, 1080.0], "720p video fills a 1080p canvas");

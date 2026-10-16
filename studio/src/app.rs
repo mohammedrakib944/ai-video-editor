@@ -40,6 +40,7 @@ pub enum Message {
     CloseProject,
     ToggleAssistant,
     Quit,
+    Mcp(crate::mcp::Call),
 }
 
 pub struct App {
@@ -52,6 +53,9 @@ pub struct App {
 
 impl App {
     pub fn new() -> (App, Task<Message>) {
+        if let Err(e) = crate::mcp::start() {
+            eprintln!("assistant server: {e}");
+        }
         let error = (!crate::ffmpeg::is_available()).then(|| format!("FFmpeg was not found, so media can't be imported or previewed. {}", crate::ffmpeg::missing_hint()));
         let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, error };
         let path = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file());
@@ -74,7 +78,7 @@ impl App {
             Screen::Editor(e) => e.subscription().map(Message::Editor),
             Screen::Start(_) => Subscription::none(),
         };
-        Subscription::batch([window::resize_events().map(|_| Message::WindowResized), event::listen_with(shortcut), editor])
+        Subscription::batch([window::resize_events().map(|_| Message::WindowResized), event::listen_with(shortcut), editor, crate::mcp::subscription().map(Message::Mcp)])
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -167,6 +171,10 @@ impl App {
                     e.side_tab = if e.side_tab == SideTab::Assistant { SideTab::Inspector } else { SideTab::Assistant };
                 }
             }
+            Message::Mcp(call) => match &mut self.screen {
+                Screen::Editor(e) => return e.update(editor::Message::AiTool(call)).map(Message::Editor),
+                Screen::Start(_) => call.answer(Err("No project is open. Ask the user to create or open a project first.".into())),
+            },
             Message::Quit => {
                 self.app_menu = false;
                 self.persist();

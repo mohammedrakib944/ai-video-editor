@@ -166,17 +166,31 @@ impl Project {
         Ok(())
     }
 
-    /// First track of `kind`, preferring the bottom-most visual track ("Main") for media.
-    fn default_track(&self, kind: TrackKind, prefer_top: bool) -> anyhow::Result<Id> {
-        let mut tracks = self.tracks.iter().filter(|t| t.kind == kind && !t.locked);
-        let t = if prefer_top { tracks.next() } else { tracks.last() };
-        t.map(|t| t.id).context("No unlocked track to put this on")
+    /// A track of `kind` that is free for the whole span, keeping the requested time.
+    /// Text and shapes prefer the top; media prefers the bottom ("Main"). If every
+    /// track is busy there, a new one is added (overlays above, audio below).
+    fn free_track(&mut self, kind: TrackKind, prefer_top: bool, start: f64, duration: f64) -> Id {
+        let mut tracks: Vec<Id> = self.tracks.iter().filter(|t| t.kind == kind && !t.locked).map(|t| t.id).collect();
+        if !prefer_top && kind == TrackKind::Visual {
+            tracks.reverse();
+        }
+        if let Some(t) = tracks.into_iter().find(|&t| !self.overlaps(t, start, duration, &[])) {
+            return t;
+        }
+        let n = self.tracks.iter().filter(|t| t.kind == kind).count() + 1;
+        match kind {
+            TrackKind::Visual => self.add_track(kind, &format!("Video {n}"), Some(0)),
+            TrackKind::Audio => self.add_track(kind, &format!("Audio {n}"), None),
+        }
     }
 
-    /// Places a clip on `track` (or a sensible default) at the free spot nearest `start`.
+    /// Places a clip at `start` on `track`, or on a free track of the right kind.
+    /// With an explicit track that is busy, the clip moves to the nearest free time.
     pub fn add_clip(&mut self, content: Content, track: Option<Id>, start: f64, duration: f64) -> anyhow::Result<Id> {
         let kind = self.kind_for(&content);
         let prefer_top = !matches!(content, Content::Media { .. });
+        let duration = duration.max(MIN_CLIP);
+        let start = start.max(0.0);
         let track = match track {
             Some(t) => {
                 let tr = self.track(t).context("That track no longer exists")?;
@@ -184,9 +198,8 @@ impl Project {
                 ensure!(!tr.locked, "That track is locked");
                 t
             }
-            None => self.default_track(kind, prefer_top)?,
+            None => self.free_track(kind, prefer_top, start, duration),
         };
-        let duration = duration.max(MIN_CLIP);
         let start = self.nearest_free(track, start, duration, &[]);
         let id = self.alloc_id();
         self.clips.push(Clip::new(id, track, start, duration, content));
@@ -204,12 +217,12 @@ impl Project {
         Ok(id)
     }
 
-    pub fn add_text_clip(&mut self, track: Option<Id>, start: f64, text: TextLayer) -> anyhow::Result<Id> {
-        self.add_clip(Content::Text(text), track, start, DEFAULT_STILL)
+    pub fn add_text_clip(&mut self, track: Option<Id>, start: f64, duration: f64, text: TextLayer) -> anyhow::Result<Id> {
+        self.add_clip(Content::Text(text), track, start, duration)
     }
 
-    pub fn add_shape_clip(&mut self, track: Option<Id>, start: f64, shape: ShapeLayer) -> anyhow::Result<Id> {
-        self.add_clip(Content::Shape(shape), track, start, DEFAULT_STILL)
+    pub fn add_shape_clip(&mut self, track: Option<Id>, start: f64, duration: f64, shape: ShapeLayer) -> anyhow::Result<Id> {
+        self.add_clip(Content::Shape(shape), track, start, duration)
     }
 
     /// Moves a clip to `track` at `start`, nudging it to the nearest free spot.
@@ -337,14 +350,24 @@ mod tests {
     }
 
     #[test]
-    fn media_goes_to_the_main_track_without_overlap() {
+    fn new_clips_keep_their_time_on_a_free_track() {
         let (mut p, a) = project_with_video(10.0);
         let c1 = p.add_media_clip(a, None, 0.0).unwrap();
         let c2 = p.add_media_clip(a, None, 3.0).unwrap();
-        let (c1, c2) = (p.clip(c1).unwrap(), p.clip(c2).unwrap());
-        assert_eq!(c1.track, c2.track);
-        assert_eq!(p.track(c1.track).unwrap().name, "Main");
-        assert_eq!(c2.start, 10.0, "second clip is pushed after the first");
+        let (k1, k2) = (p.clip(c1).unwrap().clone(), p.clip(c2).unwrap().clone());
+        assert_eq!(p.track(k1.track).unwrap().name, "Main");
+        assert_eq!(k2.start, 3.0, "time is kept");
+        assert_ne!(k1.track, k2.track, "the overlapping clip goes on the next free video track");
+        // With every video track busy, a new one appears on top.
+        let tracks = p.tracks.len();
+        for _ in 0..3 {
+            p.add_media_clip(a, None, 3.0).unwrap();
+        }
+        assert!(p.tracks.len() > tracks);
+        assert_eq!(p.tracks[0].kind, TrackKind::Visual);
+        // An explicit busy track still nudges the time instead.
+        let c = p.add_media_clip(a, Some(k1.track), 1.0).unwrap();
+        assert_eq!(p.clip(c).unwrap().start, 10.0);
     }
 
     #[test]

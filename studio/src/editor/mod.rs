@@ -4,6 +4,7 @@ mod canvas_overlay;
 pub mod export_dialog;
 pub mod inspector;
 mod library;
+pub mod tools;
 pub mod media_cache;
 pub mod preview;
 pub mod timeline;
@@ -134,6 +135,9 @@ pub enum Message {
     SoundPreviewReady(&'static str, Result<(PathBuf, ProbeInfo), String>),
     SoundPreviewTick,
     ZoomEdit(Option<(Id, Id)>),
+    AiTool(crate::mcp::Call),
+    ToolImported(crate::mcp::Call, Vec<(PathBuf, Result<ProbeInfo, String>)>, bool),
+    ToolSound(crate::mcp::Call, &'static str, Result<(PathBuf, ProbeInfo), String>),
     Track(Id, TrackAction),
     RenameInput(String),
     RenameCommit,
@@ -626,7 +630,7 @@ impl Editor {
             },
             Message::AddText => {
                 let at = self.playhead;
-                if let Some(id) = self.edit("Add text", |p| p.add_text_clip(None, at, TextLayer::default())) {
+                if let Some(id) = self.edit("Add text", |p| p.add_text_clip(None, at, crate::edit::DEFAULT_STILL, TextLayer::default())) {
                     self.selection = vec![id];
                     self.side_tab = SideTab::Inspector;
                 }
@@ -641,7 +645,7 @@ impl Editor {
                     fill_to: Some(crate::clip::Rgba::hex(0xC56BFF)),
                 };
                 if let Some(id) = self.edit("Add shape", |p| {
-                    let id = p.add_shape_clip(None, at, shape)?;
+                    let id = p.add_shape_clip(None, at, crate::edit::DEFAULT_STILL, shape)?;
                     p.clip_mut(id)?.look.corner_radius = 48.0;
                     Ok(id)
                 }) {
@@ -706,6 +710,9 @@ impl Editor {
                     self.sound_preview = None;
                 }
             }
+            Message::AiTool(call) => return self.handle_tool(call),
+            Message::ToolImported(call, results, add) => return self.finish_tool_import(call, results, add),
+            Message::ToolSound(call, sound, r) => return self.finish_tool_sound(call, sound, r),
             Message::ZoomEdit(target) => {
                 self.zoom_edit = target;
                 if let Some((clip, zoom)) = target {

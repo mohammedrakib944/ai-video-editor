@@ -94,27 +94,7 @@ pub fn export(project: &Project, path: &Path, quality: Quality, cancel: &AtomicB
     let started = Instant::now();
     crate::fonts::ensure_loaded();
 
-    let gpu = headless_gpu()?;
-    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let mut compositor = Compositor::new(&gpu.device, &gpu.queue, format);
-    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("export target"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let view = target.create_view(&Default::default());
-    let padded_row = (w * 4).div_ceil(256) * 256;
-    let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("export readback"),
-        size: (padded_row * h) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
+    let mut renderer = Offscreen::new(w, h)?;
 
     // FFmpeg: raw frames on stdin, audio mixed from the source files.
     let (inputs, graph) = audio::mix_graph(project, 1, total);
@@ -149,7 +129,7 @@ pub fn export(project: &Project, path: &Path, quality: Quality, cancel: &AtomicB
     let server = FrameServer::default();
     server.set_preview_width(w as f32);
     let sources = ExactSources { inner: server.bind(project), server: &server };
-    let mut row = vec![0u8; (w * h * 4) as usize];
+    let mut row = Vec::new();
     for n in 0..frames_total {
         if cancel.load(Ordering::Relaxed) {
             drop(stdin);
@@ -158,40 +138,7 @@ pub fn export(project: &Project, path: &Path, quality: Quality, cancel: &AtomicB
         }
         let t = n as f64 / fps as f64;
         let scene = scene::evaluate(project, t, (w, h), &sources, true);
-        compositor.prepare(&gpu.device, &gpu.queue, &scene, 1.0);
-        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("export") });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("export"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            compositor.draw(&mut pass);
-        }
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: &target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyBufferInfo { buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded_row), rows_per_image: Some(h) } },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-        gpu.queue.submit([encoder.finish()]);
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        gpu.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| anyhow::anyhow!("GPU error: {e}"))?;
-        {
-            let data = slice.get_mapped_range();
-            for y in 0..h as usize {
-                let src = y * padded_row as usize;
-                row[y * w as usize * 4..(y + 1) * w as usize * 4].copy_from_slice(&data[src..src + w as usize * 4]);
-            }
-        }
-        readback.unmap();
+        renderer.render(&scene, &mut row)?;
         if stdin.write_all(&row).is_err() {
             break;
         }
@@ -212,6 +159,108 @@ pub fn export(project: &Project, path: &Path, quality: Quality, cancel: &AtomicB
     }
     std::fs::rename(&part, path).with_context(|| format!("could not move the video to {}", path.display()))?;
     Ok(path.to_path_buf())
+}
+
+/// Renders scenes into a CPU buffer on a headless GPU device.
+pub struct Offscreen {
+    gpu: Gpu,
+    compositor: Compositor,
+    target: wgpu::Texture,
+    view: wgpu::TextureView,
+    readback: wgpu::Buffer,
+    size: (u32, u32),
+    padded_row: u32,
+}
+
+impl Offscreen {
+    pub fn new(w: u32, h: u32) -> anyhow::Result<Offscreen> {
+        let gpu = headless_gpu()?;
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let compositor = Compositor::new(&gpu.device, &gpu.queue, format);
+        let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen target"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let padded_row = (w * 4).div_ceil(256) * 256;
+        let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("offscreen readback"),
+            size: (padded_row * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Ok(Offscreen { gpu, compositor, target, view, readback, size: (w, h), padded_row })
+    }
+
+    /// Draws `scene` and copies the pixels (tightly packed RGBA) into `out`.
+    pub fn render(&mut self, scene: &scene::Scene, out: &mut Vec<u8>) -> anyhow::Result<()> {
+        let (w, h) = self.size;
+        let gpu = &self.gpu;
+        self.compositor.prepare(&gpu.device, &gpu.queue, scene, 1.0);
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("offscreen") });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("offscreen"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.compositor.draw(&mut pass);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &self.target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &self.readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(self.padded_row), rows_per_image: Some(h) } },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let slice = self.readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| anyhow::anyhow!("GPU error: {e}"))?;
+        out.resize((w * h * 4) as usize, 0);
+        {
+            let data = slice.get_mapped_range();
+            let row = (w * 4) as usize;
+            for y in 0..h as usize {
+                let src = y * self.padded_row as usize;
+                out[y * row..(y + 1) * row].copy_from_slice(&data[src..src + row]);
+            }
+        }
+        self.readback.unmap();
+        Ok(())
+    }
+}
+
+/// A JPEG of the project at time `t`, at most `max_width` wide (for the assistant to look at).
+pub fn snapshot_jpeg(project: &Project, t: f64, max_width: u32) -> anyhow::Result<Vec<u8>> {
+    crate::fonts::ensure_loaded();
+    let (cw, ch) = project.canvas.size();
+    let scale = (max_width as f64 / cw as f64).min(1.0);
+    let (w, h) = (((cw as f64 * scale) as u32).max(2) & !1, ((ch as f64 * scale) as u32).max(2) & !1);
+    let server = FrameServer::default();
+    server.set_preview_width(w as f32);
+    let sources = ExactSources { inner: server.bind(project), server: &server };
+    // Render at the reduced size directly: the scene scales everything with the canvas.
+    let scene = scene::evaluate(project, t, (w, h), &sources, false);
+    let mut renderer = Offscreen::new(w, h)?;
+    let mut rgba = Vec::new();
+    renderer.render(&scene, &mut rgba)?;
+    let img = image::RgbaImage::from_raw(w, h, rgba).context("bad frame")?;
+    let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 82).encode_image(&rgb)?;
+    Ok(jpeg)
 }
 
 /// Like the preview's sources, but waits for the exact frame instead of showing the latest one.
@@ -280,9 +329,9 @@ mod tests {
         let v = p.add_media_clip(a, None, 0.0).unwrap();
         p.clip_mut(v).unwrap().look.corner_radius = 30.0;
         p.set_speed(v, 2.0).unwrap();
-        let t = p.add_text_clip(None, 0.2, TextLayer { text: "নতুন Studio".into(), ..Default::default() }).unwrap();
+        let t = p.add_text_clip(None, 0.2, crate::edit::DEFAULT_STILL, TextLayer { text: "নতুন Studio".into(), ..Default::default() }).unwrap();
         p.clip_mut(t).unwrap().intro = Some(Motion { kind: MotionKind::Pop, duration: 0.4 });
-        p.add_shape_clip(Some(p.tracks[1].id), 0.0, ShapeLayer { kind: ShapeKind::Rectangle, width: 200.0, height: 80.0, fill: Rgba::hex(0x7C6DFF), fill_to: None }).unwrap();
+        p.add_shape_clip(Some(p.tracks[1].id), 0.0, crate::edit::DEFAULT_STILL, ShapeLayer { kind: ShapeKind::Rectangle, width: 200.0, height: 80.0, fill: Rgba::hex(0x7C6DFF), fill_to: None }).unwrap();
 
         let out = dir.join("out.mp4");
         let cancel = AtomicBool::new(false);

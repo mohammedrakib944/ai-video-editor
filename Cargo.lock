@@ -4833,14 +4833,17 @@ name = "studio"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytemuck",
  "cpal",
  "iced",
  "iced_aw",
+ "image",
  "pollster",
  "rfd",
  "serde",
  "serde_json",
+ "tiny_http",
  "tokio",
 ]
 
