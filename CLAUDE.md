@@ -4,71 +4,120 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Two apps live in this workspace:
-- **`studio/`** (binary `ai-video-studio`) — the Iced rewrite: a motion graphics editor for product showcases. All new work goes here.
-- **root crate** (binary `ai-video-editor`) — the original egui app, kept working until the rewrite reaches parity. Treat it as reference.
+A motion graphics editor for product showcases (Apple-style launches, SaaS explainers), fully
+usable by hand, with an optional AI assistant that edits through MCP. English and Bangla.
+Two apps live in this Cargo workspace:
 
-The rest of this section describes the original app; see "Studio (the rewrite)" below for the new one.
+- **`studio/`** (binary `ai-video-studio`, Iced 0.14 + wgpu) — the current app. **All new work goes here.**
+- **repo root** (binary `ai-video-editor`, egui) — the original app, kept building until Studio
+  reaches parity. Treat it as reference; see "Original app" at the end.
+- `spikes/iced-ui/` — the throwaway prototype that picked Iced (its own workspace; ignore).
 
+README.md is the user-facing setup guide (Windows + Linux), feature list and shortcuts — keep it
+in sync when adding features, shortcuts, env vars or file locations.
 
-A Rust (egui/eframe) desktop video editor for Windows that Claude edits live through MCP. FFmpeg and ffprobe are external binaries invoked as subprocesses (no ffmpeg bindings). See README.md for the user-facing feature list, keyboard shortcuts and the MCP tool list.
+## Working rules
+
+- **Never `git commit`** (or push) — the user makes all commits. Read-only git is fine.
+- The project is built on **both Windows (GNU toolchain) and Linux** — changes must compile on
+  both, and Windows behavior must not change when fixing Linux. OS-specific code goes in
+  `studio/src/platform.rs` or behind `#[cfg(windows)]` / `#[cfg(target_os = "linux")]`.
+- The user's own running app owns MCP port 47822. Test instances must use another port:
+  `AIVE_STUDIO_MCP_PORT=47950`.
+- Don't drive the user's Claude account (live assistant chats) without asking.
+- UI must look premium: every color/size/font comes from `ui/tokens.rs`; check new UI visually
+  with the debug snapshot below (not desktop screenshots — they capture the user's other windows).
 
 ## Commands
 
 ```sh
-cargo run                                   # run the editor
-cargo run -- path/to/project.aive           # open a project directly
-cargo run -- --mcp-stdio                    # stdio→HTTP MCP bridge (what Claude Desktop launches)
-cargo test                                  # unit, egui_kittest UI, and FFmpeg pipeline tests
-cargo test --lib project::                  # tests in one module
-cargo test --test pipeline <name>           # one integration test
-cargo test --test chat_e2e -- --ignored --nocapture                            # drives the real Claude Code (uses your account)
-cargo test --release --test pipeline still_frame_latency -- --ignored --nocapture  # scrub latency timing
-powershell -ExecutionPolicy Bypass -File scripts\package.ps1                     # portable dist\ folder (Windows)
+cargo run -p studio --release                    # start screen
+cargo run -p studio --release -- path/to/x.aivp  # open a project
+cargo test -p studio                             # unit + FFmpeg/GPU integration tests
+cargo test -p studio range_volume                # tests matching a name
+cargo build -p studio --release                  # release build check
 ```
 
-`tests/pipeline.rs` generates fixtures with real FFmpeg and verifies output with ffprobe, so FFmpeg must be findable. Lookup order: `AIVE_FFMPEG_DIR`, `ffmpeg\` next to the exe, next to the exe, `vendor\ffmpeg\`, then `PATH`. `AIVE_MCP_PORT` overrides the MCP port (default 47821; the server tries the next 20 ports if busy).
+Tests generate fixtures with real FFmpeg, so it must be findable (lookup in `studio/src/ffmpeg.rs`:
+`AIVE_FFMPEG_DIR`, `ffmpeg/` next to the exe, next to the exe, workspace `vendor/ffmpeg/`, `PATH`).
+Linux needs `libasound2-dev`. Studio doesn't depend on `ring`, so Windows needs only the Rust
+GNU toolchain + MinGW-w64 (Studio hasn't been built on Windows yet — expect small fixes there).
 
-## Architecture
+### Debug snapshots (debug builds only)
 
-**One shared editor state.** `shared::Shared` wraps `Arc<Mutex<project::Editor>>` and is cloned into the UI thread, the MCP HTTP server (one thread per request), and background import/export threads. `Editor` holds the `Project` plus undo/redo stacks, playhead, activity log, export status, and the cross-thread "mailbox" fields below.
+`cargo run -p studio -- project.aivp` with these env vars renders the real window to a PNG and exits:
+`STUDIO_SNAPSHOT=out.png`, `STUDIO_SNAPSHOT_DELAY` (seconds), `STUDIO_SNAPSHOT_TIME` (playhead),
+`STUDIO_SNAPSHOT_SCROLL`, `STUDIO_SNAPSHOT_SELECT=clip[,a,b]` (select a clip, optionally mark a range),
+`STUDIO_SNAPSHOT_OPEN=ai|assistant` (open the Connect AI dialog or the assistant panel).
+Wired through `Message::Snapshot` / `DevSelect` in `editor/mod.rs`, all `cfg(debug_assertions)`.
 
-**All edits go through `Editor::apply` / `apply_merge`.** These snapshot the whole `Project` (clone) before running the closure, roll back if it returns `Err`, push an undo entry, log the change tagged `Source::User` or `Source::Ai`, and bump `revision`. `apply_merge` with a `merge_key` coalesces consecutive edits (slider drags, typing, timeline trims) into one undo step. Edit logic lives as methods on `Project` (`split_at`, `delete_range`, `set_speed`, …); UI and MCP code only call them inside `apply`. Don't mutate `ed.project` directly or the change won't be undoable and the preview won't refresh.
+## Studio architecture (`studio/src`)
 
-**MCP and background threads never touch UI state.** They communicate via `Editor` fields that the UI consumes once per frame in `ui/mod.rs`: `revision` (UI re-clones its project snapshot when it changes), `seek_request` / `play_request` (taken and cleared), `ai_touched` (clip glow), then call `Shared::repaint()` to wake egui.
+**Document model.** `model.rs` (Project, Asset, Track with optional `height`, Canvas; saved as
+`.aivp` JSON) and `clip.rs` (Clip with transform, look — corners/border/shadow, grade, audio with
+fades and range `gains`, Camtasia-style `zooms` where `camera_at` pans between adjacent zooms,
+keyframes, intro/outro motions, transitions, text and shape layers). Positions are canvas
+fractions; lengths are "canvas units" (px at a 1080 short side). Types derive `PartialEq`.
 
-**One render path for everything.** `render::build` turns a `Project` + `RenderSpec` (time range, size, fps, video/audio, `preview` flag) into an ffmpeg command with a filter graph. The live preview (`playback.rs`), still frames (`render_frame`, also used by the `get_frame` MCP tool) and export (`render::export`) all use it, so a new clip effect must be added in `build` to appear anywhere. Temp files for each run go in a `JobDir` under `ffmpeg::work_dir()` (`%LOCALAPPDATA%\AIVideoEditor`, else the system temp dir) and are deleted on drop.
+**All edits are methods in `edit.rs`, run through `doc.rs`.** `Doc::apply` / `apply_merge` clone
+the project, run the edit on the draft, and only commit if it succeeded *and* changed something
+(no-op edits make no undo step and don't dirty the project). `apply_merge` with a key coalesces
+slider drags/typing within 900 ms. `next_id` never goes backwards across undo/redo because caches
+are keyed by ids. Edit invariants: clips never overlap on a track; new clips keep their time and
+go to a free (or new) track; locked tracks reject edits (`ensure_unlocked`); trim drops zooms/gains
+outside the clip; `set_speed` ripples following clips and rescales zooms/gains/keyframes.
+UI, MCP tools and tests all go through `Doc` — never mutate the project directly.
 
-**Playback** (`playback.rs`): `play` spawns ffmpeg processes for video frames and audio; cpal audio is the master clock. Scrub stills are cached by `StillKey { revision, frame, size }`.
+**One renderer for preview and export.** `render/scene.rs::evaluate(project, t, size, sources)`
+→ `LayerSpec`s; `render/compositor.rs` + `layer.wgsl` (wgpu; SDF shapes, gradients, corners,
+shadows) draws them inside iced's render pass for the preview (`editor/preview.rs`) and headless
+for export/snapshots (`render/export.rs::Offscreen`). A new visual effect must go through scene +
+compositor to appear anywhere. `render/frames.rs` (FrameServer) runs one FFmpeg decoder per
+visible clip and caches images; `render/text.rs` rasterizes with cosmic-text (Bangla shaping);
+`render/audio.rs::mix_graph` builds the FFmpeg audio mix used by export and playback.
+`playback.rs` plays audio with cpal; the audio clock is the master clock.
 
-**Timeline model**: the main track is magnetic (a `Vec` of clips with no gaps; positions come from `main_starts()`), while music and text clips have absolute `start` times.
+**Editor UI** (`editor/`): `mod.rs` holds `Editor`, its `Message`s, keyboard shortcuts, dialogs,
+autosave (2 s) and the timeline layout; `timeline.rs` (ruler, lanes, zoom bands, volume envelope),
+`inspector.rs` (`Edit` enum → edits; `HexDraft` color inputs), `canvas_overlay.rs`
+(select/move/scale/rotate, zoom-focus editing), `library.rs` (media/text/shape/effect/sound
+presets), `assistant_panel.rs`, `export_dialog.rs`, `media_cache.rs` (thumbnails, filmstrips,
+waveforms). `ui/` is the design system: `tokens.rs`, `style.rs`, `widgets.rs`, Lucide `icons.rs`,
+`chrome.rs` (frameless title bar, motion logo). The window never draws its own frame; on Windows
+it gets native rounded corners/shadow.
 
-**MCP server** (`mcp.rs`): hand-rolled JSON-RPC over HTTP with `tiny_http`. Adding a tool means adding its schema in `tool_list()` and a branch in `call_tool()`, plus a friendly label in `chat::describe_tool` and the tool list in README.md. `--mcp-stdio` (`run_stdio_bridge`) forwards stdin lines to the running app's HTTP endpoint and launches the app if it isn't running.
+**AI.** `mcp.rs` serves MCP (JSON-RPC over `tiny_http`) on the first free port from 47822
+(`AIVE_STUDIO_MCP_PORT`), local origins only; calls reach the UI thread through a subscription and
+answer on a reply channel. Tools live in `editor/tools.rs` (schema + handler per tool) — adding a
+tool means adding both there. `assistant.rs` runs the user's `claude` CLI headless against that
+server (enabled only when connected); `ai_connect.rs` is the Connect AI dialog and title-bar chip;
+the chosen provider persists in `settings.rs`. ChatGPT is shown as "Coming next" (undecided:
+Codex CLI vs API key).
 
-**Built-in chat** (`chat.rs`, `ui/chat_panel.rs`): spawns the user's `claude` CLI in `-p` stream-json mode with `--strict-mcp-config` pointing only at this app's server (key `ai-video-editor`, so tools appear as `mcp__ai-video-editor__*`). Built-ins are limited to `Glob,Read`, and `--resume` keeps the session. `SYSTEM_PROMPT` there describes the `<editor>` context line (playhead, selected clip) prepended to each user message.
+**Other modules.** `settings.rs` (recent projects, layout, AI provider; `%APPDATA%\AIVideoEditor\studio.json`
+/ `~/.config/ai-video-editor/studio.json`; projects default to `~/Videos/AI Video Editor`),
+`sfx.rs` (9 synthesized sounds written to the config dir), `fonts.rs` (bundled Inter, Poppins,
+Hind Siliguri), `ffmpeg.rs`, `platform.rs` (reveal/open in file manager), `main.rs` (on Linux,
+removes `WAYLAND_DISPLAY` to run under XWayland so drag and drop works — winit has no Wayland DnD;
+`STUDIO_WAYLAND=1` opts out).
 
-**Integrations** (`integrations.rs`): writes MCP config entries for Claude Code (`claude mcp add`), Claude Desktop (`claude_desktop_config.json`, including the MSIX `LocalCache` path) and Cursor (`~/.cursor/mcp.json`).
+## Gotchas
 
-## Platform notes
+- Iced draws images above meshes within one layer — stack separate canvases to layer them
+  (the timeline is `LanesBase` + `Lanes`). Stacked layers escape a scrollable's clipping, and
+  images/text aren't clipped to canvas bounds, so clip manually (`on_canvas`).
+- Canvas `with_clip` keeps absolute coordinates.
+- FFmpeg filter-script files must outlive the FFmpeg process that reads them. Use
+  `ffmpeg::filter_script_option()` (FFmpeg 7 `-/filter_complex` vs 6.x `-filter_complex_script`).
+- Export writes through a cleanup guard so a cancelled/failed export leaves no partial file.
 
-The project is built on both Windows (GNU toolchain: `x86_64-pc-windows-gnu` + MinGW-w64) and Linux, so changes must keep both compiling. OS differences go in `src/platform.rs` (home dir, fonts via `WINDIR\Fonts` vs `fc-match`, `explorer` vs `xdg-open`, example paths, FFmpeg hint) or behind `#[cfg(windows)]`; keep Windows behavior unchanged when adding Linux support. Other OS-specific spots: `ffmpeg.rs` (`.exe`, `CREATE_NO_WINDOW`, `filter_script_option()` picks `-/filter_complex` for FFmpeg ≥ 7 or `-filter_complex_script` for 6.x), `chat::find_claude`, `integrations::connect` (`cmd /C claude` on Windows), `shared::strip_verbatim`, and the Linux-only eframe `wayland`/`x11` features in `Cargo.toml`.
+## Original app (repo root, legacy)
 
-Linux build needs `libasound2-dev` (cpal/ALSA) and FFmpeg on PATH. `cargo check --target x86_64-pc-windows-gnu` from Linux additionally needs `mingw-w64` (the `ring` crate compiles C).
-
-## Studio (the rewrite)
-
-```sh
-cargo run -p studio                      # start screen
-cargo run -p studio -- path/to/x.aivp    # open a project
-cargo test -p studio                     # unit + FFmpeg/GPU integration tests (export, decoder, audio clock)
-```
-
-Layout of `studio/src`:
-- `model.rs` / `clip.rs` — project document (`.aivp` JSON). Positions are canvas fractions; lengths are "canvas units" (px at a 1080 short side). Clips carry transform, look (corners/border/shadow), grade, audio, Camtasia-style `zooms` (`camera_at` pans between adjacent zooms), keyframes, intro/outro motions, transitions.
-- `edit.rs` — every edit; clips never overlap on a track; new clips keep their time and go to a free track. `doc.rs` — undo history (`apply` / `apply_merge` for slider drags).
-- `render/` — `scene::evaluate(project, t, size, sources)` → layers; `compositor` (wgpu, `layer.wgsl`) draws them in the preview (inside iced's render pass, `editor/preview.rs`) and headless for export/snapshots (`export.rs::Offscreen`). `frames.rs` runs one FFmpeg decoder per visible clip; `text.rs` rasterizes with cosmic-text (Bangla shaping); `audio.rs` builds the FFmpeg mix graph used by export and by `playback.rs` (cpal; audio is the master clock).
-- `editor/` — panes, `timeline.rs` (two stacked canvases: iced draws images above meshes within one layer), `inspector.rs` (`Edit` enum), `canvas_overlay.rs` (select/move/scale/rotate, zoom focus editing), `tools.rs` (MCP tool schemas + handlers), `assistant_panel.rs`.
-- `mcp.rs` — MCP server on 127.0.0.1:47822 (`AIVE_STUDIO_MCP_PORT`); calls reach the UI thread via a subscription and answer through a reply channel. `assistant.rs` runs the user's Claude Code headless against it.
-- `ui/` — design system: `tokens.rs` (all colors/sizes/fonts), `style.rs`, `widgets.rs`, Lucide icons (`icons.rs`), window chrome (frameless; Windows uses native rounded corners/shadow, Linux draws them on a transparent window).
-
-Conventions: every visual value comes from `ui/tokens.rs`; the user wants every screen premium-polished, so check new UI with a screenshot. FFmpeg filter-script files must outlive the FFmpeg process that reads them.
+egui/eframe app; FFmpeg as subprocesses with one render path (`render::build` → filter graph)
+for preview, stills and export. State is `shared::Shared` (`Arc<Mutex<project::Editor>>`) shared
+with the MCP server (`mcp.rs`, port 47821 / `AIVE_MCP_PORT`) and background threads; all edits go
+through `Editor::apply`. Built-in chat in `chat.rs`; MCP config writers in `integrations.rs`.
+OS differences in `src/platform.rs`; eframe `wayland`/`x11` features are Linux-only in
+`Cargo.toml`. `cargo run`, `cargo test` (tests/pipeline.rs needs FFmpeg),
+`scripts/package.ps1` builds its portable Windows folder. Cross-checking it for Windows from Linux
+(`cargo check --target x86_64-pc-windows-gnu`) needs `mingw-w64` because `ring` compiles C.
