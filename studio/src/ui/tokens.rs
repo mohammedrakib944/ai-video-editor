@@ -30,6 +30,12 @@ pub const LINE: Color = alpha(Color::WHITE, 0.07);
 pub const LINE_STRONG: Color = alpha(Color::WHITE, 0.12);
 pub const LINE_FOCUS: Color = alpha(ACCENT, 0.85);
 
+/// The small grip centered in each gap between blocks that can be resized.
+pub const SPLIT_GRIP: Color = hex(0x3A3A3A);
+/// A gap being hovered or dragged to resize: barely there, never a bright line.
+pub const SPLIT_HOVER: Color = alpha(Color::WHITE, 0.06);
+pub const SPLIT_DRAG: Color = alpha(Color::WHITE, 0.12);
+
 pub const TEXT_1: Color = hex(0xF5F5F5);
 pub const TEXT_2: Color = hex(0xA6A6A6);
 pub const TEXT_3: Color = hex(0x737373);

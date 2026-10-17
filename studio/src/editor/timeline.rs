@@ -28,8 +28,8 @@ pub const MAX_TRACK_H: f32 = 220.0;
 
 pub fn default_track_height(kind: TrackKind) -> f32 {
     match kind {
-        TrackKind::Visual => 60.0,
-        TrackKind::Audio => 46.0,
+        TrackKind::Visual => 48.0,
+        TrackKind::Audio => 38.0,
     }
 }
 
@@ -379,7 +379,8 @@ pub struct Lanes<'a> {
 #[derive(Debug, Clone, Copy)]
 enum Drag {
     Pan { x0: f32, scroll0: f64 },
-    Move { clip: Id, grab: f64, track: Id, start: f64, press: Point, moved: bool },
+    /// `new_top`: dropped above the top track, onto a new one (pictures only).
+    Move { clip: Id, grab: f64, track: Id, start: f64, press: Point, moved: bool, new_top: bool },
     Trim { clip: Id, edge: Edge, t: f64 },
     /// Moving a zoom along its clip; `at` is clip-relative.
     ZoomMove { clip: Id, zoom: Id, grab: f64, at: f64, press: Point, moved: bool },
@@ -549,7 +550,7 @@ impl canvas::Program<Message> for Lanes<'_> {
                             Some(Action::publish(Message::Select(Some(clip.id), false)).and_capture())
                         }
                         Some((clip, Zone::Body)) => {
-                            state.drag = Some(Drag::Move { clip: clip.id, grab: t - clip.start, track: clip.track, start: clip.start, press: p, moved: false });
+                            state.drag = Some(Drag::Move { clip: clip.id, grab: t - clip.start, track: clip.track, start: clip.start, press: p, moved: false, new_top: false });
                             let additive = state.modifiers.shift() || state.modifiers.command();
                             Some(Action::publish(Message::Select(Some(clip.id), additive)).and_capture())
                         }
@@ -572,13 +573,15 @@ impl canvas::Program<Message> for Lanes<'_> {
                         let view = View { scroll: (*scroll0 - (p.x - *x0) as f64 / self.view.zoom).max(0.0), ..self.view };
                         return Some(Action::publish(Message::SetView(view)).and_capture());
                     }
-                    Drag::Move { clip, grab, track, start, press, moved } => {
+                    Drag::Move { clip, grab, track, start, press, moved, new_top } => {
                         if !*moved && press.distance(p) < 4.0 {
                             return None;
                         }
                         *moved = true;
                         let c = self.project.clip(*clip)?;
                         let kind = self.project.clip_kind(c);
+                        let first_top = rows(self.project, self.vscroll).first().map(|r| r.2).unwrap_or(TOP_PAD);
+                        *new_top = kind == TrackKind::Visual && p.y < first_top - GAP / 2.0;
                         if let Some((row, row_kind, _, _)) = self.row_at(p.y) {
                             if row_kind == kind && !self.project.track(row).is_some_and(|t| t.locked) {
                                 *track = row;
@@ -639,6 +642,7 @@ impl canvas::Program<Message> for Lanes<'_> {
                     return Some(Action::publish(Message::DropAsset { asset, track, t }).and_capture());
                 }
                 let msg = match state.drag.take()? {
+                    Drag::Move { clip, start, moved: true, new_top: true, .. } => Message::MoveClipToNewTrack { clip, start },
                     Drag::Move { clip, track, start, moved: true, .. } => Message::MoveClip { clip, track, start },
                     Drag::Move { .. } | Drag::Pan { .. } => return Some(Action::request_redraw().and_capture()),
                     Drag::Trim { clip, edge, t } => Message::Trim { clip, edge, t },
@@ -676,6 +680,17 @@ impl canvas::Program<Message> for Lanes<'_> {
 
         // Move / trim previews.
         match state.drag {
+            // Above the top track: a line where the new track will appear, and the clip on it.
+            Some(Drag::Move { clip, start, moved: true, new_top: true, .. }) => {
+                if let Some(c) = self.project.clip(clip) {
+                    let first_top = rows(self.project, self.vscroll).first().map(|r| r.2).unwrap_or(TOP_PAD);
+                    let y = (first_top - GAP / 2.0).max(1.0);
+                    o.fill_rectangle(Point::new(0.0, y - 1.0), Size::new(bounds.width, 2.0), ACCENT);
+                    let h = default_track_height(TrackKind::Visual);
+                    let r = Rectangle::new(Point::new(self.view.x(start), y + 3.0), Size::new((c.duration * self.view.zoom) as f32, h * 0.5));
+                    ghost(&mut o, r, clip_color(self.project, c));
+                }
+            }
             Some(Drag::Move { clip, track, start, moved: true, .. }) => {
                 if let (Some(c), Some((_, _, top, rh))) = (self.project.clip(clip), self.row_of(track)) {
                     let r = Rectangle::new(Point::new(self.view.x(start), top), Size::new((c.duration * self.view.zoom) as f32, rh));
@@ -1082,5 +1097,49 @@ fn corner_masks(f: &mut Frame, r: Rectangle, radius: f32, bg: Color) {
             b.close();
         });
         f.fill(&path, bg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clip::TextLayer;
+
+    /// Presses on a clip, drags it to (x, y) on the lanes and lets go: the message that produces.
+    fn drag_clip(project: &Project, clip: &Clip, to: Point) -> Option<Message> {
+        let (media, missing, cache) = (MediaCache::default(), std::collections::HashSet::new(), Caches::default());
+        let lanes = Lanes {
+            project, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: false, zoom_edit: None, range: None,
+            dnd: None, dnd_effect: None, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0,
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 300.0));
+        let (_, _, top, h) = lanes.row_of(clip.track)?;
+        let grab = Point::new(lanes.view.x(clip.start) + 20.0, top + h / 2.0);
+        let mut state = LanesState::default();
+        let mut send = |event: mouse::Event, at: Point| {
+            canvas::Program::update(&lanes, &mut state, &canvas::Event::Mouse(event), bounds, mouse::Cursor::Available(at)).and_then(|a| a.into_inner().0)
+        };
+        send(mouse::Event::ButtonPressed(mouse::Button::Left), grab);
+        send(mouse::Event::CursorMoved { position: Point::new(to.x, to.y) }, to);
+        send(mouse::Event::ButtonReleased(mouse::Button::Left), to)
+    }
+
+    #[test]
+    fn dropping_a_clip_above_the_top_track_puts_it_on_a_new_one() {
+        let mut p = Project::new("t", Default::default());
+        let bottom = p.tracks.iter().filter(|t| t.kind == TrackKind::Visual).last().unwrap().id;
+        let text = p.add_text_clip(Some(bottom), 1.0, 2.0, TextLayer::default()).unwrap();
+        let clip = p.clip(text).unwrap().clone();
+        // Above the first lane (or up into the ruler): a new top track, at the dragged time.
+        match drag_clip(&p, &clip, Point::new(300.0, -15.0)) {
+            Some(Message::MoveClipToNewTrack { clip, start }) => assert!(clip == text && (start - 2.8).abs() < 0.01, "start {start}"),
+            other => panic!("expected a move to a new track, got {other:?}"),
+        }
+        // Onto the first lane: that track.
+        let (first, _, top, h) = rows(&p, 0.0)[0];
+        match drag_clip(&p, &clip, Point::new(300.0, top + h / 2.0)) {
+            Some(Message::MoveClip { track, .. }) => assert_eq!(track, first),
+            other => panic!("expected a move to the top track, got {other:?}"),
+        }
     }
 }

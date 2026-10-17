@@ -4,6 +4,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, anyhow};
@@ -30,7 +31,9 @@ range is selected, the user means that part of the timeline: put new elements an
 
 Design like a premium product film:
 - Typography: few words, big and bold. Inter or Poppins (600–700) for English, Hind Siliguri (600) for Bangla. Headlines \
-around 90–140 units, subtitles 40–60. Keep text off the edges (x 0.1–0.9, y 0.1–0.9) and centered unless asked.
+around 90–140 units, subtitles 40–60. Keep text off the edges (x 0.1–0.9, y 0.1–0.9) and centered unless asked. \
+To make one keyword pop (the product name, a number), use style_text on just that word: the accent color, a marker \
+highlight or a bolder weight.
 - Motion: give titles an entrance (slide_up or fade, 0.4–0.7 s) and an exit; pop for callouts and badges; crossfade or \
 zoom_through between scenes. Use set_keyframes for slow drifts and scale-ups on hero shots.
 - Screen recordings: use add_zoom to guide the eye to the UI being discussed (scale 1.6–2.5, focus on that element), with \
@@ -78,6 +81,8 @@ pub fn describe_tool(name: &str, input: &Value) -> String {
         "update_zoom" => "Adjusting a zoom".into(),
         "remove_zoom" => "Removing a zoom".into(),
         "set_keyframes" => format!("Animating {}", q("property")),
+        "style_text" => format!("Styling “{}”", q("words")),
+        "arrange_clip" => if q("to") == "back" { "Sending a layer to the back".into() } else { "Bringing a layer to the front".into() },
         "clear_keyframes" => "Clearing animation".into(),
         "add_sound" => format!("Adding a {} sound", q("sound")),
         "add_track" => "Adding a track".into(),
@@ -121,32 +126,53 @@ pub fn claude_version() -> Result<String, String> {
     Ok(version.split_whitespace().next().unwrap_or(&version).to_string())
 }
 
-struct Running {
-    child: Child,
-    stdin: ChildStdin,
+/// What one Claude Code process has reported, collected by its reader thread.
+#[derive(Default)]
+struct Inbox {
+    events: Vec<Event>,
+    session: Option<String>,
+    /// Claude Code got as far as starting the conversation (its `init` message).
+    started: bool,
+    /// The process closed its output: it has ended.
+    exited: bool,
+    /// What it wrote to stderr, once it has ended.
+    stderr: String,
 }
 
+/// One Claude Code process. Each has its own inbox, so nothing a stopped process
+/// still says can reach a later turn. Dropping it ends the process and everything it started.
+struct Running {
+    child: Child,
+    group: crate::platform::ProcessGroup,
+    stdin: ChildStdin,
+    inbox: Arc<Mutex<Inbox>>,
+    /// Names this process in its MCP requests, so the editor can refuse calls from a stopped one.
+    tag: String,
+    /// Started with `--resume`.
+    resumed: bool,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.group.kill(&mut self.child);
+    }
+}
+
+/// The built-in assistant. Owns at most one Claude Code process; the conversation
+/// carries over from one process to the next through the session id (`--resume`).
 pub struct Agent {
     claude: Option<PathBuf>,
     running: Option<Running>,
-    session: Arc<Mutex<Option<String>>>,
-    events: Arc<Mutex<Vec<Event>>>,
+    session: Option<String>,
+    /// A message was sent and its reply hasn't finished, failed or been stopped.
     pub busy: bool,
     /// The user connected an AI service in settings.
     pub enabled: bool,
 }
 
-impl Drop for Agent {
-    fn drop(&mut self) {
-        if let Some(mut r) = self.running.take() {
-            let _ = r.child.kill();
-        }
-    }
-}
-
 impl Default for Agent {
     fn default() -> Self {
-        Agent { claude: find_claude(), running: None, session: Arc::default(), events: Arc::default(), busy: false, enabled: false }
+        Agent { claude: find_claude(), running: None, session: None, busy: false, enabled: false }
     }
 }
 
@@ -160,11 +186,21 @@ impl Agent {
         self.claude = find_claude();
     }
 
+    /// True if an MCP call tagged `run` comes from the reply in progress. Calls from a
+    /// stopped or replaced process are refused, so nothing edits after the user pressed Stop.
+    pub fn accepts(&self, run: &str) -> bool {
+        self.busy && self.running.as_ref().is_some_and(|r| r.tag == run)
+    }
+
     fn spawn(&mut self, cwd: &Path) -> anyhow::Result<()> {
+        static RUNS: AtomicU64 = AtomicU64::new(0);
         let claude = self.claude.clone().ok_or_else(|| anyhow!("Claude Code is not installed"))?;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let tag = format!("{}-{}-{nanos}", std::process::id(), RUNS.fetch_add(1, Ordering::Relaxed));
         let dir = crate::ffmpeg::work_dir();
         let cfg = dir.join(format!("assistant-mcp-{}.json", std::process::id()));
-        std::fs::write(&cfg, serde_json::to_string_pretty(&json!({ "mcpServers": { SERVER_KEY: { "type": "http", "url": mcp::url() } } }))?)?;
+        let server = json!({ "type": "http", "url": mcp::url(), "headers": { mcp::RUN_HEADER: tag } });
+        std::fs::write(&cfg, serde_json::to_string_pretty(&json!({ "mcpServers": { SERVER_KEY: server } }))?)?;
         let prompt = dir.join(format!("assistant-prompt-{}.txt", std::process::id()));
         let os = if cfg!(windows) { "Windows" } else { "Linux" };
         std::fs::write(&prompt, format!("{SYSTEM_PROMPT}\nThe editor runs on {os}; file paths are {os} paths."))?;
@@ -191,8 +227,9 @@ impl Agent {
         args.extend(["--mcp-config".into(), cfg.display().to_string()]);
         args.extend(["--allowedTools".into(), format!("mcp__{SERVER_KEY},Glob,Read")]);
         args.extend(["--append-system-prompt-file".into(), prompt.display().to_string()]);
-        if let Some(id) = self.session.lock().unwrap().clone() {
-            args.extend(["--resume".into(), id]);
+        let resumed = self.session.is_some();
+        if let Some(id) = &self.session {
+            args.extend(["--resume".into(), id.clone()]);
         }
         let is_cmd = claude.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd"));
         let mut cmd = if is_cmd {
@@ -207,83 +244,128 @@ impl Agent {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000);
         }
+        crate::platform::own_process_group(&mut cmd);
         cmd.args(&args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd.spawn().context("could not start Claude Code")?;
+        let group = crate::platform::ProcessGroup::of(&child);
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
-        let stderr_buf: Arc<Mutex<String>> = Arc::default();
-        let buf = stderr_buf.clone();
+        let err_text: Arc<Mutex<Option<String>>> = Arc::default();
+        let err_out = err_text.clone();
         std::thread::spawn(move || {
             let mut s = String::new();
             let _ = stderr.read_to_string(&mut s);
-            buf.lock().unwrap().push_str(&s);
+            *err_out.lock().unwrap() = Some(s);
         });
-        let (events, session) = (self.events.clone(), self.session.clone());
-        std::thread::Builder::new().name("assistant-reader".into()).spawn(move || {
+        let inbox: Arc<Mutex<Inbox>> = Arc::default();
+        let reader_inbox = inbox.clone();
+        let reader = std::thread::Builder::new().name("assistant-reader".into()).spawn(move || {
             let mut parser = StreamParser::default();
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+                let events = parser.handle(&v);
+                let mut inbox = reader_inbox.lock().unwrap();
                 if let Some(id) = v["session_id"].as_str() {
-                    *session.lock().unwrap() = Some(id.to_string());
+                    inbox.session = Some(id.to_string());
                 }
-                events.lock().unwrap().extend(parser.handle(&v));
+                inbox.started |= v["type"] == "system" && v["subtype"] == "init";
+                inbox.events.extend(events);
             }
-            if parser.in_turn {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                let err = stderr_buf.lock().unwrap().trim().to_string();
-                let lines: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).collect();
-                let msg = if lines.is_empty() { "Claude Code stopped unexpectedly.".to_string() } else { lines[lines.len().saturating_sub(6)..].join("\n") };
-                events.lock().unwrap().push(Event::TurnDone { error: Some(msg) });
+            // stderr closes along with stdout; give its reader a moment to finish.
+            let mut stderr = None;
+            for _ in 0..25 {
+                stderr = err_text.lock().unwrap().take();
+                if stderr.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-        })?;
-        self.running = Some(Running { child, stdin });
+            let mut inbox = reader_inbox.lock().unwrap();
+            inbox.stderr = stderr.unwrap_or_default();
+            inbox.exited = true;
+        });
+        if let Err(e) = reader {
+            group.kill(&mut child);
+            return Err(e.into());
+        }
+        self.running = Some(Running { child, group, stdin, inbox, tag, resumed });
         Ok(())
     }
 
     /// Sends a message. `context` describes the editor state in one line.
     pub fn send(&mut self, text: &str, context: &str, cwd: &Path) -> anyhow::Result<()> {
         anyhow::ensure!(!self.busy, "The assistant is still working on the last message");
-        let alive = self.running.as_mut().is_some_and(|r| matches!(r.child.try_wait(), Ok(None)));
-        if !alive {
-            self.running = None;
+        // A process that ended between replies is replaced; the conversation resumes.
+        if self.running.as_mut().is_some_and(|r| !matches!(r.child.try_wait(), Ok(None))) {
+            self.end_process();
+        }
+        if self.running.is_none() {
             self.spawn(cwd)?;
         }
         let content = format!("<editor>{context}</editor>\n{text}");
         let msg = json!({ "type": "user", "message": { "role": "user", "content": content } });
         let r = self.running.as_mut().unwrap();
         if let Err(e) = writeln!(r.stdin, "{msg}").and_then(|_| r.stdin.flush()) {
-            self.running = None;
+            self.end_process();
             return Err(anyhow!("could not talk to Claude Code: {e}"));
         }
         self.busy = true;
         Ok(())
     }
 
-    /// Stops the current reply; the conversation continues with the next message.
-    pub fn stop(&mut self) {
-        if let Some(mut r) = self.running.take() {
-            let _ = r.child.kill();
-            let _ = r.child.wait();
+    /// Ends the process now, keeping its session id so the conversation can resume.
+    fn end_process(&mut self) {
+        if let Some(r) = self.running.take() {
+            if let Some(id) = r.inbox.lock().unwrap().session.take() {
+                self.session = Some(id);
+            }
         }
-        if self.busy {
-            self.busy = false;
-            self.events.lock().unwrap().push(Event::TurnDone { error: Some("Stopped.".into()) });
-        }
+    }
+
+    /// Stops the current reply at once: the process and everything it started end, and
+    /// whatever it was still saying is dropped. The conversation continues with the next
+    /// message. Returns true if a reply was in progress.
+    pub fn stop(&mut self) -> bool {
+        self.end_process();
+        std::mem::take(&mut self.busy)
     }
 
     /// Starts a fresh conversation.
     pub fn reset(&mut self) {
         self.stop();
-        *self.session.lock().unwrap() = None;
-        self.events.lock().unwrap().clear();
+        self.session = None;
     }
 
+    /// Takes what the assistant said since the last poll. A reply always ends with exactly
+    /// one `TurnDone`, also when Claude Code quits in the middle of it.
     pub fn poll(&mut self) -> Vec<Event> {
-        let events: Vec<Event> = std::mem::take(&mut *self.events.lock().unwrap());
+        let Some(r) = &self.running else { return Vec::new() };
+        let resumed = r.resumed;
+        let (mut events, exited, started, stderr) = {
+            let mut inbox = r.inbox.lock().unwrap();
+            if let Some(id) = inbox.session.take() {
+                self.session = Some(id);
+            }
+            (std::mem::take(&mut inbox.events), inbox.exited, inbox.started, std::mem::take(&mut inbox.stderr))
+        };
         if events.iter().any(|e| matches!(e, Event::TurnDone { .. })) {
             self.busy = false;
+        }
+        if exited {
+            self.end_process();
+            if std::mem::take(&mut self.busy) {
+                let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                let mut msg = if lines.is_empty() { "Claude Code stopped unexpectedly.".to_string() } else { lines[lines.len().saturating_sub(6)..].join("\n") };
+                // It couldn't even open the saved conversation: start a new one next time
+                // instead of failing the same way on every message.
+                if resumed && !started {
+                    self.session = None;
+                    msg.push_str("\nYour next message starts a new conversation.");
+                }
+                events.push(Event::TurnDone { error: Some(msg) });
+            }
         }
         events
     }
@@ -294,14 +376,12 @@ impl Agent {
 pub struct StreamParser {
     streamed: std::collections::HashSet<String>,
     current_msg: Option<String>,
-    pub in_turn: bool,
 }
 
 impl StreamParser {
     pub fn handle(&mut self, v: &Value) -> Vec<Event> {
         let mut out = Vec::new();
         match v["type"].as_str().unwrap_or("") {
-            "system" if v["subtype"] == "init" || v["subtype"] == "status" => self.in_turn = true,
             "stream_event" => {
                 let ev = &v["event"];
                 match ev["type"].as_str().unwrap_or("") {
@@ -360,7 +440,6 @@ impl StreamParser {
                 }
             }
             "result" => {
-                self.in_turn = false;
                 let failed = v["is_error"].as_bool().unwrap_or(false) || v["subtype"].as_str().is_some_and(|s| s != "success");
                 let error = failed.then(|| v["result"].as_str().map(str::to_string).unwrap_or_else(|| format!("Claude Code reported an error ({})", v["subtype"].as_str().unwrap_or("unknown"))));
                 out.push(Event::TurnDone { error });
@@ -394,5 +473,115 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, Event::ToolDone { ok: true, summary, .. } if summary == "Added zoom 7")));
         assert!(matches!(events.last(), Some(Event::TurnDone { error: None })));
         assert_eq!(describe_tool("mcp__ai-video-editor__add_zoom", &json!({ "start": 3.0 })), "Zooming in at 3.0s");
+    }
+
+    /// A stand-in for Claude Code that does what `mode.txt` (in its working folder) says for each
+    /// message. "slow" hands the work to a child process, as `claude.cmd` does with node.
+    fn fake_claude(dir: &Path) -> PathBuf {
+        let init = r#"{"type":"system","subtype":"init","session_id":"s1"}"#;
+        let tool = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"mcp__ai-video-editor__add_zoom","input":{"start":3}}]}}"#;
+        let result = r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
+        #[cfg(windows)]
+        let (main, slow, file) = (
+            format!(
+                "@echo off\necho %* > args.txt\n:loop\nset LINE=\nset /p LINE=\nif not defined LINE exit /b 0\nset /p MODE=<mode.txt\n\
+                 if \"%MODE%\"==\"noresume\" (\n  echo No conversation found 1>&2\n  exit /b 1\n)\necho {init}\n\
+                 if \"%MODE%\"==\"slow\" cmd /C \"%~dp0slow.cmd\"\nif \"%MODE%\"==\"crash\" (\n  echo boom 1>&2\n  exit /b 1\n)\necho {result}\ngoto loop\n"
+            ),
+            format!("@echo off\necho {tool}\nping -n 4 127.0.0.1 >nul\necho late> marker.txt\necho {result}\n"),
+            "claude.cmd",
+        );
+        #[cfg(not(windows))]
+        let (main, slow, file) = (
+            format!(
+                "#!/bin/sh\necho \"$@\" > args.txt\nwhile IFS= read -r line; do\n  mode=$(cat mode.txt)\n\
+                 if [ \"$mode\" = noresume ]; then echo 'No conversation found' >&2; exit 1; fi\n  echo '{init}'\n\
+                 if [ \"$mode\" = slow ]; then sh ./slow.sh; fi\n  if [ \"$mode\" = crash ]; then echo boom >&2; exit 1; fi\n  echo '{result}'\ndone\n"
+            ),
+            format!("#!/bin/sh\necho '{tool}'\nsleep 3\necho late > marker.txt\necho '{result}'\n"),
+            "claude",
+        );
+        let crlf = |s: String| if cfg!(windows) { s.replace('\n', "\r\n") } else { s };
+        std::fs::write(dir.join(if cfg!(windows) { "slow.cmd" } else { "slow.sh" }), crlf(slow)).unwrap();
+        let path = dir.join(file);
+        std::fs::write(&path, crlf(main)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// Polls until `done` holds for everything received, or fails after 15 s.
+    fn wait(agent: &mut Agent, done: impl Fn(&[Event]) -> bool) -> Vec<Event> {
+        let (mut all, t) = (Vec::new(), std::time::Instant::now());
+        while !done(&all) {
+            assert!(t.elapsed().as_secs() < 15, "timed out; got {all:?}");
+            all.extend(agent.poll());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        all
+    }
+
+    fn turn_done(events: &[Event]) -> Vec<&Option<String>> {
+        events.iter().filter_map(|e| if let Event::TurnDone { error } = e { Some(error) } else { None }).collect()
+    }
+
+    #[test]
+    fn stop_send_again_and_crashes() {
+        let dir = std::env::temp_dir().join(format!("studio-agent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mode = |m: &str| std::fs::write(dir.join("mode.txt"), m).unwrap();
+        let mut agent = Agent { claude: Some(fake_claude(&dir)), running: None, session: None, busy: false, enabled: true };
+
+        // Stopped in the middle of a tool call: the whole process tree ends at once.
+        mode("slow");
+        agent.send("first", "", &dir).unwrap();
+        assert!(agent.send("again", "", &dir).is_err(), "no second message while one is running");
+        wait(&mut agent, |e| e.iter().any(|e| matches!(e, Event::ToolStart { .. })));
+        let first_run = agent.running.as_ref().unwrap().tag.clone();
+        assert!(agent.accepts(&first_run));
+        assert!(agent.stop());
+        assert!(!agent.busy && !agent.accepts(&first_run), "tool calls from the stopped reply are refused");
+        assert!(agent.poll().is_empty(), "a stopped reply says nothing more");
+        assert!(!agent.stop(), "stopping again is a no-op");
+
+        // The next message gets a clean reply: no stale error, the conversation resumes.
+        mode("fast");
+        agent.send("second", "", &dir).unwrap();
+        let events = wait(&mut agent, |e| !turn_done(e).is_empty());
+        assert_eq!(turn_done(&events), [&None], "exactly one clean end: {events:?}");
+        assert!(!agent.busy);
+        let args = std::fs::read_to_string(dir.join("args.txt")).unwrap();
+        assert!(args.contains("--resume") && args.contains("s1"), "resumed the conversation: {args}");
+        let second_run = agent.running.as_ref().unwrap().tag.clone();
+        assert_ne!(first_run, second_run);
+        assert!(!agent.accepts(&second_run), "an idle assistant makes no calls");
+
+        // Claude Code dies in the middle of a reply: one error with what it printed, then it recovers.
+        mode("crash");
+        agent.send("third", "", &dir).unwrap();
+        let events = wait(&mut agent, |e| !turn_done(e).is_empty());
+        assert!(matches!(turn_done(&events)[..], [Some(e)] if e.contains("boom")), "{events:?}");
+        assert!(!agent.busy && agent.running.is_none() && agent.session.is_some());
+
+        // The saved conversation can't be opened: the next message starts a new one.
+        mode("noresume");
+        agent.send("fourth", "", &dir).unwrap();
+        let events = wait(&mut agent, |e| !turn_done(e).is_empty());
+        assert!(matches!(turn_done(&events)[..], [Some(e)] if e.contains("new conversation")), "{events:?}");
+        assert!(agent.session.is_none());
+        mode("fast");
+        agent.send("fifth", "", &dir).unwrap();
+        let events = wait(&mut agent, |e| !turn_done(e).is_empty());
+        assert_eq!(turn_done(&events), [&None]);
+        assert!(!std::fs::read_to_string(dir.join("args.txt")).unwrap().contains("--resume"));
+
+        // The work the stopped reply handed to its child process never finished.
+        std::thread::sleep(std::time::Duration::from_millis(4500));
+        assert!(!dir.join("marker.txt").exists(), "the stopped reply kept running in the background");
+        drop(agent);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

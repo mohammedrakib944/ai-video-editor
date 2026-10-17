@@ -31,7 +31,12 @@ pub fn key(layer: &TextLayer, px_per_unit: f32) -> u64 {
     }
     (layer.align as u8).hash(&mut h);
     layer.background.is_some().hash(&mut h);
+    serde_json::to_string(&layer.spans).unwrap_or_default().hash(&mut h);
     h.finish()
+}
+
+fn ct_color(c: crate::clip::Rgba) -> ct::Color {
+    ct::Color::rgba((c.0 * 255.0) as u8, (c.1 * 255.0) as u8, (c.2 * 255.0) as u8, (c.3 * 255.0) as u8)
 }
 
 pub fn rasterize(layer: &TextLayer, px_per_unit: f32) -> Arc<Frame> {
@@ -47,12 +52,37 @@ pub fn rasterize(layer: &TextLayer, px_per_unit: f32) -> Arc<Frame> {
         Align::Right => ct::Align::Right,
     };
     let text = if layer.text.is_empty() { " " } else { layer.text.as_str() };
+    // Each run with its own attributes; `metadata` is the span's index + 1 (0 = plain), so the
+    // laid-out glyphs can be traced back for highlights and underlines.
+    let runs = layer.styled_runs();
+    fn span_attrs<'a>(base: &Attrs<'a>, i: usize, style: Option<&'a crate::clip::SpanStyle>, size: f32, line_height: f32) -> Attrs<'a> {
+        let Some(s) = style else { return base.clone() };
+        let mut a = base.clone().metadata(i + 1);
+        if let Some(f) = &s.font {
+            a = a.family(Family::Name(f));
+        }
+        if let Some(w) = s.weight {
+            a = a.weight(Weight(w));
+        }
+        if let Some(c) = s.color {
+            a = a.color(ct_color(c));
+        }
+        if let Some(k) = s.scale {
+            a = a.metrics(Metrics::new(size * k as f32, size * k as f32 * line_height));
+        }
+        a
+    }
 
     let mut fs_guard = font_system().write().expect("font system");
     let fs = fs_guard.raw();
     let mut buffer = Buffer::new(fs, metrics);
     buffer.set_size(fs, None, None);
-    buffer.set_text(fs, text, &attrs, Shaping::Advanced, Some(align));
+    if layer.spans.is_empty() || layer.text.is_empty() {
+        buffer.set_text(fs, text, &attrs, Shaping::Advanced, Some(align));
+    } else {
+        let spans = runs.iter().enumerate().map(|(i, (r, s))| (&layer.text[r.clone()], span_attrs(&attrs, i, *s, size, layer.line_height as f32)));
+        buffer.set_rich_text(fs, spans, &attrs, Shaping::Advanced, Some(align));
+    }
     buffer.shape_until_scroll(fs, false);
     // Measure, then lay out again at that width so alignment works across lines.
     let width = buffer.layout_runs().map(|r| r.line_w).fold(0.0f32, f32::max).ceil().max(1.0);
@@ -60,7 +90,9 @@ pub fn rasterize(layer: &TextLayer, px_per_unit: f32) -> Arc<Frame> {
     buffer.shape_until_scroll(fs, false);
     let height = buffer.layout_runs().map(|r| r.line_top + r.line_height).fold(0.0f32, f32::max).ceil().max(1.0);
 
-    let pad = if layer.background.is_some() { (layer.padding as f32 * px_per_unit).round() } else { (size * 0.08).ceil() + 2.0 };
+    // Room around the glyphs for overhangs, and for highlight boxes around the biggest styled words.
+    let biggest = layer.spans.iter().filter_map(|s| s.style.scale).fold(1.0f64, f64::max) as f32;
+    let pad = if layer.background.is_some() { (layer.padding as f32 * px_per_unit).round() } else { (size * biggest * 0.12).ceil() + 2.0 };
     let (w, h) = ((width + pad * 2.0) as u32, (height + pad * 2.0) as u32);
     let mut rgba = vec![0u8; (w * h * 4) as usize];
 
@@ -68,10 +100,37 @@ pub fn rasterize(layer: &TextLayer, px_per_unit: f32) -> Arc<Frame> {
         fill_rounded(&mut rgba, w, h, (pad * 0.7).min(h as f32 / 2.0), [bg.0, bg.1, bg.2, bg.3]);
     }
 
-    let c = layer.color;
-    let color = ct::Color::rgba((c.0 * 255.0) as u8, (c.1 * 255.0) as u8, (c.2 * 255.0) as u8, (c.3 * 255.0) as u8);
-    let mut cache = swash_cache().lock().expect("swash cache");
+    // Highlights behind the styled words, underlines below them: one box per line and span.
     let (ox, oy) = (pad as i32, pad as i32);
+    let mut underlines = Vec::new();
+    for run in buffer.layout_runs() {
+        let mut boxes: Vec<(usize, f32, f32, f32)> = Vec::new(); // (run index, left, right, glyph size)
+        for g in run.glyphs.iter().filter(|g| g.metadata > 0) {
+            match boxes.last_mut() {
+                Some(b) if b.0 == g.metadata && (g.x - b.2).abs() < 1.0 + g.font_size * 0.5 => {
+                    b.2 = b.2.max(g.x + g.w);
+                    b.3 = b.3.max(g.font_size);
+                }
+                _ => boxes.push((g.metadata, g.x, g.x + g.w, g.font_size)),
+            }
+        }
+        for (meta, left, right, gsize) in boxes {
+            let Some(style) = runs.get(meta - 1).and_then(|r| r.1) else { continue };
+            if let Some(hl) = style.highlight {
+                let (x0, x1) = (left - gsize * 0.08 + pad, right + gsize * 0.08 + pad);
+                let (y0, y1) = (run.line_y - gsize * 0.86 + pad, run.line_y + gsize * 0.24 + pad);
+                fill_box(&mut rgba, w, h, (x0, y0, x1, y1), gsize * 0.12, [hl.0, hl.1, hl.2, hl.3]);
+            }
+            if style.underline {
+                let c = style.color.unwrap_or(layer.color);
+                let y = run.line_y + gsize * 0.1 + pad;
+                underlines.push(((left + pad, y, right + pad, y + (gsize * 0.06).max(1.0)), gsize * 0.03, [c.0, c.1, c.2, c.3]));
+            }
+        }
+    }
+
+    let color = ct_color(layer.color);
+    let mut cache = swash_cache().lock().expect("swash cache");
     buffer.draw(fs, &mut cache, color, |x, y, gw, gh, col| {
         let a = col.a() as f32 / 255.0;
         if a <= 0.0 {
@@ -88,7 +147,30 @@ pub fn rasterize(layer: &TextLayer, px_per_unit: f32) -> Arc<Frame> {
             }
         }
     });
+    for (rect, radius, c) in underlines {
+        fill_box(&mut rgba, w, h, rect, radius, c);
+    }
     Arc::new(Frame::new(w, h, rgba))
+}
+
+/// An anti-aliased rounded box from (x0, y0) to (x1, y1), in bitmap pixels.
+fn fill_box(rgba: &mut [u8], w: u32, h: u32, (x0, y0, x1, y1): (f32, f32, f32, f32), r: f32, c: [f32; 4]) {
+    let rgb = [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8];
+    let (cx, cy, hw, hh) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0) / 2.0, (y1 - y0) / 2.0);
+    let r = r.min(hw).min(hh).max(0.0);
+    for y in (y0.floor().max(0.0) as u32)..(y1.ceil().max(0.0) as u32).min(h) {
+        for x in (x0.floor().max(0.0) as u32)..(x1.ceil().max(0.0) as u32).min(w) {
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            let qx = (px - cx).abs() - (hw - r);
+            let qy = (py - cy).abs() - (hh - r);
+            let d = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
+            let cover = (0.5 - d).clamp(0.0, 1.0);
+            if cover > 0.0 {
+                let i = ((y * w + x) * 4) as usize;
+                blend(&mut rgba[i..i + 4], rgb, c[3] * cover);
+            }
+        }
+    }
 }
 
 /// Source-over blend of one color onto a straight-alpha pixel.
@@ -121,5 +203,44 @@ fn fill_rounded(rgba: &mut [u8], w: u32, h: u32, r: f32, c: [f32; 4]) {
                 blend(&mut rgba[i..i + 4], rgb, c[3] * cover);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clip::{Rgba, SpanChange};
+
+    fn count(f: &Frame, test: impl Fn([u8; 4]) -> bool) -> usize {
+        f.rgba.chunks_exact(4).filter(|p| test([p[0], p[1], p[2], p[3]])).count()
+    }
+
+    #[test]
+    fn styled_words_render_with_their_own_look() {
+        crate::fonts::ensure_loaded();
+        let plain = TextLayer { text: "Make it fast".into(), size: 80.0, ..Default::default() };
+        let red = |p: [u8; 4]| p[3] > 200 && p[0] > 200 && p[1] < 60 && p[2] < 60;
+        let yellow = |p: [u8; 4]| p[3] > 200 && p[0] > 200 && p[1] > 150 && p[2] < 80;
+        let base = rasterize(&plain, 1.0);
+        assert_eq!(count(&base, red) + count(&base, yellow), 0);
+
+        let mut styled = plain.clone();
+        styled.style_range(8, 12, &SpanChange::Color(Some(Rgba::hex(0xFF2020))));
+        styled.style_range(5, 7, &SpanChange::Highlight(Some(Rgba::hex(0xFFD000))));
+        let f = rasterize(&styled, 1.0);
+        assert!(count(&f, red) > 300, "the colored word is drawn in its color");
+        assert!(count(&f, yellow) > 1500, "the highlight box is drawn behind its word");
+        assert_eq!((f.width, f.height), (base.width, base.height), "color and highlight don't change the layout");
+
+        // A bigger word makes the layer bigger; an underline adds ink below the baseline.
+        let mut big = plain.clone();
+        big.style_range(8, 12, &SpanChange::Scale(Some(2.0)));
+        let b = rasterize(&big, 1.0);
+        assert!(b.width > base.width && b.height > base.height, "{}x{} vs {}x{}", b.width, b.height, base.width, base.height);
+        let mut under = plain.clone();
+        under.style_range(0, 4, &SpanChange::Underline(true));
+        let ink = |p: [u8; 4]| p[3] > 128;
+        assert!(count(&rasterize(&under, 1.0), ink) > count(&base, ink) + 200);
+        assert_ne!(key(&plain, 1.0), key(&styled, 1.0), "styles are part of the cache key");
     }
 }

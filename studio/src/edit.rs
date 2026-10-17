@@ -263,6 +263,45 @@ impl Project {
         self.add_clip(Content::Blur(blur), track, start, duration)
     }
 
+    /// Puts a picture in front of everything else (the top video track) or behind it (the
+    /// bottom one), at the same time. A new track is added when that one is busy then.
+    pub fn arrange(&mut self, id: Id, front: bool) -> anyhow::Result<()> {
+        self.ensure_unlocked(id)?;
+        let clip = self.clip(id).context("That clip no longer exists")?;
+        ensure!(self.clip_kind(clip) == TrackKind::Visual, "Only pictures, text and shapes are layered");
+        let (start, duration, current) = (clip.start, clip.duration, clip.track);
+        let visual: Vec<Id> = self.tracks.iter().filter(|t| t.kind == TrackKind::Visual).map(|t| t.id).collect();
+        let edge = if front { visual.first() } else { visual.last() }.copied();
+        // Already the edge track: nothing else on it overlaps, so nothing can be in front (or behind).
+        if edge == Some(current) {
+            return Ok(());
+        }
+        let target = match edge.filter(|&t| !self.track(t).is_some_and(|t| t.locked) && !self.overlaps(t, start, duration, &[id])) {
+            Some(t) => t,
+            None => self.new_visual_track(front),
+        };
+        self.clip_mut(id)?.track = target;
+        Ok(())
+    }
+
+    /// Moves a picture to a new track on top of all others, at `start` (dropped above the top track).
+    pub fn move_to_new_top_track(&mut self, id: Id, start: f64) -> anyhow::Result<()> {
+        self.ensure_unlocked(id)?;
+        let clip = self.clip(id).context("That clip no longer exists")?;
+        ensure!(self.clip_kind(clip) == TrackKind::Visual, "Only pictures, text and shapes go on video tracks");
+        let track = self.new_visual_track(true);
+        let clip = self.clip_mut(id)?;
+        clip.track = track;
+        clip.start = start.max(0.0);
+        Ok(())
+    }
+
+    /// A new video track above all others (`top`) or below them.
+    pub fn new_visual_track(&mut self, top: bool) -> Id {
+        let n = self.tracks.iter().filter(|t| t.kind == TrackKind::Visual).count() + 1;
+        self.add_track(TrackKind::Visual, &format!("Video {n}"), Some(if top { 0 } else { usize::MAX }))
+    }
+
     /// Moves a clip to `track` at `start`, nudging it to the nearest free spot.
     pub fn move_clip(&mut self, id: Id, track: Id, start: f64) -> anyhow::Result<()> {
         let clip = self.clip(id).context("That clip no longer exists")?;
@@ -704,5 +743,46 @@ mod tests {
         p.rename_track(v, "  Screen  ").unwrap();
         assert_eq!(p.track(v).unwrap().name, "Screen");
         assert!(p.rename_track(v, "  ").is_err());
+    }
+
+    #[test]
+    fn bring_to_front_and_send_to_back() {
+        let mut p = Project::new("t", Canvas::default());
+        let visual = |p: &Project| p.tracks.iter().filter(|t| t.kind == TrackKind::Visual).map(|t| t.id).collect::<Vec<_>>();
+        let (top, bottom) = (visual(&p)[0], *visual(&p).last().unwrap());
+        // A title already on the top track, and a text on the bottom one under it.
+        let title = p.add_text_clip(Some(top), 0.0, 5.0, TextLayer::default()).unwrap();
+        let text = p.add_text_clip(Some(bottom), 1.0, 2.0, TextLayer::default()).unwrap();
+        // The top track is busy then: a new track on top.
+        p.arrange(text, true).unwrap();
+        let new_top = visual(&p)[0];
+        assert!(new_top != top && p.clip(text).unwrap().track == new_top);
+        assert_eq!(p.clip(text).unwrap().start, 1.0, "it keeps its time");
+        // Already in front: nothing changes.
+        let before = p.clone();
+        p.arrange(text, true).unwrap();
+        assert_eq!(p, before);
+        // Behind everything: the bottom track is free again.
+        p.arrange(text, false).unwrap();
+        assert_eq!(p.clip(text).unwrap().track, bottom);
+        // The title goes to the back too, but the bottom track is busy now: a new bottom track.
+        p.arrange(title, false).unwrap();
+        assert_eq!(p.clip(title).unwrap().track, *visual(&p).last().unwrap());
+        assert_ne!(p.clip(title).unwrap().track, bottom);
+        assert!(p.tracks.iter().position(|t| t.id == p.clip(title).unwrap().track) < p.tracks.iter().position(|t| t.kind == TrackKind::Audio), "video tracks stay above audio");
+        // Sound can't be layered; locked clips don't move.
+        let a = p.add_asset(&PathBuf::from("/a.wav"), &crate::media::ProbeInfo { kind: MediaKind::Audio, duration: 3.0, width: 0, height: 0, fps: 0.0, has_audio: true });
+        let sound = p.add_media_clip(a, None, 0.0).unwrap();
+        assert!(p.arrange(sound, true).is_err());
+        p.track_mut(bottom).unwrap().locked = true;
+        assert!(p.arrange(text, true).is_err());
+        assert!(p.move_to_new_top_track(text, 0.0).is_err(), "locked clips stay put");
+        // Dropped above the top track: a new track on top, at the drop time.
+        p.track_mut(bottom).unwrap().locked = false;
+        let tracks = p.tracks.len();
+        p.move_to_new_top_track(text, 2.5).unwrap();
+        assert_eq!(p.tracks.len(), tracks + 1);
+        assert_eq!((p.clip(text).unwrap().track, p.clip(text).unwrap().start), (p.tracks[0].id, 2.5));
+        assert!(p.move_to_new_top_track(sound, 0.0).is_err());
     }
 }

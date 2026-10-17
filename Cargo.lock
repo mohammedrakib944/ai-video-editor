@@ -4097,6 +4097,7 @@ dependencies = [
  "iced",
  "iced_aw",
  "image",
+ "libc",
  "pollster",
  "rfd",
  "serde",

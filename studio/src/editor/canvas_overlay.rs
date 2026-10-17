@@ -409,7 +409,10 @@ impl canvas::Program<Message> for Overlay<'_> {
                         return Some(Action::capture());
                     }
                 }
-                match self.layer_at(p) {
+                // The selected element keeps the drag wherever it's under the cursor, even
+                // where another element (or an invisible box) lies on top of it.
+                let selected = self.selected_layer().filter(|l| contains(l, p) && !self.locked(l.clip));
+                match selected.or_else(|| self.layer_at(p)) {
                     Some(l) => {
                         let clip = self.project.clip(l.clip)?;
                         let base = Point::new(clip.transform.x as f32 * cw, clip.transform.y as f32 * ch);
@@ -808,12 +811,45 @@ mod tests {
         assert_eq!((r.x0, r.y0), (0.95, 0.95), "can't flip past the far corner");
     }
 
+    fn layer(clip: Id, center: [f32; 2], size: [f32; 2]) -> LayerSpec {
+        LayerSpec {
+            clip, slot: 1, frame: None, center, size, rotation: 0.0, opacity: 1.0, radius: 0.0, border: 0.0, border_color: [0.0; 4],
+            shadow_blur: 0.0, shadow_y: 0.0, shadow_color: [0.0; 4], uv: [0.0, 0.0, 1.0, 1.0], tint_top: [1.0; 4], tint_bottom: [1.0; 4], grade: [0.0; 4], shape: [0.0; 4], blurs: [[0.0; 8]; crate::clip::MAX_BLURS], blurrable: false, blur_box: None,
+        }
+    }
+
+    /// Presses the left button at canvas point (x, y) and says which clip the drag moves.
+    fn press(project: &Project, layers: Vec<LayerSpec>, selection: &[Id], x: f32, y: f32) -> Option<Id> {
+        let scene = Arc::new(Scene { width: 1920, height: 1080, background: [0.0; 4], layers });
+        let overlay = Overlay { project, scene, selection, zoom_edit: None, crop_edit: None, dragging: None, origin: Vector::ZERO, display: Size::new(1920.0, 1080.0), zoomed: false };
+        let mut state = State::default();
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1920.0, 1080.0));
+        let _ = canvas::Program::update(&overlay, &mut state, &canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), bounds, mouse::Cursor::Available(Point::new(x, y)));
+        match state.drag {
+            Some(Drag::Move { clip, .. }) => Some(clip),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_selected_element_moves_even_under_another_one() {
+        let mut p = Project::new("t", Default::default());
+        let text = p.add_text_clip(None, 0.0, 5.0, crate::clip::TextLayer::default()).unwrap();
+        let card = p.add_shape_clip(None, 0.0, 5.0, crate::clip::ShapeLayer::new(crate::clip::ShapeKind::Rectangle, 1200.0, 400.0, crate::clip::Rgba::WHITE, None)).unwrap();
+        // The card is drawn over the text's lower half (later layers are on top).
+        let layers = || vec![layer(text, [960.0, 540.0], [800.0, 200.0]), layer(card, [960.0, 700.0], [1200.0, 400.0])];
+        assert_eq!(press(&p, layers(), &[], 960.0, 600.0), Some(card), "nothing selected: the top element");
+        assert_eq!(press(&p, layers(), &[text], 960.0, 600.0), Some(text), "the selected text keeps the drag");
+        assert_eq!(press(&p, layers(), &[text], 960.0, 850.0), Some(card), "outside the text: what's under the cursor");
+        // A locked selected element doesn't take the drag.
+        let track = p.clip(text).unwrap().track;
+        p.track_mut(track).unwrap().locked = true;
+        assert_eq!(press(&p, layers(), &[text], 960.0, 600.0), Some(card));
+    }
+
     #[test]
     fn layer_fractions_round_trip_through_rotation() {
-        let l = LayerSpec {
-            clip: 1, slot: 1, frame: None, center: [500.0, 300.0], size: [400.0, 200.0], rotation: 0.7, opacity: 1.0, radius: 0.0, border: 0.0, border_color: [0.0; 4],
-            shadow_blur: 0.0, shadow_y: 0.0, shadow_color: [0.0; 4], uv: [0.0, 0.0, 1.0, 1.0], tint_top: [1.0; 4], tint_bottom: [1.0; 4], grade: [0.0; 4], shape: [0.0; 4], blurs: [[0.0; 8]; crate::clip::MAX_BLURS], blurrable: false, blur_box: None,
-        };
+        let l = LayerSpec { rotation: 0.7, ..layer(1, [500.0, 300.0], [400.0, 200.0]) };
         let p = from_frac(&l, (0.25, 0.8));
         let (fx, fy) = to_frac(&l, p);
         assert!((fx - 0.25).abs() < 1e-4 && (fy - 0.8).abs() < 1e-4);

@@ -80,6 +80,8 @@ pub enum Edit {
     BlurHeight(f64),
     /// A shape resized on the canvas: width and height (canvas units) and its new center.
     ShapeBox(f64, f64, f64, f64),
+    /// Restyles characters `start..end` of a text clip.
+    SpanStyle(usize, usize, crate::clip::SpanChange),
 }
 
 impl Edit {
@@ -102,6 +104,7 @@ impl Edit {
             Edit::FadeIn(_) | Edit::FadeOut(_) => ("fade", "Audio fade"),
             Edit::Speed(_) => ("speed", "Speed"),
             Edit::Text(_) => ("text", "Edit text"),
+            Edit::SpanStyle(..) => ("text-span", "Style words"),
             Edit::Font(_) | Edit::FontSize(_) | Edit::Weight(_) | Edit::TextColor(_) | Edit::Align(_) | Edit::TextBox(_) => ("text-style", "Text style"),
             Edit::Intro(_) | Edit::Outro(_) | Edit::IntroDuration(_) | Edit::OutroDuration(_) => ("motion", "Animation"),
             Edit::ShapeKind(_) | Edit::ShapeWidth(_) | Edit::ShapeHeight(_) | Edit::ShapeThickness(_) | Edit::ShapeBox(..) => ("shape", "Shape"),
@@ -219,7 +222,8 @@ impl Edit {
             edit => {
                 if let Content::Text(tl) = &mut c.content {
                     match edit {
-                        Edit::Text(s) => tl.text = s,
+                        Edit::Text(s) => tl.set_text(s),
+                        Edit::SpanStyle(a, b, change) => tl.style_range(a, b, &change),
                         Edit::Font(f) => tl.font = f,
                         Edit::FontSize(v) => tl.size = v,
                         Edit::Weight(w) => tl.weight = w,
@@ -358,11 +362,35 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             .menu_style(style::select_menu);
         let weights = [(400u16, "Regular"), (500, "Medium"), (600, "Semibold"), (700, "Bold")];
         let aligns = [Align::Left, Align::Center, Align::Right];
+        let font = if t.text.is_ascii() { INTER } else { HIND };
+        // A multi-line box that keeps its selection: select words to style just them.
+        let (text_box, selected): (Element<'a, Message>, Option<(usize, usize)>) = match ctx.text_draft {
+            Some(content) => (
+                iced::widget::text_editor(content)
+                    .placeholder("Type your text…")
+                    .on_action(move |a| Message::TextDraft(id, a))
+                    .highlight_with::<SpanHighlighter>(span_marks(t), span_format)
+                    .padding([8, 10])
+                    .size(T_BODY)
+                    .font(font)
+                    .min_height(40)
+                    .max_height(160)
+                    .style(style::text_area)
+                    .into(),
+                selected_chars(content),
+            ),
+            None => (text_input("Type your text…", &t.text).on_input(move |s| e(Edit::Text(s))).padding([8, 10]).size(T_BODY).font(font).style(style::input).into(), None),
+        };
+        let mut text_col = column![text_box].spacing(S3);
+        match selected {
+            Some((a, b)) => text_col = text_col.push(selection_style(id, t, a, b, hex)),
+            None => text_col = text_col.push(text("Select words to give them their own color, weight, size or highlight.").size(T_CAPTION).color(TEXT_4)),
+        }
         col = add(col, &mut shown, ctx.section(
             code::TYPE,
             "Text",
             column![
-                text_input("Type your text…", &t.text).on_input(move |s| e(Edit::Text(s))).padding([8, 10]).size(T_BODY).font(if t.text.is_ascii() { INTER } else { HIND }).style(style::input),
+                text_col,
                 row![container(font_pick).width(Length::FillPortion(3)), container(widgets::segmented(&aligns, t.align, |a| match a {
                     Align::Left => "Left".into(),
                     Align::Center => "Center".into(),
@@ -675,6 +703,8 @@ fn blur_clip<'a>(clip: &'a Clip, b: &crate::clip::BlurLayer, ctx: &Ctx<'a>, col:
 /// What the inspector shows besides the clip: edit modes, the range, typed colors,
 /// collapsed sections and the search text.
 pub struct Ctx<'a> {
+    /// The text box of the selected text clip (see `Editor::sync_text_draft`).
+    pub text_draft: Option<&'a iced::widget::text_editor::Content>,
     pub zoom_edit: Option<Id>,
     pub crop_edit: bool,
     pub range: Option<(f64, f64)>,
@@ -782,6 +812,141 @@ fn slider_row<'a>(name: &'a str, value: f64, range: RangeInclusive<f64>, step: f
     .spacing(S2)
     .align_y(Alignment::Center)
     .into()
+}
+
+/// The selected characters of a text box, as char indices `start..end` into its text.
+pub fn selected_chars(content: &iced::widget::text_editor::Content) -> Option<(usize, usize)> {
+    let selected = content.selection().filter(|s| !s.is_empty())?;
+    let text = content.text();
+    let cursor = content.cursor();
+    let line_starts: Vec<usize> = std::iter::once(0).chain(text.match_indices('\n').map(|(i, _)| i + 1)).collect();
+    let offset = |p: iced::widget::text_editor::Position| {
+        let mut b = (line_starts.get(p.line).copied().unwrap_or(text.len()) + p.column).min(text.len());
+        while !text.is_char_boundary(b) {
+            b -= 1;
+        }
+        b
+    };
+    let (p, q) = (offset(cursor.position), cursor.selection.map(offset).unwrap_or(text.len()));
+    let (mut a, mut b) = (p.min(q), p.max(q));
+    // Double-click selects a whole word but reports where the click was: find the selected
+    // text nearest to the cursor instead.
+    if text.get(a..b) != Some(selected.as_str()) {
+        a = text.match_indices(selected.as_str()).map(|(i, _)| i).min_by_key(|i| i.abs_diff(a))?;
+        b = a + selected.len();
+    }
+    let chars = |i: usize| text[..i].chars().count();
+    Some((chars(a), chars(b)))
+}
+
+/// The style controls for the selected words of a text clip.
+fn selection_style<'a>(id: Id, t: &'a crate::clip::TextLayer, a: usize, b: usize, hex: Option<&'a HexDraft>) -> Element<'a, Message> {
+    use crate::clip::SpanChange as C;
+    let e = move |change: C| Message::Edit(id, Edit::SpanStyle(a, b, change));
+    let s = t.style_at(a);
+    let words: String = t.text.chars().skip(a).take(b - a).collect::<String>().replace('\n', " ");
+    let shown: String = if words.chars().count() > 24 { format!("{}…", words.chars().take(23).collect::<String>()) } else { words };
+    let font = if shown.is_ascii() { INTER_MEDIUM } else { HIND };
+    let head = row![
+        tinted(code::TYPE, 12, ACCENT_HOVER),
+        text("Selection").size(T_CAPTION).color(TEXT_3),
+        text(format!("“{shown}”")).font(font).size(T_SMALL).color(TEXT_1).wrapping(text::Wrapping::None).width(Fill),
+        button(text("Reset").size(T_CAPTION)).padding([2, 8]).style(style::ghost).on_press_maybe((!s.is_plain() || t.spans.iter().any(|sp| sp.start < b && sp.end > a)).then(|| e(C::Clear))),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    let weights = [(400u16, "Regular"), (500, "Medium"), (600, "Semibold"), (700, "Bold")];
+    let base_weight = t.weight;
+    let font_pick = pick_list(&FONTS[..], Some(s.font.as_deref().unwrap_or(t.font.as_str())).and_then(|f| FONTS.iter().find(|x| **x == f).copied()), {
+        let base = t.font.clone();
+        move |f: &str| e(C::Font((f != base).then(|| f.to_string())))
+    })
+    .padding([6, 9])
+    .text_size(T_BODY)
+    .width(Fill)
+    .style(style::select)
+    .menu_style(style::select_menu);
+    let mut body = column![
+        head,
+        color_row("Color", s.color.unwrap_or(t.color), (id, "span", hex), move |c| e(C::Color(Some(c)))),
+        widgets::segmented(&weights.map(|w| w.0), s.weight.unwrap_or(base_weight), move |w| weights.iter().find(|x| x.0 == *w).map(|x| x.1).unwrap_or("").to_string(), move |w| e(C::Weight((w != base_weight).then_some(w)))),
+        row![text("Font").size(T_SMALL).color(TEXT_2).width(84), font_pick].align_y(Alignment::Center),
+        slider_row("Size", s.scale.unwrap_or(1.0) * 100.0, 50.0..=300.0, 5.0, |v| format!("{v:.0}%"), move |v| e(C::Scale(Some(v / 100.0)))),
+        toggle_row("Highlight", s.highlight.is_some(), move |on| e(C::Highlight(on.then(|| Rgba::hex(0xD6FF00))))),
+    ]
+    .spacing(S3);
+    if let Some(hl) = s.highlight {
+        body = body.push(color_row("Marker", hl, (id, "span-marker", hex), move |c| e(C::Highlight(Some(c)))));
+    }
+    body = body.push(toggle_row("Underline", s.underline, move |on| e(C::Underline(on))));
+    container(body).padding([10, 10]).width(Fill).style(style::inset).into()
+}
+
+/// How a styled word looks in the inspector's text box.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpanMark {
+    color: Option<Color>,
+    bold: bool,
+}
+
+/// Styled words of `t` per line of its text: (line, byte range in the line, look).
+fn span_marks(t: &crate::clip::TextLayer) -> Vec<(usize, std::ops::Range<usize>, SpanMark)> {
+    let mut out = Vec::new();
+    let line_starts: Vec<usize> = std::iter::once(0).chain(t.text.match_indices('\n').map(|(i, _)| i + 1)).collect();
+    for (range, style) in t.styled_runs() {
+        let Some(s) = style else { continue };
+        // Its own color when it reads on the dark box, otherwise the accent, so it still stands out.
+        let readable = |c: Rgba| 0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2 > 0.3;
+        let color = s.color.filter(|c| readable(*c)).or(s.highlight.filter(|c| readable(*c))).map(|c| Color::from_rgb(c.0, c.1, c.2)).unwrap_or(ACCENT_HOVER);
+        let mark = SpanMark { color: Some(color), bold: s.weight.unwrap_or(t.weight) >= 600 };
+        for (line, &start) in line_starts.iter().enumerate() {
+            let end = line_starts.get(line + 1).map(|n| n - 1).unwrap_or(t.text.len());
+            let (a, b) = (range.start.max(start), range.end.min(end));
+            if a < b {
+                out.push((line, a - start..b - start, mark));
+            }
+        }
+    }
+    out
+}
+
+fn span_format(mark: &SpanMark, _: &iced::Theme) -> iced::advanced::text::highlighter::Format<iced::Font> {
+    iced::advanced::text::highlighter::Format { color: mark.color, font: mark.bold.then_some(INTER_SEMIBOLD) }
+}
+
+/// Feeds `span_marks` to the text box line by line.
+pub struct SpanHighlighter {
+    marks: Vec<(usize, std::ops::Range<usize>, SpanMark)>,
+    line: usize,
+}
+
+impl iced::advanced::text::Highlighter for SpanHighlighter {
+    type Settings = Vec<(usize, std::ops::Range<usize>, SpanMark)>;
+    type Highlight = SpanMark;
+    type Iterator<'a> = std::vec::IntoIter<(std::ops::Range<usize>, SpanMark)>;
+
+    fn new(marks: &Self::Settings) -> Self {
+        SpanHighlighter { marks: marks.clone(), line: 0 }
+    }
+
+    fn update(&mut self, marks: &Self::Settings) {
+        self.marks = marks.clone();
+        self.line = 0;
+    }
+
+    fn change_line(&mut self, line: usize) {
+        self.line = line;
+    }
+
+    fn highlight_line(&mut self, _: &str) -> Self::Iterator<'_> {
+        let line = self.line;
+        self.line += 1;
+        self.marks.iter().filter(|m| m.0 == line).map(|m| (m.1.clone(), m.2)).collect::<Vec<_>>().into_iter()
+    }
+
+    fn current_line(&self) -> usize {
+        self.line
+    }
 }
 
 fn toggle_row<'a>(name: &'a str, on: bool, on_toggle: impl Fn(bool) -> Message + 'a) -> Element<'a, Message> {

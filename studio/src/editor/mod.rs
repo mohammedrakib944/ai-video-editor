@@ -132,9 +132,13 @@ pub enum Message {
     ZoomFit,
     Select(Option<Id>, bool),
     MoveClip { clip: Id, track: Id, start: f64 },
+    /// A clip dropped above the top track: onto a new track on top.
+    MoveClipToNewTrack { clip: Id, start: f64 },
     Trim { clip: Id, edge: Edge, t: f64 },
     SplitAtPlayhead,
     MarkRange,
+    /// Finish the Range tool (the ✓ after A and B).
+    RangeDone,
     MarkIn,
     MarkOut,
     AddZoomAtPlayhead,
@@ -158,8 +162,12 @@ pub enum Message {
     DevSelect(Id, Option<(f64, f64)>),
     /// Debug snapshots: show a sample conversation (user text, reply Markdown).
     DevChat(String, String),
+    /// Debug snapshots: select characters `start..end` in the inspector's text box.
+    DevSelectText(usize, usize),
     DeleteSelection,
     DuplicateSelection,
+    /// Bring the selected pictures to the front (true) or send them to the back.
+    Arrange(bool),
     /// Put the sound of the selected video clips on an audio track of its own.
     SeparateAudio,
     /// Mute or unmute the sound of the selected clips.
@@ -199,6 +207,8 @@ pub enum Message {
     SetCanvas(crate::model::Canvas),
     AiTool(crate::mcp::Call),
     ChatEdit(iced::widget::text_editor::Action),
+    /// Typing or selecting in the inspector's text box of a text clip.
+    TextDraft(Id, iced::widget::text_editor::Action),
     /// The transcript scrolled; true when it's at the bottom.
     ChatScrolled(bool),
     ChatSend,
@@ -245,6 +255,8 @@ pub struct Editor {
     pub side_tab: SideTab,
     /// Range start marked with the playhead, waiting for the end.
     range_anchor: Option<f64>,
+    /// The Range tool's last step: A and B are set and can still be adjusted; Done (✓) finishes.
+    range_review: bool,
     /// Track list scroll offset in pixels.
     vscroll: f32,
     playing: Option<(Instant, f64)>,
@@ -280,7 +292,11 @@ pub struct Editor {
     audio: Option<crate::playback::AudioPlayer>,
     /// Fingerprint of the sound the running audio player was started with.
     audio_revision: u64,
+    /// Why the last playback had no sound, already shown once (so seeking doesn't repeat it).
+    audio_problem: Option<String>,
     muted: bool,
+    /// The "preview is muted" reminder was shown, or the user toggled mute themselves.
+    mute_hint_shown: bool,
     sound_preview: Option<(&'static str, crate::playback::AudioPlayer, Instant)>,
     zoom_edit: Option<(Id, Id)>,
     crop_edit: Option<Id>,
@@ -293,6 +309,8 @@ pub struct Editor {
     agent: crate::assistant::Agent,
     chat: Vec<assistant_panel::ChatItem>,
     chat_input: iced::widget::text_editor::Content,
+    /// The selected text clip's text, as edited in the inspector (it keeps the cursor and selection).
+    text_draft: Option<(Id, iced::widget::text_editor::Content)>,
     /// Keep the transcript pinned to the newest message (off once the user scrolls up).
     chat_follow: bool,
     /// Debug snapshots show a sample conversation without a connected AI.
@@ -337,6 +355,7 @@ impl Editor {
             library_tab: LibraryTab::Media,
             side_tab: SideTab::Inspector,
             range_anchor: None,
+            range_review: false,
             vscroll: 0.0,
             playing: None,
             snapping: true,
@@ -365,7 +384,9 @@ impl Editor {
             export: None,
             audio: None,
             audio_revision: 0,
+            audio_problem: None,
             muted: false,
+            mute_hint_shown: false,
             sound_preview: None,
             zoom_edit: None,
             crop_edit: None,
@@ -376,6 +397,7 @@ impl Editor {
             agent: crate::assistant::Agent::default(),
             chat: Vec::new(),
             chat_input: iced::widget::text_editor::Content::new(),
+            text_draft: None,
             chat_follow: true,
             dev_chat: false,
             timeline_auto: layout.timeline_auto,
@@ -549,8 +571,23 @@ impl Editor {
     fn start_playback(&mut self) {
         self.sound_preview = None;
         self.playing = Some((Instant::now(), self.playhead));
-        self.audio = crate::playback::AudioPlayer::start(&self.doc.project, self.playhead, self.muted).ok();
+        self.audio = None;
+        self.audio = match crate::playback::AudioPlayer::start(&self.doc.project, self.playhead, self.muted) {
+            Ok(a) => a,
+            Err(e) => {
+                self.report_audio_problem(e.to_string());
+                None
+            }
+        };
         self.audio_revision = audio_fingerprint(&self.doc.project);
+    }
+
+    /// Says why playback has no sound, once while the same problem lasts.
+    fn report_audio_problem(&mut self, why: String) {
+        if self.audio_problem.as_deref() != Some(why.as_str()) {
+            self.notify(format!("No sound: {why}"), true);
+            self.audio_problem = Some(why);
+        }
     }
 
     fn stop_playback(&mut self) {
@@ -572,6 +609,32 @@ impl Editor {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.update_inner(message);
+        self.sync_text_draft();
+        task
+    }
+
+    /// Keeps the inspector's text box in step with the selected text clip (undo, the AI and
+    /// other edits change its text too), without disturbing the cursor while they match.
+    fn sync_text_draft(&mut self) {
+        let text = match self.selection.as_slice() {
+            [id] => self.doc.project.clip(*id).and_then(|c| match &c.content {
+                crate::clip::Content::Text(t) => Some((*id, t.text.as_str())),
+                _ => None,
+            }),
+            _ => None,
+        };
+        match text {
+            None => self.text_draft = None,
+            Some((id, text)) => {
+                if !matches!(&self.text_draft, Some((d, c)) if *d == id && c.text() == text) {
+                    self.text_draft = Some((id, iced::widget::text_editor::Content::with_text(text)));
+                }
+            }
+        }
+    }
+
+    fn update_inner(&mut self, message: Message) -> Task<Message> {
         if self.crop_edit.is_some_and(|c| self.selection != [c]) {
             self.crop_edit = None;
         }
@@ -619,13 +682,20 @@ impl Editor {
                         self.playhead = 0.0;
                     }
                     self.start_playback();
+                    // Muted with M or by "Start muted" in Settings: say so once, not on every play.
+                    if self.muted && !self.mute_hint_shown {
+                        self.mute_hint_shown = true;
+                        self.notify("The preview is muted. Press M to hear it", false);
+                    }
                 }
             }
             Message::ToggleMute => {
                 self.muted = !self.muted;
+                self.mute_hint_shown = true;
                 if let Some(a) = &self.audio {
                     a.set_muted(self.muted);
                 }
+                self.notify(if self.muted { "Sound off" } else { "Sound on" }, false);
             }
             Message::Tick(now) => {
                 self.frames.settle();
@@ -641,17 +711,36 @@ impl Editor {
                     }
                     // Edits during playback change the sound: restart the mix where we are.
                     // Only edits that change the sound restart the mix (moving a layer doesn't).
-                    if self.audio.is_some() && audio_fingerprint(&self.doc.project) != self.audio_revision {
+                    // Also when nothing was audible before: a sound added during playback starts playing.
+                    if audio_fingerprint(&self.doc.project) != self.audio_revision {
                         self.start_playback();
+                        return Task::none();
+                    }
+                    // A new default device takes over from one that went away.
+                    if self.audio.as_ref().is_some_and(|a| a.device_lost()) {
+                        self.report_audio_problem("the audio device was disconnected".into());
+                        self.start_playback();
+                        return Task::none();
+                    }
+                    // FFmpeg couldn't mix the sound: say why and keep playing the picture.
+                    if let Some(why) = self.audio.as_ref().and_then(|a| a.failure()) {
+                        let at = self.playhead;
+                        self.audio = None;
+                        self.playing = Some((now, at));
+                        self.report_audio_problem(why);
                         return Task::none();
                     }
                     let t = match &self.audio {
                         Some(a) => match a.position() {
-                            Some(p) => p,
+                            Some(p) => {
+                                self.audio_problem = None;
+                                p
+                            }
+                            // The sound is slow to start: the picture goes ahead on the wall
+                            // clock and the sound joins in sync when it arrives.
                             None if a.stalled() => {
-                                self.audio = None;
-                                self.playing = Some((now, from));
-                                from
+                                a.join_at(started);
+                                from + now.duration_since(started).as_secs_f64()
                             }
                             // Wait for the first samples so picture and sound start together.
                             None => {
@@ -842,6 +931,9 @@ impl Editor {
             Message::MoveClip { clip, track, start } => {
                 self.edit("Move clip", |p| p.move_clip(clip, track, start));
             }
+            Message::MoveClipToNewTrack { clip, start } => {
+                self.edit("Move clip to a new track", |p| p.move_to_new_top_track(clip, start));
+            }
             Message::Trim { clip, edge, t } => {
                 self.edit("Trim clip", |p| p.trim(clip, edge, t));
             }
@@ -868,11 +960,21 @@ impl Editor {
                     });
                 }
             }
+            // The Range tool's three steps: A at the playhead, then B, then Done (✓).
             Message::MarkRange => {
+                if self.reviewing_range() {
+                    return self.update(Message::RangeDone);
+                }
                 let t = self.playhead;
                 match self.range_anchor.take() {
-                    Some(a) if (t - a).abs() > 0.05 => self.set_range(a.min(t), a.max(t)),
-                    Some(_) => self.notify("Move the playhead to where the range should end", false),
+                    Some(a) if (t - a).abs() > 0.05 => {
+                        self.set_range(a.min(t), a.max(t));
+                        self.notify("Range set. Drag its flags to adjust, then click Done", false);
+                    }
+                    Some(a) => {
+                        self.range_anchor = Some(a);
+                        self.notify("Move the playhead to where the range should end", false);
+                    }
                     None => {
                         self.range = None;
                         self.range_anchor = Some(t);
@@ -880,6 +982,12 @@ impl Editor {
                     }
                 }
                 self.lanes_cache.clear();
+            }
+            Message::RangeDone => {
+                if self.reviewing_range() {
+                    self.range_review = false;
+                    self.lanes_cache.clear();
+                }
             }
             Message::MarkIn => {
                 let t = self.playhead;
@@ -917,9 +1025,20 @@ impl Editor {
             }
             Message::DevSelect(clip, range) => {
                 self.selection = vec![clip];
-                self.range = range;
+                match range {
+                    Some((a, b)) => self.set_range(a, b),
+                    None => self.range = None,
+                }
                 self.side_tab = SideTab::Inspector;
                 self.lanes_cache.clear();
+            }
+            Message::DevSelectText(a, b) => {
+                use iced::widget::text_editor::{Action, Motion};
+                if let Some((_, content)) = &mut self.text_draft {
+                    content.perform(Action::Move(Motion::DocumentStart));
+                    (0..a).for_each(|_| content.perform(Action::Move(Motion::Right)));
+                    (a..b).for_each(|_| content.perform(Action::Select(Motion::Right)));
+                }
             }
             Message::Relink(id) => {
                 let name = self.doc.project.asset(id).map(|a| a.name.clone()).unwrap_or_default();
@@ -1027,6 +1146,14 @@ impl Editor {
                     self.selection = new;
                 }
             }
+            Message::Arrange(front) => {
+                // Only pictures have a stacking order; sound in the selection is left alone.
+                let p = &self.doc.project;
+                let ids: Vec<Id> = self.selection.iter().copied().filter(|&id| p.clip(id).is_some_and(|c| p.clip_has_picture(c))).collect();
+                if !ids.is_empty() {
+                    self.edit(if front { "Bring to front" } else { "Send to back" }, |p| ids.iter().try_for_each(|&id| p.arrange(id, front)));
+                }
+            }
             Message::EffectPress(effect) => self.effect_press = Some((effect, self.cursor)),
             Message::EffectHover(h) => self.effect_hover = h,
             Message::EffectClick(effect) => {
@@ -1118,6 +1245,8 @@ impl Editor {
             Message::SetRange(r) => {
                 self.range = r;
                 self.range_anchor = None;
+                // A range dragged out on the ruler (or adjusted) gets the same Done step.
+                self.range_review = r.is_some();
                 self.lanes_cache.clear();
             }
             Message::Edit(id, edit) => {
@@ -1216,7 +1345,7 @@ impl Editor {
                 let mut p = Project::new("preview", self.doc.project.canvas);
                 let asset = p.add_asset(&path, &info);
                 if p.add_media_clip(asset, None, 0.0).is_ok() {
-                    self.sound_preview = crate::playback::AudioPlayer::start(&p, 0.0, false).ok().map(|a| (id, a, Instant::now() + Duration::from_secs_f64(info.duration + 0.3)));
+                    self.sound_preview = crate::playback::AudioPlayer::start(&p, 0.0, false).ok().flatten().map(|a| (id, a, Instant::now() + Duration::from_secs_f64(info.duration + 0.3)));
                 }
             }
             Message::SoundPreviewTick => {
@@ -1224,7 +1353,14 @@ impl Editor {
                     self.sound_preview = None;
                 }
             }
-            Message::AiTool(call) => return self.handle_tool(call),
+            Message::AiTool(call) => {
+                // A reply the user stopped (or one from an earlier process) may still have calls on the way.
+                if call.run.as_deref().is_some_and(|run| !self.agent.accepts(run)) {
+                    call.answer(Err("The user stopped this request. Don't make any more changes.".into()));
+                    return Task::none();
+                }
+                return self.handle_tool(call);
+            }
             Message::SetCanvas(c) => {
                 if c != self.doc.project.canvas {
                     self.edit("Change format", |p| {
@@ -1234,8 +1370,24 @@ impl Editor {
                 }
             }
             Message::ChatEdit(action) => self.chat_input.perform(action),
+            Message::TextDraft(id, action) => {
+                let Some((draft_id, content)) = &mut self.text_draft else { return Task::none() };
+                if *draft_id != id {
+                    return Task::none();
+                }
+                // Selecting only moves the cursor; typing changes the clip (one undo step per burst).
+                let typed = action.is_edit();
+                content.perform(action);
+                if typed {
+                    let text = content.text();
+                    return self.update(Message::Edit(id, inspector::Edit::Text(text)));
+                }
+            }
             Message::ChatScrolled(at_bottom) => self.chat_follow = at_bottom,
             Message::ChatSuggestion(s) => {
+                if self.agent.busy {
+                    return Task::none();
+                }
                 self.chat_input = iced::widget::text_editor::Content::with_text(&s);
                 return self.update(Message::ChatSend);
             }
@@ -1257,7 +1409,14 @@ impl Editor {
                 }
                 return iced::widget::operation::snap_to_end(assistant_panel::SCROLL_ID);
             }
-            Message::ChatStop => self.agent.stop(),
+            Message::ChatStop => {
+                if self.agent.stop() {
+                    self.end_chat_turn(assistant_panel::TurnEnd::Stopped);
+                    if self.chat_follow {
+                        return iced::widget::operation::snap_to_end(assistant_panel::SCROLL_ID);
+                    }
+                }
+            }
             Message::OpenLink(url) => crate::platform::open_url(&url),
             Message::CopyText(text) => {
                 self.notify("Copied", false);
@@ -1291,16 +1450,10 @@ impl Editor {
                                 *img = image.map(iced::widget::image::Handle::from_bytes);
                             }
                         }
-                        crate::assistant::Event::TurnDone { error } => {
-                            for item in &mut self.chat {
-                                if let ChatItem::Tool { state: s @ ToolState::Running, .. } = item {
-                                    *s = ToolState::Done;
-                                }
-                            }
-                            if let Some(e) = error {
-                                self.chat.push(ChatItem::Notice(e));
-                            }
-                        }
+                        crate::assistant::Event::TurnDone { error } => self.end_chat_turn(match error {
+                            None => assistant_panel::TurnEnd::Finished,
+                            Some(e) => assistant_panel::TurnEnd::Failed(e),
+                        }),
                     }
                 }
                 if self.chat_follow {
@@ -1379,6 +1532,7 @@ impl Editor {
                 }
                 if self.renaming.take().is_none() {
                     self.range = None;
+                    self.range_review = false;
                     self.selected_marker = None;
                     self.selection.clear();
                     self.lanes_cache.clear();
@@ -1616,6 +1770,8 @@ impl Editor {
                     items.push(MenuItem::Separator);
                 }
                 items.push(MenuItem::new(code::REFRESH_CW, "Reset position and size", Message::Edit(c.id, Edit::ResetTransform)));
+                items.push(MenuItem::new(code::CHEVRON_UP, "Bring to front", Message::Arrange(true)).shortcut("Ctrl+]"));
+                items.push(MenuItem::new(code::CHEVRON_DOWN, "Send to back", Message::Arrange(false)).shortcut("Ctrl+["));
             }
         }
         items.push(MenuItem::Separator);
@@ -1723,6 +1879,12 @@ impl Editor {
     fn set_range(&mut self, a: f64, b: f64) {
         self.range = Some((a, b));
         self.range_anchor = None;
+        self.range_review = true;
+    }
+
+    /// A and B are set and the Range tool is waiting for Done.
+    fn reviewing_range(&self) -> bool {
+        self.range_review && self.range.is_some() && self.range_anchor.is_none()
     }
 
     /// Camtasia-style: a zoom starting at the playhead on the clip under it. Right after
@@ -1870,10 +2032,15 @@ impl Editor {
         .on_resize(10, Message::PaneResized)
         .style(|_| pane_grid::Style {
             hovered_region: pane_grid::Highlight { background: ACCENT_SOFT.into(), border: iced::Border { color: ACCENT, width: 1.0, radius: R_LG.into() } },
-            picked_split: pane_grid::Line { color: ACCENT, width: 2.0 },
-            hovered_split: pane_grid::Line { color: Color { a: 0.6, ..ACCENT }, width: 2.0 },
+            picked_split: pane_grid::Line { color: SPLIT_DRAG, width: PANE_GAP },
+            hovered_split: pane_grid::Line { color: SPLIT_HOVER, width: PANE_GAP },
         });
-        let body = container(grid).padding(GRID_PAD).width(Fill).height(Fill).style(style::backdrop);
+        // A small grip in the middle of every gap that can be dragged.
+        let grips = responsive(|size| {
+            let splits = self.panes.layout().split_regions(PANE_GAP, PANE_MIN, size);
+            iced::widget::canvas(SplitGrips(splits.into_values().collect())).width(Fill).height(Fill).into()
+        });
+        let body = container(iced::widget::stack![grid, grips]).padding(GRID_PAD).width(Fill).height(Fill).style(style::backdrop);
         let mut layers: Vec<Element<'_, Message>> = vec![body.into()];
         if let Some((msg, error, _)) = &self.toast {
             let toast = container(
@@ -1994,6 +2161,7 @@ impl Editor {
                 [id] => match self.doc.project.clip(*id) {
                     Some(c) => {
                         let ctx = inspector::Ctx {
+                            text_draft: self.text_draft.as_ref().filter(|(d, _)| *d == c.id).map(|(_, content)| content),
                             zoom_edit: self.zoom_edit.map(|(_, z)| z),
                             crop_edit: self.crop_edit == Some(c.id),
                             range: self.range,
@@ -2035,9 +2203,22 @@ impl Editor {
             (Some(_), _) => "Set B",
             _ => "Range",
         };
+        // After A and B: Done finishes the range, ✕ clears it.
+        let range_tool: Element<'_, Message> = if self.reviewing_range() {
+            let done = button(row![icon(code::CHECK, 13), text("Done").font(INTER_SEMIBOLD).size(T_SMALL)].spacing(6).align_y(Alignment::Center)).padding([5, 10]).style(style::primary).on_press(Message::RangeDone);
+            row![
+                widgets::tip(done, "Finish the range (drag its flags on the ruler to adjust it first)", Some("Enter"), tip_pos()),
+                widgets::tip(widgets::icon_button(code::X, Some(Message::SetRange(None))), "Clear the range", Some("Esc"), tip_pos()),
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            widgets::tip(labeled_tool(code::SQUARE_DASHED, range_label, self.range_anchor.is_some() || self.range.is_some(), Message::MarkRange), "Mark A, move the playhead, mark B, then Done", Some("R  ·  I / O"), tip_pos())
+        };
         let tools = row![
             widgets::tip(labeled_tool(code::SCISSORS, "Split", false, Message::SplitAtPlayhead), "Split at the playhead", Some("S"), tip_pos()),
-            widgets::tip(labeled_tool(code::SQUARE_DASHED, range_label, self.range_anchor.is_some() || self.range.is_some(), Message::MarkRange), "Mark A, move the playhead, mark B", Some("R  ·  I / O"), tip_pos()),
+            range_tool,
             widgets::tip(labeled_tool(code::ZOOM_IN, "Zoom", self.zoom_edit.is_some(), Message::AddZoomAtPlayhead), "Add a zoom or pan at the playhead", Some("Z"), tip_pos()),
             widgets::tip(labeled_tool(code::FLAG, "Marker", self.selected_marker.is_some(), Message::AddMarker), "Add a marker at the playhead (or over the marked range)", Some("Shift+M"), tip_pos()),
             container(widgets::vdivider(16.0)).padding([0, 4]),
@@ -2089,7 +2270,7 @@ impl Editor {
             let first = rows.iter().position(|r| r.2 + r.3 + timeline::GAP > 0.0).unwrap_or(0);
             let offset = rows.get(first).map(|r| r.2 - timeline::TOP_PAD).unwrap_or(0.0);
             let headers = mouse_area(
-                container(iced::widget::pin(self.track_headers(first)).y(offset)).width(HEADER_W).height(Fill).clip(true),
+                widgets::clipped(container(iced::widget::pin(self.track_headers(first)).y(offset)).width(HEADER_W).height(Fill)),
             )
             .on_scroll(|d| Message::ScrollTracks(-match d {
                 mouse::ScrollDelta::Lines { y, .. } => y * 48.0,
@@ -2195,8 +2376,10 @@ pub fn blocked_by_dialog(m: &Message) -> bool {
         Message::TogglePlay
             | Message::DeleteSelection
             | Message::DuplicateSelection
+            | Message::Arrange(_)
             | Message::SplitAtPlayhead
             | Message::MarkRange
+            | Message::RangeDone
             | Message::MarkIn
             | Message::MarkOut
             | Message::AddZoomAtPlayhead
@@ -2213,6 +2396,30 @@ pub fn blocked_by_dialog(m: &Message) -> bool {
             | Message::SeparateAudio
             | Message::ToggleClipMute
     )
+}
+
+/// Grips centered in the gaps between blocks: (axis, region the split divides, ratio) per split.
+/// Draw-only, so dragging still goes to the pane grid underneath.
+struct SplitGrips(Vec<(pane_grid::Axis, iced::Rectangle, f32)>);
+
+impl iced::widget::canvas::Program<Message> for SplitGrips {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &iced::Renderer, _: &iced::Theme, bounds: iced::Rectangle, _: iced::mouse::Cursor) -> Vec<iced::widget::canvas::Geometry> {
+        use iced::widget::canvas::{Frame, Path};
+        const LONG: f32 = 22.0;
+        const THICK: f32 = 3.0;
+        let mut frame = Frame::new(renderer, bounds.size());
+        for (axis, r, ratio) in &self.0 {
+            // The gap's center line sits at `ratio` across the region (see iced's `Axis::split`).
+            let (at, size) = match axis {
+                pane_grid::Axis::Horizontal => (iced::Point::new(r.center_x() - LONG / 2.0, r.y + r.height * ratio - THICK / 2.0), iced::Size::new(LONG, THICK)),
+                pane_grid::Axis::Vertical => (iced::Point::new(r.x + r.width * ratio - THICK / 2.0, r.center_y() - LONG / 2.0), iced::Size::new(THICK, LONG)),
+            };
+            frame.fill(&Path::rounded_rectangle(at, size, (THICK / 2.0).into()), SPLIT_GRIP);
+        }
+        vec![frame.into_geometry()]
+    }
 }
 
 /// A hash of everything that affects the audio mix, so playback restarts only when the sound changes.
@@ -2301,10 +2508,13 @@ fn editor_event(event: Event, status: event::Status, _window: window::Id) -> Opt
                 Key::Named(key::Named::ArrowLeft) => Some(Message::Step(if modifiers.shift() { -10 } else { -1 })),
                 Key::Named(key::Named::ArrowRight) => Some(Message::Step(if modifiers.shift() { 10 } else { 1 })),
                 Key::Named(key::Named::Escape) => Some(Message::Escape),
+                Key::Named(key::Named::Enter) => Some(Message::RangeDone),
                 Key::Character("z") if cmd && modifiers.shift() => Some(Message::Redo),
                 Key::Character("z") if cmd => Some(Message::Undo),
                 Key::Character("y") if cmd => Some(Message::Redo),
                 Key::Character("d") if cmd => Some(Message::DuplicateSelection),
+                Key::Character("]") if cmd => Some(Message::Arrange(true)),
+                Key::Character("[") if cmd => Some(Message::Arrange(false)),
                 Key::Character("i") if cmd => Some(Message::Import),
                 Key::Character("b") => Some(Message::SplitAtPlayhead),
                 Key::Character("s") if !cmd => Some(Message::SplitAtPlayhead),
@@ -2387,4 +2597,126 @@ fn fmt_ruler(t: f64) -> String {
 fn fmt_duration(d: f64) -> String {
     let s = d.round() as u64;
     if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clip::{Content, Rgba, SpanChange, TextLayer};
+    use iced::widget::text_editor::{Action, Edit as Typed, Motion};
+
+    fn editor_with_text(text: &str) -> (Editor, Id) {
+        let mut p = Project::new("t", Default::default());
+        let clip = p.add_text_clip(None, 0.0, 5.0, TextLayer { text: text.into(), ..Default::default() }).unwrap();
+        let mut ed = Editor::new(p, None, Layout::default());
+        ed.selection = vec![clip];
+        let _ = ed.update(Message::SideTab(SideTab::Inspector));
+        (ed, clip)
+    }
+
+    fn layer(ed: &Editor, clip: Id) -> TextLayer {
+        match &ed.doc.project.clip(clip).unwrap().content {
+            Content::Text(t) => t.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn draft(ed: &Editor) -> &iced::widget::text_editor::Content {
+        &ed.text_draft.as_ref().expect("the text box follows the selected text clip").1
+    }
+
+    #[test]
+    fn the_range_tool_marks_a_then_b_then_done() {
+        let (mut ed, _) = editor_with_text("x");
+        ed.playhead = 1.0;
+        let _ = ed.update(Message::MarkRange);
+        assert_eq!((ed.range_anchor, ed.range), (Some(1.0), None), "first press: A");
+        assert!(!ed.reviewing_range());
+        ed.playhead = 3.0;
+        let _ = ed.update(Message::MarkRange);
+        assert_eq!(ed.range, Some((1.0, 3.0)), "second press: B");
+        assert!(ed.reviewing_range(), "then the Done button shows");
+        // Adjusting a flag keeps it open; Done (or a third press) closes it and keeps the range.
+        let _ = ed.update(Message::SetRange(Some((1.0, 3.5))));
+        assert!(ed.reviewing_range());
+        let _ = ed.update(Message::MarkRange);
+        assert!(!ed.reviewing_range());
+        assert_eq!(ed.range, Some((1.0, 3.5)));
+        // A range dragged on the ruler gets Done too; Esc clears it.
+        let _ = ed.update(Message::SetRange(Some((4.0, 5.0))));
+        assert!(ed.reviewing_range());
+        let _ = ed.update(Message::RangeDone);
+        assert!(!ed.reviewing_range() && ed.range == Some((4.0, 5.0)));
+        let _ = ed.update(Message::SetRange(Some((4.0, 5.0))));
+        let _ = ed.update(Message::Escape);
+        assert!(ed.range.is_none() && !ed.reviewing_range());
+        // Pressing B at the same spot as A doesn't make an empty range.
+        ed.playhead = 2.0;
+        let _ = ed.update(Message::MarkRange);
+        let _ = ed.update(Message::MarkRange);
+        assert_eq!((ed.range_anchor, ed.range), (Some(2.0), None));
+    }
+
+    #[test]
+    fn selected_words_get_their_own_style_and_keep_it_while_typing() {
+        let (mut ed, clip) = editor_with_text("Make it fast");
+        let _ = ed.update(Message::DevSelectText(8, 12));
+        assert_eq!(inspector::selected_chars(draft(&ed)), Some((8, 12)));
+        let _ = ed.update(Message::Edit(clip, inspector::Edit::SpanStyle(8, 12, SpanChange::Color(Some(Rgba::hex(0xD6FF00))))));
+        let t = layer(&ed, clip);
+        assert_eq!((t.spans.len(), t.spans[0].start, t.spans[0].end), (1, 8, 12));
+        assert_eq!(inspector::selected_chars(draft(&ed)), Some((8, 12)), "styling keeps the selection");
+
+        // Typing in the text box changes the clip, and the style moves with its word.
+        let _ = ed.update(Message::TextDraft(clip, Action::Move(Motion::DocumentStart)));
+        for c in "Now ".chars() {
+            let _ = ed.update(Message::TextDraft(clip, Action::Edit(Typed::Insert(c))));
+        }
+        let t = layer(&ed, clip);
+        assert_eq!(t.text, "Now Make it fast");
+        assert_eq!((t.spans[0].start, t.spans[0].end), (12, 16));
+        assert_eq!(draft(&ed).text(), t.text);
+
+        // Undo puts the text back, and the box follows.
+        let _ = ed.update(Message::Undo);
+        let t = layer(&ed, clip);
+        assert_eq!(t.text, "Make it fast");
+        assert_eq!(draft(&ed).text(), "Make it fast");
+        assert_eq!((t.spans[0].start, t.spans[0].end), (8, 12));
+
+        // Another clip, or none: the box goes with the selection.
+        ed.selection.clear();
+        let _ = ed.update(Message::SideTab(SideTab::Inspector));
+        assert!(ed.text_draft.is_none());
+    }
+
+    #[test]
+    fn bring_to_front_from_the_menu_puts_the_text_over_everything() {
+        let (mut ed, text) = editor_with_text("Hello");
+        let top = ed.doc.project.tracks[0].id;
+        let bottom = ed.doc.project.tracks.iter().filter(|t| t.kind == crate::model::TrackKind::Visual).last().unwrap().id;
+        // The text on the bottom video track, and something else on the top one at the same time.
+        ed.doc.project.move_clip(text, bottom, 0.0).unwrap();
+        let card = ed.doc.project.add_text_clip(Some(top), 0.0, 5.0, TextLayer::default()).unwrap();
+        assert_ne!(ed.doc.project.clip(text).unwrap().track, ed.doc.project.clip(card).unwrap().track);
+        let _ = ed.update(Message::Arrange(true));
+        assert_eq!(ed.doc.project.clip(text).unwrap().track, ed.doc.project.tracks[0].id, "on the new top track");
+        let _ = ed.update(Message::Undo);
+        assert_ne!(ed.doc.project.clip(text).unwrap().track, ed.doc.project.tracks[0].id, "one undo step");
+    }
+
+    #[test]
+    fn double_click_word_selection_and_bangla_map_to_the_right_characters() {
+        let (mut ed, _) = editor_with_text("নতুন অফার আজই");
+        // Put the cursor inside the second word and select the word, as a double-click does.
+        let _ = ed.update(Message::DevSelectText(0, 0));
+        if let Some((_, c)) = &mut ed.text_draft {
+            for _ in 0..6 {
+                c.perform(Action::Move(Motion::Right));
+            }
+            c.perform(Action::SelectWord);
+        }
+        assert_eq!(draft(&ed).selection().as_deref(), Some("অফার"));
+        assert_eq!(inspector::selected_chars(draft(&ed)), Some((5, 9)));
+    }
 }

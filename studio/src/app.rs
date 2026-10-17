@@ -637,6 +637,11 @@ fn snapshot_task() -> Task<Message> {
         None => Task::none(),
     };
     // `STUDIO_SNAPSHOT_REOPEN=1` switches to the assistant tab last (after a selection opened the inspector).
+    // `STUDIO_SNAPSHOT_TEXT=start,end` selects those characters in the text box of the selected text clip.
+    let text_select = match std::env::var("STUDIO_SNAPSHOT_TEXT").ok().map(|v| v.split(',').filter_map(|s| s.parse::<usize>().ok()).collect::<Vec<_>>()) {
+        Some(v) if v.len() == 2 => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.2)), move |_| Message::Editor(editor::Message::DevSelectText(v[0], v[1]))),
+        _ => Task::none(),
+    };
     let reopen = match std::env::var("STUDIO_SNAPSHOT_REOPEN") {
         Ok(_) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.1)), |_| Message::ToggleAssistant),
         Err(_) => Task::none(),
@@ -646,7 +651,7 @@ fn snapshot_task() -> Task<Message> {
         Some(t) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.5)), move |_| Message::Editor(editor::Message::Seek(t))),
         None => Task::none(),
     };
-    Task::batch([open, scroll_first, hscroll, select, zoom, chat, reopen, seek, shot])
+    Task::batch([open, scroll_first, hscroll, select, text_select, zoom, chat, reopen, seek, shot])
 }
 
 fn window_task(action: WindowAction) -> Task<Message> {

@@ -165,3 +165,78 @@ pub fn pad(top: f32, right: f32, bottom: f32, left: f32) -> Padding {
 pub fn fixed(px: f32) -> Length {
     Length::Fixed(px)
 }
+
+/// Truly clips `content` to its bounds. (`container(..).clip(true)` only narrows the viewport
+/// it passes down, so backgrounds and borders moved outside still draw over their neighbors.)
+/// The mouse doesn't reach the parts outside either.
+pub fn clipped<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
+    Element::new(Clipped { content: content.into() })
+}
+
+struct Clipped<'a, M> {
+    content: Element<'a, M>,
+}
+
+mod clipped_impl {
+    use iced::advanced::widget::{Operation, Tree, tree};
+    use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
+    use iced::{Event, Length, Rectangle, Renderer, Size, Theme, Vector};
+
+    use super::Clipped;
+
+    /// The cursor as seen by the content: gone when it's outside the visible part.
+    fn inside(cursor: mouse::Cursor, bounds: Rectangle) -> mouse::Cursor {
+        if cursor.is_over(bounds) { cursor } else { mouse::Cursor::Unavailable }
+    }
+
+    impl<M> Widget<M, Theme, Renderer> for Clipped<'_, M> {
+        fn tag(&self) -> tree::Tag {
+            self.content.as_widget().tag()
+        }
+
+        fn state(&self) -> tree::State {
+            self.content.as_widget().state()
+        }
+
+        fn children(&self) -> Vec<Tree> {
+            self.content.as_widget().children()
+        }
+
+        fn diff(&self, tree: &mut Tree) {
+            self.content.as_widget().diff(tree);
+        }
+
+        fn size(&self) -> Size<Length> {
+            self.content.as_widget().size()
+        }
+
+        fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
+            self.content.as_widget_mut().layout(tree, renderer, limits)
+        }
+
+        fn operate(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer, operation: &mut dyn Operation) {
+            self.content.as_widget_mut().operate(tree, layout, renderer, operation);
+        }
+
+        fn update(&mut self, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, renderer: &Renderer, clipboard: &mut dyn Clipboard, shell: &mut Shell<'_, M>, viewport: &Rectangle) {
+            let bounds = layout.bounds();
+            let viewport = viewport.intersection(&bounds).unwrap_or(Rectangle::new(bounds.position(), Size::ZERO));
+            self.content.as_widget_mut().update(tree, event, layout, inside(cursor, bounds), renderer, clipboard, shell, &viewport);
+        }
+
+        fn mouse_interaction(&self, tree: &Tree, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle, renderer: &Renderer) -> mouse::Interaction {
+            self.content.as_widget().mouse_interaction(tree, layout, inside(cursor, layout.bounds()), viewport, renderer)
+        }
+
+        fn draw(&self, tree: &Tree, renderer: &mut Renderer, theme: &Theme, style: &renderer::Style, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle) {
+            use iced::advanced::Renderer as _;
+            let bounds = layout.bounds();
+            let Some(visible) = viewport.intersection(&bounds) else { return };
+            renderer.with_layer(visible, |r| self.content.as_widget().draw(tree, r, theme, style, layout, inside(cursor, bounds), &visible));
+        }
+
+        fn overlay<'b>(&'b mut self, tree: &'b mut Tree, layout: Layout<'b>, renderer: &Renderer, viewport: &Rectangle, translation: Vector) -> Option<overlay::Element<'b, M, Theme, Renderer>> {
+            self.content.as_widget_mut().overlay(tree, layout, renderer, viewport, translation)
+        }
+    }
+}

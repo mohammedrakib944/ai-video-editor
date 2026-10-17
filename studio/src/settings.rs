@@ -20,7 +20,8 @@ pub struct Layout {
     pub library: f32,
     pub preview_inspector: f32,
     /// The timeline keeps its compact default height until the user drags its edge.
-    #[serde(default = "yes")]
+    /// (Saved under a new key when the compact height got smaller, so every layout starts compact once.)
+    #[serde(default = "yes", rename = "timeline_compact")]
     pub timeline_auto: bool,
 }
 
@@ -255,6 +256,8 @@ mod tests {
         let s: Settings = serde_json::from_str(r#"{ "recent": [], "layout": { "top_bottom": 0.6, "library": 0.2, "preview_inspector": 0.74 } }"#).unwrap();
         assert_eq!(s.prefs, Prefs::default());
         assert!(s.layout.timeline_auto, "old layouts get the compact timeline");
+        let resized: Settings = serde_json::from_str(r#"{ "recent": [], "layout": { "top_bottom": 0.6, "library": 0.2, "preview_inspector": 0.74, "timeline_auto": false } }"#).unwrap();
+        assert!(resized.layout.timeline_auto, "a timeline sized before the smaller default starts compact again");
         assert_eq!(s.prefs.preview_quality, PreviewQuality::Auto);
     }
 

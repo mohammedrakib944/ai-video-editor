@@ -8,7 +8,7 @@ use iced::Task;
 use serde_json::{Value, json};
 
 use super::{Editor, Message, SideTab};
-use crate::clip::{Align, Clip, Content, Ease, Keyframe, Motion, MotionKind, Prop, Rgba, ShapeKind, ShapeLayer, TextLayer, Transition, TransitionKind, Zoom};
+use crate::clip::{Align, Clip, Content, Ease, Keyframe, Motion, MotionKind, Prop, Rgba, ShapeKind, SpanChange, ShapeLayer, TextLayer, Transition, TransitionKind, Zoom};
 use crate::mcp::{self, Call};
 use crate::model::{Aspect, Id, MediaKind, Project, Resolution, TrackKind};
 
@@ -122,6 +122,31 @@ pub fn schemas() -> Vec<Value> {
             &["start", "width", "height", "color"],
         ),
         tool("update_clip", "Change any properties of a clip. Only the fields you pass change.", merged(&[style_props(), text_props()], json!({ "clip_id": int(""), "name": string("Label on the timeline"), "speed": num("Playback speed, 0.25–4 (video/audio)"), "crop_left": num("Video/image crop: fraction of the source frame cut from the left (0–0.95); the rest stays in place"), "crop_right": num("Fraction cut from the right"), "crop_top": num("Fraction cut from the top"), "crop_bottom": num("Fraction cut from the bottom") })), &["clip_id"]),
+        tool(
+            "style_text",
+            "Style some words of a text clip differently from the rest (an accent-colored keyword, a bolder or bigger word, a marker highlight, an underline). Pick the words with `words` (exact text, case-sensitive) or with start/end character positions. Only the fields you pass change; `clear` removes their styling.",
+            json!({
+                "clip_id": int("A text clip"),
+                "words": string("The exact text to style, e.g. \"AI\" or \"in seconds\""),
+                "occurrence": choice(&["first", "all"], "Which matches of `words` to style (default first)"),
+                "start": int("Instead of `words`: first character (0-based, in Unicode characters)"),
+                "end": int("Instead of `words`: character after the last one"),
+                "color": string("#RRGGBB text color"),
+                "weight": int("400 regular – 700 bold"),
+                "font": choice(&["Inter", "Poppins", "Hind Siliguri"], "Font for these words (Hind Siliguri for Bangla)"),
+                "size_scale": num("Size relative to the rest of the text, 0.5–3 (1 = same)"),
+                "highlight": string("#RRGGBB marker box behind the words, or \"none\" to remove it"),
+                "underline": boolean("Underline the words"),
+                "clear": boolean("Remove all styling from these words first"),
+            }),
+            &["clip_id"],
+        ),
+        tool(
+            "arrange_clip",
+            "Put a picture (video, image, text or shape) in front of everything else or behind it, at the same time. It moves to the top or bottom video track (a new one when that is busy).",
+            json!({ "clip_id": int(""), "to": choice(&["front", "back"], "front: drawn over all other layers; back: under them") }),
+            &["clip_id", "to"],
+        ),
         tool("move_clip", "Move a clip to a new start time (and optionally another track of the same kind).", json!({ "clip_id": int(""), "start": num("Timeline seconds"), "track_id": int("Optional") }), &["clip_id", "start"]),
         tool("trim_clip", "Change where a clip starts and/or ends on the timeline (media can't extend past its source).", json!({ "clip_id": int(""), "start": num("New start, timeline seconds"), "end": num("New end, timeline seconds") }), &["clip_id"]),
         tool("split_clip", "Split clips at a time. Without clip_id, splits every clip under that time.", json!({ "time": num("Timeline seconds"), "clip_id": int("Optional") }), &["time"]),
@@ -198,6 +223,32 @@ fn req_id(a: &Value, k: &str) -> anyhow::Result<Id> {
 fn s<'a>(a: &'a Value, k: &str) -> Option<&'a str> {
     a.get(k).and_then(Value::as_str)
 }
+/// The character ranges `style_text` works on: matches of `words`, or `start`..`end`.
+fn text_ranges(tl: &crate::clip::TextLayer, a: &Value) -> anyhow::Result<Vec<(usize, usize)>> {
+    let len = tl.text.chars().count();
+    if let Some(words) = s(a, "words").filter(|w| !w.is_empty()) {
+        let all = s(a, "occurrence") == Some("all");
+        let found: Vec<(usize, usize)> = tl
+            .text
+            .match_indices(words)
+            .map(|(b, m)| {
+                let start = tl.text[..b].chars().count();
+                (start, start + m.chars().count())
+            })
+            .take(if all { usize::MAX } else { 1 })
+            .collect();
+        anyhow::ensure!(!found.is_empty(), "“{words}” isn't in the text “{}”", tl.text);
+        return Ok(found);
+    }
+    let start = a.get("start").and_then(Value::as_u64).map(|v| v as usize);
+    let end = a.get("end").and_then(Value::as_u64).map(|v| v as usize);
+    match (start, end) {
+        (Some(s), Some(e)) if s < e && e <= len => Ok(vec![(s, e)]),
+        (Some(_), Some(_)) => Err(anyhow!("start/end must be 0 ≤ start < end ≤ {len} (the text has {len} characters)")),
+        _ => Err(anyhow!("Pass `words`, or `start` and `end`")),
+    }
+}
+
 fn color(a: &Value, k: &str) -> anyhow::Result<Option<Rgba>> {
     match s(a, k) {
         None => Ok(None),
@@ -343,7 +394,7 @@ fn apply_props(c: &mut Clip, a: &Value) -> anyhow::Result<()> {
     }
     if let Content::Text(tl) = &mut c.content {
         if let Some(v) = s(a, "text") {
-            tl.text = v.replace("\\n", "\n");
+            tl.set_text(v.replace("\\n", "\n"));
         }
         if let Some(v) = s(a, "font") {
             tl.font = v.to_string();
@@ -406,6 +457,37 @@ impl Editor {
                     m.insert("size".into(), json!(t.size));
                     m.insert("weight".into(), json!(t.weight));
                     m.insert("color".into(), json!(t.color.to_hex()));
+                    if !t.spans.is_empty() {
+                        let styled: Vec<Value> = t
+                            .spans
+                            .iter()
+                            .map(|sp| {
+                                let st = &sp.style;
+                                let mut o = json!({ "start": sp.start, "end": sp.end, "words": t.text.chars().skip(sp.start).take(sp.end - sp.start).collect::<String>() });
+                                let m = o.as_object_mut().unwrap();
+                                if let Some(c) = st.color {
+                                    m.insert("color".into(), json!(c.to_hex()));
+                                }
+                                if let Some(w) = st.weight {
+                                    m.insert("weight".into(), json!(w));
+                                }
+                                if let Some(f) = &st.font {
+                                    m.insert("font".into(), json!(f));
+                                }
+                                if let Some(k) = st.scale {
+                                    m.insert("size_scale".into(), json!(k));
+                                }
+                                if let Some(c) = st.highlight {
+                                    m.insert("highlight".into(), json!(c.to_hex()));
+                                }
+                                if st.underline {
+                                    m.insert("underline".into(), json!(true));
+                                }
+                                o
+                            })
+                            .collect();
+                        m.insert("styled_words".into(), json!(styled));
+                    }
                 }
                 if let Content::Media { asset, speed, src_in } = c.content {
                     m.insert("media_id".into(), json!(asset));
@@ -664,6 +746,55 @@ impl Editor {
                     Ok(())
                 })?;
                 Ok("Removed zoom".into())
+            })(),
+            "arrange_clip" => (|| {
+                let clip = req_id(&a, "clip_id")?;
+                let front = match s(&a, "to") {
+                    Some("front") => true,
+                    Some("back") => false,
+                    _ => anyhow::bail!("`to` must be \"front\" or \"back\""),
+                };
+                self.ai_edit(if front { "Bring to front" } else { "Send to back" }, |p| p.arrange(clip, front))?;
+                Ok(format!("Clip {clip} is now {}", if front { "in front of everything" } else { "behind everything" }))
+            })(),
+            "style_text" => (|| {
+                let clip = req_id(&a, "clip_id")?;
+                let shown = self.ai_edit("Style words", |p| {
+                    let Content::Text(tl) = &mut p.clip_mut(clip)?.content else { anyhow::bail!("Clip {clip} isn't a text clip") };
+                    let ranges = text_ranges(tl, &a)?;
+                    let mut changes = Vec::new();
+                    if a["clear"].as_bool() == Some(true) {
+                        changes.push(SpanChange::Clear);
+                    }
+                    if let Some(c) = color(&a, "color")? {
+                        changes.push(SpanChange::Color(Some(c)));
+                    }
+                    if let Some(w) = a.get("weight").and_then(Value::as_u64) {
+                        changes.push(SpanChange::Weight(Some((w as u16).clamp(100, 900))));
+                    }
+                    if let Some(font) = s(&a, "font") {
+                        changes.push(SpanChange::Font(Some(font.to_string())));
+                    }
+                    if let Some(k) = f(&a, "size_scale") {
+                        changes.push(SpanChange::Scale(Some(k)));
+                    }
+                    match s(&a, "highlight") {
+                        Some("none") => changes.push(SpanChange::Highlight(None)),
+                        Some(_) => changes.push(SpanChange::Highlight(color(&a, "highlight")?)),
+                        None => {}
+                    }
+                    if let Some(on) = a["underline"].as_bool() {
+                        changes.push(SpanChange::Underline(on));
+                    }
+                    anyhow::ensure!(!changes.is_empty(), "Pass a style to apply (color, weight, font, size_scale, highlight, underline or clear)");
+                    for &(start, end) in &ranges {
+                        for change in &changes {
+                            tl.style_range(start, end, change);
+                        }
+                    }
+                    Ok(ranges.iter().map(|&(s, e)| tl.text.chars().skip(s).take(e - s).collect::<String>()).collect::<Vec<_>>())
+                })?;
+                Ok(format!("Styled {} in clip {clip}", shown.iter().map(|w| format!("“{w}”")).collect::<Vec<_>>().join(", ")))
             })(),
             "set_keyframes" => (|| {
                 let clip = req_id(&a, "clip_id")?;

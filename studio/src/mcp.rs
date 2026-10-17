@@ -12,6 +12,8 @@ use iced::futures::SinkExt;
 use serde_json::{Value, json};
 
 pub const SERVER_KEY: &str = "ai-video-editor";
+/// Header the built-in assistant sends with every request, naming its run.
+pub const RUN_HEADER: &str = "X-Aive-Run";
 const DEFAULT_PORT: u16 = 47822;
 const CALL_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -23,6 +25,8 @@ pub struct Call {
     pub name: String,
     pub args: Value,
     pub reply: Sender<Reply>,
+    /// The built-in assistant run that made the call (`None` for other MCP clients).
+    pub run: Option<String>,
 }
 
 impl Call {
@@ -99,6 +103,7 @@ fn respond(req: tiny_http::Request, status: u16, body: Option<String>) {
 fn handle_http(tx: Sender<Call>, mut req: tiny_http::Request) {
     // Only local pages may talk to us (protects against DNS rebinding from websites).
     let origin = req.headers().iter().find(|h| h.field.equiv("Origin")).map(|h| h.value.as_str().to_string());
+    let run = req.headers().iter().find(|h| h.field.equiv(RUN_HEADER)).map(|h| h.value.as_str().to_string());
     if let Some(o) = origin {
         let local = o.starts_with("http://127.0.0.1") || o.starts_with("http://localhost") || o == "null";
         if !local {
@@ -113,7 +118,7 @@ fn handle_http(tx: Sender<Call>, mut req: tiny_http::Request) {
         return respond(req, 400, None);
     }
     match serde_json::from_str::<Value>(&body) {
-        Ok(msg) => match handle_message(&tx, msg) {
+        Ok(msg) => match handle_message(&tx, msg, run) {
             Some(reply) => respond(req, 200, Some(reply.to_string())),
             None => respond(req, 202, None),
         },
@@ -121,7 +126,7 @@ fn handle_http(tx: Sender<Call>, mut req: tiny_http::Request) {
     }
 }
 
-fn handle_message(tx: &Sender<Call>, msg: Value) -> Option<Value> {
+fn handle_message(tx: &Sender<Call>, msg: Value, run: Option<String>) -> Option<Value> {
     let id = msg.get("id").cloned()?;
     let method = msg["method"].as_str().unwrap_or("");
     let result = match method {
@@ -135,7 +140,7 @@ fn handle_message(tx: &Sender<Call>, msg: Value) -> Option<Value> {
         "tools/list" => Ok(json!({ "tools": crate::editor::tools::schemas() })),
         "tools/call" => {
             let (reply_tx, reply_rx) = channel();
-            let call = Call { name: msg["params"]["name"].as_str().unwrap_or("").to_string(), args: msg["params"]["arguments"].clone(), reply: reply_tx };
+            let call = Call { name: msg["params"]["name"].as_str().unwrap_or("").to_string(), args: msg["params"]["arguments"].clone(), reply: reply_tx, run };
             let outcome = if tx.send(call).is_err() { Err("The editor isn't running".to_string()) } else { reply_rx.recv_timeout(CALL_TIMEOUT).unwrap_or_else(|_| Err("The editor took too long to answer".into())) };
             Ok(match outcome {
                 Ok(content) => json!({ "content": content, "isError": false }),

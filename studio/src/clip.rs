@@ -397,6 +397,183 @@ pub struct TextLayer {
     /// Optional box behind the text.
     pub background: Option<Rgba>,
     pub padding: f64,
+    /// Words styled differently from the rest: sorted, non-overlapping character ranges.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<TextSpan>,
+}
+
+/// Part of a text layer (characters `start..end`, counted in Unicode chars) with its own style.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextSpan {
+    pub start: usize,
+    pub end: usize,
+    #[serde(flatten)]
+    pub style: SpanStyle,
+}
+
+/// What a span changes; unset fields follow the layer.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpanStyle {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<Rgba>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
+    /// Size relative to the layer's (1.0 = the same).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+    /// A marker-pen box behind the characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<Rgba>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub underline: bool,
+}
+
+impl SpanStyle {
+    pub fn is_plain(&self) -> bool {
+        *self == SpanStyle::default()
+    }
+}
+
+/// One change to the style of part of a text layer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpanChange {
+    Color(Option<Rgba>),
+    Weight(Option<u16>),
+    Font(Option<String>),
+    Scale(Option<f64>),
+    Highlight(Option<Rgba>),
+    Underline(bool),
+    /// Back to the layer's style.
+    Clear,
+}
+
+impl SpanChange {
+    fn apply(&self, s: &mut SpanStyle) {
+        match self.clone() {
+            SpanChange::Color(c) => s.color = c,
+            SpanChange::Weight(w) => s.weight = w,
+            SpanChange::Font(f) => s.font = f,
+            SpanChange::Scale(v) => s.scale = v.map(|v| v.clamp(0.25, 4.0)).filter(|v| (v - 1.0).abs() > 1e-6),
+            SpanChange::Highlight(c) => s.highlight = c,
+            SpanChange::Underline(on) => s.underline = on,
+            SpanChange::Clear => *s = SpanStyle::default(),
+        }
+    }
+}
+
+impl TextLayer {
+    fn char_len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    /// The style of the character at `i` (plain if no span covers it).
+    pub fn style_at(&self, i: usize) -> SpanStyle {
+        self.spans.iter().find(|s| s.start <= i && i < s.end).map(|s| s.style.clone()).unwrap_or_default()
+    }
+
+    /// Applies `change` to characters `start..end`, keeping whatever else those characters had.
+    pub fn style_range(&mut self, start: usize, end: usize, change: &SpanChange) {
+        let end = end.min(self.char_len());
+        if start >= end {
+            return;
+        }
+        // Cut the spans at the range's edges, so every span is fully inside or outside it.
+        let mut runs: Vec<TextSpan> = Vec::new();
+        for s in self.spans.drain(..) {
+            for (a, b) in [(s.start, s.end.min(start)), (s.start.max(start), s.end.min(end)), (s.start.max(end), s.end)] {
+                if a < b {
+                    runs.push(TextSpan { start: a, end: b, style: s.style.clone() });
+                }
+            }
+        }
+        // Plain gaps inside the range become spans too, so they take the change.
+        let mut at = start;
+        let inside: Vec<(usize, usize)> = runs.iter().filter(|r| r.start >= start && r.end <= end).map(|r| (r.start, r.end)).collect();
+        for (a, b) in inside {
+            if at < a {
+                runs.push(TextSpan { start: at, end: a, style: SpanStyle::default() });
+            }
+            at = b;
+        }
+        if at < end {
+            runs.push(TextSpan { start: at, end, style: SpanStyle::default() });
+        }
+        for r in runs.iter_mut().filter(|r| r.start >= start && r.end <= end) {
+            change.apply(&mut r.style);
+        }
+        self.spans = runs;
+        self.normalize_spans();
+    }
+
+    /// Replaces the text, keeping each style on the characters it was on: text typed inside
+    /// a styled word takes its style, text typed at its edges doesn't, and typing over a
+    /// selection keeps the style it started with.
+    pub fn set_text(&mut self, text: String) {
+        let old: Vec<char> = self.text.chars().collect();
+        let new: Vec<char> = text.chars().collect();
+        let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+        let max_suffix = old.len().min(new.len()) - prefix;
+        let suffix = old.iter().rev().zip(new.iter().rev()).take(max_suffix).take_while(|(a, b)| a == b).count();
+        let (old_tail, new_tail) = (old.len() - suffix, new.len() - suffix);
+        // Characters before the change stay; those after it move with the length change;
+        // a span reaching into the replaced part covers the new text there.
+        let start = |p: usize| if p < prefix { p } else if p >= old_tail { p - old_tail + new_tail } else { prefix };
+        let end = |p: usize| if p <= prefix { p } else if p >= old_tail { p - old_tail + new_tail } else { new_tail };
+        for s in &mut self.spans {
+            (s.start, s.end) = (start(s.start), end(s.end));
+        }
+        self.text = text;
+        self.normalize_spans();
+    }
+
+    /// Sorted, inside the text, no empty or plain spans, neighbors with the same style merged.
+    fn normalize_spans(&mut self) {
+        let len = self.char_len();
+        let mut spans: Vec<TextSpan> = std::mem::take(&mut self.spans)
+            .into_iter()
+            .map(|s| TextSpan { start: s.start.min(len), end: s.end.min(len), style: s.style })
+            .filter(|s| s.start < s.end && !s.style.is_plain())
+            .collect();
+        spans.sort_by_key(|s| s.start);
+        let mut out: Vec<TextSpan> = Vec::new();
+        for mut s in spans {
+            if let Some(last) = out.last_mut() {
+                // Overlaps (from hand-edited files or the AI) keep the earlier span.
+                s.start = s.start.max(last.end);
+                if s.start >= s.end {
+                    continue;
+                }
+                if last.end == s.start && last.style == s.style {
+                    last.end = s.end;
+                    continue;
+                }
+            }
+            out.push(s);
+        }
+        self.spans = out;
+    }
+
+    /// Byte ranges of the text with the style of each (plain parts included), for rendering.
+    pub fn styled_runs(&self) -> Vec<(std::ops::Range<usize>, Option<&SpanStyle>)> {
+        let bytes: Vec<usize> = self.text.char_indices().map(|(b, _)| b).chain(std::iter::once(self.text.len())).collect();
+        let byte = |c: usize| bytes[c.min(bytes.len() - 1)];
+        let mut out = Vec::new();
+        let mut at = 0;
+        for s in &self.spans {
+            if s.start > at {
+                out.push((byte(at)..byte(s.start), None));
+            }
+            out.push((byte(s.start)..byte(s.end), Some(&s.style)));
+            at = s.end;
+        }
+        if byte(at) < self.text.len() {
+            out.push((byte(at)..self.text.len(), None));
+        }
+        out
+    }
 }
 
 impl Default for TextLayer {
@@ -412,6 +589,7 @@ impl Default for TextLayer {
             letter_spacing: -1.0,
             background: None,
             padding: 24.0,
+            spans: Vec::new(),
         }
     }
 }
@@ -631,5 +809,74 @@ mod tests {
     fn colors_round_trip_through_hex() {
         assert_eq!(Rgba::parse("#7C6DFF").unwrap().to_hex(), "#7C6DFF");
         assert!(Rgba::parse("nope").is_none());
+    }
+
+    fn styled(text: &str) -> TextLayer {
+        TextLayer { text: text.into(), ..Default::default() }
+    }
+
+    /// The styled words, as text.
+    fn words(t: &TextLayer) -> Vec<String> {
+        t.spans.iter().map(|s| t.text.chars().skip(s.start).take(s.end - s.start).collect()).collect()
+    }
+
+    #[test]
+    fn styling_part_of_a_text_keeps_the_rest() {
+        let mut t = styled("Make it fast today");
+        t.style_range(8, 12, &SpanChange::Color(Some(Rgba::hex(0xD6FF00))));
+        assert_eq!(words(&t), ["fast"]);
+        // Bold over a range that half overlaps: the overlap keeps its color too.
+        t.style_range(5, 10, &SpanChange::Weight(Some(800)));
+        assert_eq!(words(&t), ["it ", "fa", "st"]);
+        assert_eq!(t.style_at(9), SpanStyle { color: Some(Rgba::hex(0xD6FF00)), weight: Some(800), ..Default::default() });
+        assert_eq!(t.style_at(6).color, None);
+        assert_eq!(t.style_at(11).weight, None);
+        // Clearing everything leaves no spans; neighbors with the same style merge.
+        t.style_range(0, 18, &SpanChange::Clear);
+        assert!(t.spans.is_empty());
+        t.style_range(0, 4, &SpanChange::Underline(true));
+        t.style_range(4, 7, &SpanChange::Underline(true));
+        assert_eq!(words(&t), ["Make it"]);
+        // A size back at 100% is no change.
+        t.style_range(0, 7, &SpanChange::Underline(false));
+        t.style_range(0, 4, &SpanChange::Scale(Some(1.0)));
+        assert!(t.spans.is_empty());
+    }
+
+    #[test]
+    fn styles_follow_their_words_while_typing() {
+        let mut t = styled("Make it fast");
+        t.style_range(8, 12, &SpanChange::Highlight(Some(Rgba::hex(0xFFB547))));
+        t.set_text("Make it very fast".into());
+        assert_eq!(words(&t), ["fast"], "text typed before a styled word pushes it along");
+        t.set_text("Make it very faxst".into());
+        assert_eq!(words(&t), ["faxst"], "typing inside a styled word extends it");
+        t.set_text("Make it very faxst!".into());
+        assert_eq!(words(&t), ["faxst"], "typing right after it doesn't");
+        t.set_text("Make it very slow!".into());
+        assert_eq!(words(&t), ["slow"], "typing over the whole word keeps its style");
+        t.set_text("Make it very!".into());
+        assert!(t.spans.is_empty(), "deleting the word removes its style");
+        // Bangla: positions are characters, not bytes.
+        let mut b = styled("নতুন অফার আজই");
+        b.style_range(5, 9, &SpanChange::Color(Some(Rgba::hex(0xFF6363))));
+        assert_eq!(words(&b), ["অফার"]);
+        b.set_text("নতুন বড় অফার আজই".into());
+        assert_eq!(words(&b), ["অফার"]);
+        let runs = b.styled_runs();
+        assert_eq!(runs.iter().filter(|r| r.1.is_some()).map(|r| &b.text[r.0.clone()]).collect::<Vec<_>>(), ["অফার"]);
+        assert_eq!(runs.iter().map(|r| &b.text[r.0.clone()]).collect::<String>(), b.text, "the runs cover the whole text");
+    }
+
+    #[test]
+    fn spans_load_from_files_and_bad_ones_are_cleaned() {
+        let t: TextLayer = serde_json::from_str(r##"{ "text": "Hello", "spans": [ { "start": 0, "end": 99, "color": [1,0,0,1] }, { "start": 1, "end": 3, "underline": true } ] }"##).unwrap();
+        let mut t = t;
+        t.set_text(t.text.clone());
+        assert_eq!(t.spans.len(), 1);
+        assert_eq!((t.spans[0].start, t.spans[0].end), (0, 5));
+        let plain: TextLayer = serde_json::from_str(r#"{ "text": "Old file" }"#).unwrap();
+        assert!(plain.spans.is_empty());
+        assert!(!serde_json::to_string(&plain).unwrap().contains("spans"), "no styles, nothing saved");
     }
 }

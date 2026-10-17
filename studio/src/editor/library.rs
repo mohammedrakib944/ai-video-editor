@@ -56,23 +56,37 @@ impl Editor {
                 Some(widgets::primary_button(Some(code::PLUS), "Import media", Some(Message::Import)).into()),
             );
         }
-        let mut cards: Vec<Element<'_, Message>> = project.assets.iter().map(|a| self.media_card(a)).collect();
-        for path in &self.importing {
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            cards.push(
-                container(
-                    column![
-                        container(iced_aw::Spinner::new().width(Length::Fixed(20.0)).height(Length::Fixed(20.0)).circle_radius(2.0)).center_x(Fill).height(76).align_y(Alignment::Center).style(style::inset),
-                        text(name).size(T_CAPTION).color(TEXT_3).wrapping(text::Wrapping::None),
-                    ]
-                    .spacing(6),
-                )
-                .padding(6)
-                .into(),
-            );
+        fn grid(cards: Vec<Element<'_, Message>>) -> Element<'_, Message> {
+            iced::widget::grid(cards).fluid(190).spacing(6).height(iced::widget::grid::Sizing::EvenlyDistribute(Length::Shrink)).into()
         }
-        let grid = iced::widget::grid(cards).fluid(190).spacing(6).height(iced::widget::grid::Sizing::EvenlyDistribute(Length::Shrink));
-        widgets::scroll(container(grid).padding([6, 8])).height(Fill).into()
+        // Grouped by kind, each group in import order; files still being read come first.
+        let mut groups = column![].spacing(S3);
+        if !self.importing.is_empty() {
+            let cards = self
+                .importing
+                .iter()
+                .map(|path| {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    container(
+                        column![
+                            container(iced_aw::Spinner::new().width(Length::Fixed(20.0)).height(Length::Fixed(20.0)).circle_radius(2.0)).center_x(Fill).height(76).align_y(Alignment::Center).style(style::inset),
+                            text(name).size(T_CAPTION).color(TEXT_3).wrapping(text::Wrapping::None),
+                        ]
+                        .spacing(6),
+                    )
+                    .padding(6)
+                    .into()
+                })
+                .collect();
+            groups = groups.push(column![media_group_header("Importing", self.importing.len()), grid(cards)].spacing(4));
+        }
+        for (kind, title) in [(MediaKind::Video, "Videos"), (MediaKind::Image, "Images"), (MediaKind::Audio, "Audio")] {
+            let cards: Vec<Element<'_, Message>> = project.assets.iter().filter(|a| a.kind == kind).map(|a| self.media_card(a)).collect();
+            if !cards.is_empty() {
+                groups = groups.push(column![media_group_header(title, cards.len()), grid(cards)].spacing(4));
+            }
+        }
+        widgets::scroll(container(groups).padding([8, 8])).height(Fill).into()
     }
 
     fn media_card<'a>(&'a self, a: &'a crate::model::Asset) -> Element<'a, Message> {
@@ -323,6 +337,11 @@ impl Highlight {
 
 /// Colors offered for markers (on the video and on the timeline).
 pub const MARKER_COLORS: [u32; 8] = [0xFFD43B, 0xD6FF00, 0x2EF2A2, 0x4C8DFF, 0x8B7CF6, 0xFF6363, 0xFFA94D, 0xFFFFFF];
+
+/// "VIDEOS  3": a media group's title and how many files it holds.
+fn media_group_header<'a>(title: &str, count: usize) -> Element<'a, Message> {
+    row![widgets::section(title), text(count).font(INTER_MEDIUM).size(10.5).color(TEXT_4)].spacing(6).align_y(Alignment::Center).padding([0, 6]).into()
+}
 
 fn effect_card(_: &iced::Theme, hovered: bool) -> container::Style {
     container::Style {

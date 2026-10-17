@@ -107,12 +107,15 @@ Projects save automatically a couple of seconds after each change.
 - **Timeline**: as many video and audio tracks as you like (right-click a track header to rename,
   add, move, lock, hide/mute or delete; drag a header's bottom edge to resize the track; drag the
   gap above the timeline to resize the whole area; it starts compact). Move, trim and snap clips;
-  drag media in from the library. **Right-click a clip** (on the timeline or the preview) for split,
-  duplicate, **separate audio** (the sound moves to its own audio track), mute, zoom, crop, range
-  volume and delete.
+  drag a clip above the top track to put it on a new track over everything; drag media in from the
+  library. **Right-click a clip** (on the timeline or the preview) for split, duplicate, **separate
+  audio** (the sound moves to its own audio track), mute, zoom, crop, **bring to front / send to back**,
+  range volume and delete. On the preview, a selected element keeps the drag even where another
+  element lies over it.
 - **Split at the playhead** (`S`), **mark a range** with the playhead (`R` for A, then B — the
-  range follows the playhead until you set B; or `I`/`O`). Drag the A/B flags on the ruler to adjust
-  a range, or Shift+drag on the ruler to draw one.
+  range follows the playhead until you set B; or `I`/`O`). Then a **✓ Done** button appears: drag the
+  A/B flags on the ruler to adjust the range, and click Done (or press `Enter` or `R`) to finish; ✕ clears it.
+  Shift+drag on the ruler draws a range too.
 - **Markers**: colored flags on the ruler (`Shift+M`, or the **Marker** button) — a span when a
   range is marked. Click one to jump to it and rename or recolor it in the inspector; drag to move.
 - **Zoom & pan, Camtasia-style**: put the playhead where the zoom should start and press `Z`.
@@ -127,16 +130,19 @@ Projects save automatically a couple of seconds after each change.
   rotation, opacity, framing; **crop** (sliders, or drag the edges on the canvas); rounded corners,
   border, drop shadow; color (brightness, contrast, saturation, warmth); speed; volume and fades; **range volume** (change or mute just the marked range of a clip — each changed
   part keeps its own slider); text (Inter, Poppins, Hind Siliguri for
-  Bangla); shapes (rectangle, ellipse, triangle, star, hexagon, ring, frame with linear/radial gradients
+  Bangla) — **select words in the text box** to give just them their own color, weight, font, size,
+  marker highlight or underline (styles stay on their words while you keep typing); shapes (rectangle, ellipse, triangle, star, hexagon, ring, frame with linear/radial gradients
   at any angle); animations in/out; transitions.
-- **Library tabs**: Media, Text (headline, subtitle, Bangla headline, shape presets), Effects
+- **Library tabs**: Media (grouped into videos, images and audio), Text (headline, subtitle, Bangla headline, shape presets), Effects
   (markers — box, circle, highlight, underline in a color you pick — and **blur**: they go on the
   timeline at the playhead for 3 s, or over the marked range, and you move and resize them on the
   preview; a blur only blurs the video under its box, only while it's on the timeline; plus
   transitions and animations: click to apply to the selection, or drag onto any clip), Sounds (9 original effects — whoosh, pop, click, riser…).
 - **Assistant**: describe what you want; it sees the playhead, the selected clip and the marked
-  range. Replies show formatted (headings, lists, code with a copy button, links). Tool calls show
-  as cards, and it can look at rendered frames to check its work.
+  range. Write on several lines freely: Enter starts a new line and only the Send button sends. Replies show
+  formatted (headings, lists, code with a copy button, links) with a Copy button for the whole reply. Tool calls show
+  as cards, and it can look at rendered frames to check its work. **Stop** ends the reply at once, including
+  anything Claude Code started, and refuses edits still on the way; your next message continues the conversation.
 - **Export** to MP4 (H.264 + AAC) with progress, time left and cancel. The export uses the same
   renderer as the preview, and a cancelled or failed export leaves no broken file.
 - **Settings** (gear in the title bar, the app menu, or `Ctrl+,`): preview quality — **Auto**
@@ -153,11 +159,12 @@ Projects save automatically a couple of seconds after each change.
 |---|---|
 | Space | Play / pause |
 | S or B (Ctrl+B) | Split at the playhead |
-| R · I · O | Mark range (A, then B) · set start · set end |
+| R · I · O | Mark range (A, then B, then Done) · set start · set end |
 | Z | Add a zoom (or pan) at the playhead |
 | T | Add text at the playhead |
 | Delete / Backspace | Delete the selected clips (or the zoom being edited, or the selected marker) |
 | Ctrl+D | Duplicate |
+| Ctrl+] · Ctrl+[ | Bring to front · send to back |
 | ← / → (Shift: 10 frames) | Step one frame |
 | Home / End | Start / end |
 | + / − · Shift+Z | Zoom the timeline in / out · fit |

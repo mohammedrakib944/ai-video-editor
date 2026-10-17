@@ -16,6 +16,8 @@ pub enum ToolState {
     Running,
     Done,
     Failed,
+    /// The reply ended (stopped or failed) before the tool reported back.
+    Unfinished,
 }
 
 pub enum ChatItem {
@@ -23,6 +25,33 @@ pub enum ChatItem {
     Reply(Reply),
     Tool { id: String, label: String, state: ToolState, detail: String, image: Option<image::Handle> },
     Notice(String),
+    /// The user stopped the reply.
+    Stopped,
+}
+
+/// How a reply ended.
+pub enum TurnEnd {
+    Finished,
+    Failed(String),
+    Stopped,
+}
+
+impl Editor {
+    /// Closes the reply in the transcript: no tool is left spinning, and an error or
+    /// "Stopped" line says why it ended. Every way a reply can end goes through here.
+    pub(super) fn end_chat_turn(&mut self, end: TurnEnd) {
+        let left = if matches!(end, TurnEnd::Finished) { ToolState::Done } else { ToolState::Unfinished };
+        for item in &mut self.chat {
+            if let ChatItem::Tool { state: s @ ToolState::Running, .. } = item {
+                *s = left;
+            }
+        }
+        match end {
+            TurnEnd::Finished => {}
+            TurnEnd::Failed(e) => self.chat.push(ChatItem::Notice(e)),
+            TurnEnd::Stopped => self.chat.push(ChatItem::Stopped),
+        }
+    }
 }
 
 /// An assistant reply: the raw text, and its Markdown parsed as it streams in.
@@ -139,7 +168,8 @@ impl Editor {
             .spacing(6);
             widgets::scroll(column![space().height(12), hero, space().height(8), chips].spacing(S3).padding([8, 12])).height(Fill).into()
         } else {
-            let items = self.chat.iter().map(|item| -> Element<'_, Message> {
+            let last = self.chat.len().saturating_sub(1);
+            let items = self.chat.iter().enumerate().map(|(i, item)| -> Element<'_, Message> {
                 match item {
                     ChatItem::User { text: t, context } => {
                         let mut col = column![].spacing(4).align_x(Alignment::End);
@@ -156,7 +186,15 @@ impl Editor {
                         container(col).width(Fill).align_right(Fill).into()
                     }
                     ChatItem::Reply(r) => {
-                        let body = container(markdown::view_with(r.md.items(), markdown_settings(&r.text), &ChatViewer)).width(Fill);
+                        let mut body = column![markdown::view_with(r.md.items(), markdown_settings(&r.text), &ChatViewer)].spacing(4).width(Fill);
+                        // Copy the whole reply as Markdown, once it has finished streaming.
+                        if !(self.agent.busy && i == last) && !r.text.trim().is_empty() {
+                            let copy = button(row![icon(code::COPY, 11).color(TEXT_3), text("Copy").size(T_CAPTION).color(TEXT_3)].spacing(5).align_y(Alignment::Center))
+                                .padding([2, 6])
+                                .style(style::ghost)
+                                .on_press(Message::CopyText(r.text.trim().to_string()));
+                            body = body.push(copy);
+                        }
                         row![container(icon(code::SPARKLES, 11).color(ON_ACCENT)).center(20).style(style::logo), body].spacing(8).into()
                     }
                     ChatItem::Tool { label, state, detail, image: img, .. } => {
@@ -164,6 +202,7 @@ impl Editor {
                             ToolState::Running => (code::LOADER_CIRCLE, ACCENT_HOVER),
                             ToolState::Done => (code::CIRCLE_CHECK, SUCCESS),
                             ToolState::Failed => (code::CIRCLE_X, DANGER),
+                            ToolState::Unfinished => (code::CIRCLE_DASHED, TEXT_4),
                         };
                         let head: Element<'_, Message> = if *state == ToolState::Running {
                             iced_aw::Spinner::new().width(Length::Fixed(12.0)).height(Length::Fixed(12.0)).circle_radius(1.5).into()
@@ -182,6 +221,7 @@ impl Editor {
                     ChatItem::Notice(t) => {
                         container(row![tinted(code::TRIANGLE_ALERT, 12, WARNING), text(t).size(T_SMALL).color(TEXT_2)].spacing(8)).padding([6, 10]).width(Fill).style(style::badge(WARNING)).into()
                     }
+                    ChatItem::Stopped => row![tinted(code::SQUARE, 10, TEXT_4), text("Stopped").size(T_CAPTION).color(TEXT_3)].spacing(6).align_y(Alignment::Center).into(),
                 }
             });
             let mut col = column(items).spacing(10);
@@ -240,19 +280,11 @@ impl Editor {
             column![
                 chips,
                 row![
-                    // Enter sends; Shift+Enter starts a new line. Grows up to about six lines.
+                    // Enter starts a new line; only the Send button sends. Grows up to about six lines.
                     iced::widget::text_editor(&self.chat_input)
                         .id(INPUT_ID)
                         .placeholder("Describe what you want…")
                         .on_action(Message::ChatEdit)
-                        .key_binding(|kp| {
-                            use iced::keyboard::key::Named;
-                            use iced::widget::text_editor::Binding;
-                            if kp.key == iced::keyboard::Key::Named(Named::Enter) && !kp.modifiers.shift() {
-                                return Some(Binding::Custom(Message::ChatSend));
-                            }
-                            Binding::from_key_press(kp)
-                        })
                         .font(font)
                         .size(T_BODY)
                         .padding([9, 11])

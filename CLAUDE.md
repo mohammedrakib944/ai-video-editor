@@ -51,7 +51,8 @@ GNU toolchain + MinGW-w64 (WinLibs). Windows packaging:
 `STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|settings` (open the Connect AI dialog, the assistant panel,
 the Effects tab or Settings), `STUDIO_SNAPSHOT_ZOOM=2` (preview zoom), `STUDIO_SNAPSHOT_CHAT=reply.md` (a sample
 conversation with that Markdown reply, no AI needed), `STUDIO_SNAPSHOT_REOPEN=1` (switch to the
-assistant tab last), `STUDIO_SNAPSHOT_SEEK=seconds` (move the playhead). Set `APPDATA` to a scratch folder for test instances so they don't touch the
+assistant tab last), `STUDIO_SNAPSHOT_SEEK=seconds` (move the playhead), `STUDIO_SNAPSHOT_TEXT=start,end` (select those characters in
+the text box of a text clip selected with `STUDIO_SNAPSHOT_SELECT`). Set `APPDATA` to a scratch folder for test instances so they don't touch the
 user's settings or recent projects.
 Wired through `Message::Snapshot` / `DevSelect` in `editor/mod.rs`, all `cfg(debug_assertions)`.
 
@@ -60,7 +61,8 @@ Wired through `Message::Snapshot` / `DevSelect` in `editor/mod.rs`, all `cfg(deb
 **Document model.** `model.rs` (Project, Asset, Track with optional `height`, Canvas; saved as
 `.aivp` JSON) and `clip.rs` (Clip with transform, look — corners/border/shadow, grade, audio with
 fades and range `gains`, Camtasia-style `zooms` where `camera_at` pans between adjacent zooms,
-keyframes, intro/outro motions, transitions, text, shape and blur layers (`Content::Blur`: a box that blurs
+keyframes, intro/outro motions, transitions, text (with `spans`: styled character ranges — change the text only
+through `TextLayer::set_text` and styles through `style_range`, which keep spans on their words), shape and blur layers (`Content::Blur`: a box that blurs
 the media below it while the clip is on), `crop`, and `part` — Whole, or Picture/Sound after "Separate audio"; use
 `Project::clip_kind`, `clip_has_picture`, `clip_has_sound` instead of the asset kind). Timeline
 `markers` live on the Project (colored points or spans; not rendered). Positions are canvas
@@ -108,7 +110,11 @@ it gets native rounded corners/shadow.
 (`AIVE_STUDIO_MCP_PORT`), local origins only; calls reach the UI thread through a subscription and
 answer on a reply channel. Tools live in `editor/tools.rs` (schema + handler per tool) — adding a
 tool means adding both there. `assistant.rs` runs the user's `claude` CLI headless against that
-server (enabled only when connected); `ai_connect.rs` is the Connect AI dialog and title-bar chip;
+server (enabled only when connected). Each Claude Code process has its own inbox (a stopped one can't
+leak events into the next reply), runs in a `platform::ProcessGroup` (Windows job object / Linux process
+group, so Stop ends everything it started), and tags its MCP requests with `X-Aive-Run`; the editor
+refuses tool calls whose run isn't the reply in progress (`Agent::accepts`). Every reply ends in
+exactly one `TurnDone`, and the UI closes it through `end_chat_turn`; `ai_connect.rs` is the Connect AI dialog and title-bar chip;
 the chosen provider persists in `settings.rs`. ChatGPT is shown as "Coming next" (undecided:
 Codex CLI vs API key).
 
@@ -131,6 +137,9 @@ removes `WAYLAND_DISPLAY` to run under XWayland so drag and drop works — winit
   (the timeline is `LanesBase` + `Lanes`). Stacked layers escape a scrollable's clipping, and
   images/text aren't clipped to canvas bounds, so clip manually (`on_canvas`).
 - Canvas `with_clip` keeps absolute coordinates.
+- `container(..).clip(true)` only narrows the viewport its children get; their backgrounds and borders still
+  draw outside it. Use `widgets::clipped` (a real clip layer that also hides the mouse outside) when content can
+  move past its bounds (the track headers scroll that way).
 - FFmpeg filter-script files must outlive the FFmpeg process that reads them. Use
   `ffmpeg::filter_script_option()` (FFmpeg 7 `-/filter_complex` vs 6.x `-filter_complex_script`).
 - Export writes through a cleanup guard so a cancelled/failed export leaves no partial file.
