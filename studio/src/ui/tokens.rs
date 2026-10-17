@@ -62,6 +62,8 @@ pub mod clip {
     pub const TEXT: Color = hex(0xA672FF);
     pub const AUDIO: Color = hex(0x37C98B);
     pub const EFFECT: Color = hex(0xFF8A4C);
+    /// Blur bands on clips.
+    pub const BLUR: Color = hex(0x7CC4FF);
 }
 
 // Spacing scale (px).

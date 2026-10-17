@@ -35,6 +35,13 @@ use crate::ui::tokens::*;
 use crate::ui::widgets::{self, MenuItem};
 use crate::ui::style;
 
+/// Gaps between the editor blocks, and around them.
+const PANE_GAP: f32 = 6.0;
+const GRID_PAD: iced::Padding = iced::Padding { top: PANE_GAP, right: PANE_GAP, bottom: PANE_GAP, left: PANE_GAP };
+/// Smallest a pane can be dragged; the timeline also starts at this height.
+const PANE_MIN: f32 = 160.0;
+const TIMELINE_DEFAULT_H: f32 = PANE_MIN;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     Library,
@@ -83,9 +90,26 @@ pub enum TrackAction {
     AddAudio,
 }
 
+/// Where a dragged effect was dropped.
+#[derive(Debug, Clone, Copy)]
+pub enum DropTarget {
+    /// On the preview: the layer under the cursor, and the point (canvas fractions).
+    Canvas { clip: Option<Id>, at: (f64, f64) },
+    /// On the timeline: the clip under the cursor, the track and the time.
+    Timeline { clip: Option<Id>, track: Option<Id>, t: f64 },
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     PaneResized(pane_grid::ResizeEvent),
+    /// The window size changed (or is first known).
+    WindowSize(Size),
+    /// Preview zoom: a scale (1 = one canvas pixel per screen point), or None to fit.
+    PreviewZoom(Option<f32>),
+    /// Zoom the preview by a factor around a point of the stage.
+    PreviewZoomAt(f32, Point),
+    /// Move a zoomed preview by this many pixels.
+    PreviewPan(iced::Vector),
     LibraryTab(LibraryTab),
     SideTab(SideTab),
     TogglePlay,
@@ -120,6 +144,11 @@ pub enum Message {
     /// Volume for the selected range of a clip.
     RangeVolume(Id, f64),
     RemoveGain(Id, Id),
+    /// Volume of one changed part of a clip: (clip, gain, volume).
+    GainVolume(Id, Id, f64),
+    /// Collapse or expand an inspector section.
+    ToggleSection(&'static str),
+    InspectorSearch(String),
     TrackResizeStart(Id),
     HexDraft(Id, &'static str, String),
     /// Point a library item at a new file (for moved or missing media).
@@ -127,10 +156,30 @@ pub enum Message {
     Relinked(Id, Option<PathBuf>),
     /// Debug snapshots: select a clip and a range.
     DevSelect(Id, Option<(f64, f64)>),
+    /// Debug snapshots: show a sample conversation (user text, reply Markdown).
+    DevChat(String, String),
     DeleteSelection,
     DuplicateSelection,
+    /// Put the sound of the selected video clips on an audio track of its own.
+    SeparateAudio,
+    /// Mute or unmute the sound of the selected clips.
+    ToggleClipMute,
     SetRange(Option<(f64, f64)>),
     DropAsset { asset: Id, track: Option<Id>, t: f64 },
+    /// An effect card was pressed (a drag may follow), released without dragging, or hovered.
+    EffectPress(library::Effect),
+    EffectClick(library::Effect),
+    EffectHover(Option<library::Effect>),
+    /// An effect dropped on the preview or the timeline.
+    DropEffect { effect: library::Effect, target: DropTarget },
+    MarkerColor(Rgba),
+    /// Add a timeline marker at the playhead (spanning the range, if one is marked).
+    AddMarker,
+    SelectMarker(Option<Id>),
+    MoveMarker(Id, f64),
+    MarkerName(Id, String),
+    MarkerColorOf(Id, Rgba),
+    DeleteMarker(Id),
     Edit(Id, Edit),
     Undo,
     Redo,
@@ -145,6 +194,8 @@ pub enum Message {
     SoundPreviewReady(&'static str, Result<(PathBuf, ProbeInfo), String>),
     SoundPreviewTick,
     ZoomEdit(Option<(Id, Id)>),
+    /// Crop the clip on the canvas (None leaves crop mode).
+    CropEdit(Option<Id>),
     SetCanvas(crate::model::Canvas),
     AiTool(crate::mcp::Call),
     ChatEdit(iced::widget::text_editor::Action),
@@ -154,6 +205,10 @@ pub enum Message {
     ChatSuggestion(String),
     ChatStop,
     ChatNew,
+    /// A link in an assistant reply was clicked.
+    OpenLink(String),
+    /// Copy text (a code block) to the clipboard.
+    CopyText(String),
     ChatPoll,
     /// Ask the app to open the Connect AI dialog.
     OpenAiConnect,
@@ -205,6 +260,17 @@ pub struct Editor {
     /// Library item pressed (drag starts once the cursor moves).
     press: Option<(Id, Point)>,
     pub dnd: Option<Id>,
+    /// Effect card pressed (drag starts once the cursor moves), and the effect being dragged.
+    effect_press: Option<(library::Effect, Point)>,
+    pub effect_dnd: Option<library::Effect>,
+    effect_hover: Option<library::Effect>,
+    /// Color for new markers.
+    marker_color: Rgba,
+    /// The timeline marker shown in the inspector.
+    selected_marker: Option<Id>,
+    /// Inspector sections the user collapsed (by title), and the inspector search text.
+    pub collapsed: std::collections::BTreeSet<String>,
+    inspector_query: String,
     pub cursor: Point,
     renaming: Option<(Id, String)>,
     toast: Option<(String, bool, Instant)>,
@@ -217,6 +283,7 @@ pub struct Editor {
     muted: bool,
     sound_preview: Option<(&'static str, crate::playback::AudioPlayer, Instant)>,
     zoom_edit: Option<(Id, Id)>,
+    crop_edit: Option<Id>,
     file_hover: bool,
     /// Track being resized: (track, cursor y at start, height at start).
     resizing_track: Option<(Id, f32, f32)>,
@@ -228,6 +295,20 @@ pub struct Editor {
     chat_input: iced::widget::text_editor::Content,
     /// Keep the transcript pinned to the newest message (off once the user scrolls up).
     chat_follow: bool,
+    /// Debug snapshots show a sample conversation without a connected AI.
+    dev_chat: bool,
+    /// Whether the timeline height follows the default (until the user drags it).
+    timeline_auto: bool,
+    window_size: Size,
+    /// Preview zoom (None = fit) and how far the zoomed canvas is moved from the center.
+    preview_zoom: Option<f32>,
+    preview_pan: iced::Vector,
+    stage_size: Cell<Size>,
+    /// Settings that shape the editor (preview quality, default lengths, …).
+    prefs: crate::settings::Prefs,
+    /// With Auto preview quality: the level in use (lowered while playback can't keep up).
+    auto_level: crate::settings::PreviewQuality,
+    lag_check: Instant,
 }
 
 impl Editor {
@@ -269,6 +350,13 @@ impl Editor {
             library_selected: None,
             press: None,
             dnd: None,
+            effect_press: None,
+            effect_dnd: None,
+            effect_hover: None,
+            marker_color: Rgba::hex(library::MARKER_COLORS[0]),
+            selected_marker: None,
+            collapsed: Default::default(),
+            inspector_query: String::new(),
             cursor: Point::ORIGIN,
             renaming: None,
             toast: None,
@@ -280,6 +368,7 @@ impl Editor {
             muted: false,
             sound_preview: None,
             zoom_edit: None,
+            crop_edit: None,
             file_hover: false,
             resizing_track: None,
             missing: Default::default(),
@@ -288,6 +377,62 @@ impl Editor {
             chat: Vec::new(),
             chat_input: iced::widget::text_editor::Content::new(),
             chat_follow: true,
+            dev_chat: false,
+            timeline_auto: layout.timeline_auto,
+            window_size: Size::ZERO,
+            preview_zoom: None,
+            preview_pan: iced::Vector::ZERO,
+            stage_size: Cell::new(Size::new(960.0, 540.0)),
+            prefs: Default::default(),
+            auto_level: crate::settings::PreviewQuality::Auto,
+            lag_check: Instant::now(),
+        }
+    }
+
+    /// Uses new settings. `opening`: the project was just opened, so session toggles
+    /// (snapping, mute) start from the settings too.
+    pub fn apply_prefs(&mut self, prefs: &crate::settings::Prefs, opening: bool) {
+        let p = prefs.sane();
+        if opening || p.snapping != self.prefs.snapping {
+            self.snapping = p.snapping;
+        }
+        if opening || p.start_muted != self.prefs.start_muted {
+            self.muted = p.start_muted;
+            if let Some(a) = &self.audio {
+                a.set_muted(self.muted);
+            }
+        }
+        if p.preview_quality != self.prefs.preview_quality {
+            self.auto_level = crate::settings::PreviewQuality::Auto;
+        }
+        self.prefs = p;
+    }
+
+    /// The preview quality in use right now.
+    fn preview_quality(&self) -> crate::settings::PreviewQuality {
+        match self.prefs.preview_quality {
+            crate::settings::PreviewQuality::Auto => self.auto_level,
+            q => q,
+        }
+    }
+
+    /// The split between the top panes and the timeline.
+    fn top_split(&self) -> Option<pane_grid::Split> {
+        match self.panes.layout() {
+            pane_grid::Node::Split { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Gives the timeline its compact default height, until the user sizes it themselves.
+    fn fit_timeline(&mut self) {
+        let grid_h = self.window_size.height - TITLE_BAR_H - GRID_PAD.top - GRID_PAD.bottom;
+        if !self.timeline_auto || grid_h < TIMELINE_DEFAULT_H * 2.0 {
+            return;
+        }
+        if let Some(split) = self.top_split() {
+            // The pane grid gives the bottom pane `height * (1 - ratio) - spacing / 2`.
+            self.panes.resize(split, 1.0 - (TIMELINE_DEFAULT_H + PANE_GAP / 2.0) / grid_h);
         }
     }
 
@@ -333,7 +478,7 @@ impl Editor {
     /// Current split ratios, for saving the layout.
     pub fn layout(&self) -> Layout {
         use pane_grid::Node;
-        let mut l = Layout::default();
+        let mut l = Layout { timeline_auto: self.timeline_auto, ..Layout::default() };
         if let Node::Split { ratio, a, .. } = self.panes.layout() {
             l.top_bottom = *ratio;
             if let Node::Split { ratio, b, .. } = a.as_ref() {
@@ -411,6 +556,9 @@ impl Editor {
     fn stop_playback(&mut self) {
         self.playing = None;
         self.audio = None;
+        // Auto goes back to sharp once the picture stands still.
+        self.auto_level = crate::settings::PreviewQuality::Auto;
+        self.frames.take_lag();
     }
 
     /// Scrolls the timeline so the playhead stays visible.
@@ -424,13 +572,44 @@ impl Editor {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if self.crop_edit.is_some_and(|c| self.selection != [c]) {
+            self.crop_edit = None;
+        }
         if self.export.is_some() && blocked_by_dialog(&message) {
             return Task::none();
         }
         match message {
-            Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => self.panes.resize(split, ratio),
+            Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
+                if self.top_split() == Some(split) {
+                    self.timeline_auto = false;
+                }
+                self.panes.resize(split, ratio);
+            }
+            Message::PreviewZoom(z) => {
+                self.preview_zoom = z.map(|z| z.clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX));
+                self.preview_pan = iced::Vector::ZERO;
+            }
+            Message::PreviewZoomAt(factor, at) => self.zoom_preview_at(factor, at),
+            Message::PreviewPan(d) => {
+                if self.preview_zoom.is_some() {
+                    let size = self.stage_size.get();
+                    let (w, h, _) = self.canvas_placement(size);
+                    self.preview_pan = clamp_pan(self.preview_pan + d, size, w, h);
+                }
+            }
+            Message::WindowSize(size) => {
+                self.window_size = size;
+                self.fit_timeline();
+            }
             Message::LibraryTab(t) => self.library_tab = t,
-            Message::SideTab(t) => self.side_tab = t,
+            Message::SideTab(t) => {
+                self.side_tab = t;
+                // The transcript is rebuilt when its tab opens: show where the conversation ended.
+                if t == SideTab::Assistant {
+                    self.chat_follow = true;
+                    return iced::widget::operation::snap_to_end(assistant_panel::SCROLL_ID);
+                }
+            }
             Message::ToggleSnapping => self.snapping = !self.snapping,
             Message::TogglePlay => {
                 if self.playing.is_some() {
@@ -452,6 +631,14 @@ impl Editor {
                 self.frames.settle();
                 self.frames.collect_idle();
                 if let Some((started, from)) = self.playing {
+                    // Auto quality: step down when more than a fifth of the frames came late.
+                    if self.prefs.preview_quality == crate::settings::PreviewQuality::Auto && self.lag_check.elapsed() > Duration::from_secs(1) {
+                        let (asked, late) = self.frames.take_lag();
+                        if asked >= 10 && late * 5 > asked && self.auto_level != crate::settings::PreviewQuality::Draft {
+                            self.auto_level = self.auto_level.lower();
+                        }
+                        self.lag_check = now;
+                    }
                     // Edits during playback change the sound: restart the mix where we are.
                     // Only edits that change the sound restart the mix (moving a layer doesn't).
                     if self.audio.is_some() && audio_fingerprint(&self.doc.project) != self.audio_revision {
@@ -549,7 +736,8 @@ impl Editor {
             Message::LibraryAdd(id) => {
                 self.press = None;
                 let at = self.playhead;
-                if let Some(clip) = self.edit("Add to timeline", |p| p.add_media_clip(id, None, at)) {
+                let still = self.prefs.still_seconds;
+                if let Some(clip) = self.edit("Add to timeline", |p| p.add_media_clip_still(id, None, at, still)) {
                     self.selection = vec![clip];
                 }
             }
@@ -572,10 +760,17 @@ impl Editor {
                         self.dnd = Some(id);
                     }
                 }
+                if let Some((effect, origin)) = self.effect_press {
+                    if self.effect_dnd.is_none() && origin.distance(p) > 6.0 {
+                        self.effect_dnd = Some(effect);
+                    }
+                }
             }
             Message::MouseReleased => {
                 self.press = None;
                 self.dnd = None;
+                self.effect_press = None;
+                self.effect_dnd = None;
                 self.resizing_track = None;
             }
             Message::DropAsset { asset, track, t } => {
@@ -588,9 +783,10 @@ impl Editor {
                         (tk.kind == TrackKind::Audio) == (a.kind == MediaKind::Audio) && !tk.locked
                     })
                 };
+                let still = self.prefs.still_seconds;
                 if let Some(clip) = self.edit("Add to timeline", |p| {
                     let track = if fits(p) { track } else { None };
-                    p.add_media_clip(asset, track, t)
+                    p.add_media_clip_still(asset, track, t, still)
                 }) {
                     self.selection = vec![clip];
                 }
@@ -614,6 +810,9 @@ impl Editor {
                 self.lanes_cache.clear();
             }
             Message::Select(id, additive) => {
+                if id.is_some() {
+                    self.selected_marker = None;
+                }
                 match id {
                     Some(id) if additive => {
                         if let Some(i) = self.selection.iter().position(|&s| s == id) {
@@ -634,6 +833,9 @@ impl Editor {
                 }
                 if self.zoom_edit.is_some_and(|(c, _)| !self.selection.contains(&c)) {
                     self.zoom_edit = None;
+                }
+                if self.crop_edit.is_some_and(|c| !self.selection.contains(&c)) {
+                    self.crop_edit = None;
                 }
                 self.lanes_cache.clear();
             }
@@ -706,6 +908,13 @@ impl Editor {
                     self.edit_merge("Range volume", Some(&format!("range-volume:{clip}")), |p| p.set_range_volume(clip, a, b, v));
                 }
             }
+            Message::DevChat(user, reply) => {
+                self.chat.push(assistant_panel::ChatItem::User { text: user, context: None });
+                self.chat.push(assistant_panel::ChatItem::Reply(assistant_panel::Reply::new(&reply)));
+                self.dev_chat = true;
+                self.side_tab = SideTab::Assistant;
+                return iced::widget::operation::snap_to_end(assistant_panel::SCROLL_ID);
+            }
             Message::DevSelect(clip, range) => {
                 self.selection = vec![clip];
                 self.range = range;
@@ -765,6 +974,20 @@ impl Editor {
                     self.resizing_track = Some((id, self.cursor.y, timeline::track_height(t)));
                 }
             }
+            Message::GainVolume(clip, gain, v) => {
+                self.edit_merge("Range volume", Some(&format!("gain:{gain}")), |p| {
+                    p.ensure_unlocked(clip)?;
+                    let g = p.clip_mut(clip)?.audio.gains.iter_mut().find(|g| g.id == gain).ok_or_else(|| anyhow::anyhow!("That volume change no longer exists"))?;
+                    g.volume = v.clamp(0.0, 4.0);
+                    Ok(())
+                });
+            }
+            Message::ToggleSection(title) => {
+                if !self.collapsed.remove(title) {
+                    self.collapsed.insert(title.to_string());
+                }
+            }
+            Message::InspectorSearch(q) => self.inspector_query = q,
             Message::RemoveGain(clip, gain) => {
                 self.edit("Remove range volume", |p| {
                     p.clip_mut(clip)?.audio.gains.retain(|g| g.id != gain);
@@ -788,6 +1011,11 @@ impl Editor {
                     });
                     return Task::none();
                 }
+                if self.selection.is_empty() {
+                    if let Some(m) = self.selected_marker {
+                        return self.update(Message::DeleteMarker(m));
+                    }
+                }
                 let ids = std::mem::take(&mut self.selection);
                 if !ids.is_empty() {
                     self.edit(if ids.len() == 1 { "Delete clip" } else { "Delete clips" }, |p| p.delete_clips(&ids));
@@ -799,6 +1027,94 @@ impl Editor {
                     self.selection = new;
                 }
             }
+            Message::EffectPress(effect) => self.effect_press = Some((effect, self.cursor)),
+            Message::EffectHover(h) => self.effect_hover = h,
+            Message::EffectClick(effect) => {
+                // A press and release on the same card, without a drag in between, is a click.
+                if self.effect_dnd.is_none() && self.effect_press.is_some_and(|(e, _)| e == effect) {
+                    self.effect_press = None;
+                    return self.apply_effect(effect, None);
+                }
+            }
+            Message::DropEffect { effect, target } => {
+                (self.effect_press, self.effect_dnd) = (None, None);
+                return self.apply_effect(effect, Some(target));
+            }
+            Message::MarkerColor(c) => {
+                self.marker_color = c;
+                // Recolor a selected marker, too.
+                if let [id] = self.selection.as_slice() {
+                    if self.doc.project.clip(*id).is_some_and(|c| matches!(c.content, crate::clip::Content::Shape(_))) {
+                        return self.update(Message::Edit(*id, Edit::ShapeFill(Rgba(c.0, c.1, c.2, self.doc.project.clip(*id).and_then(|c| inspector::current_color(c, "shape1")).map(|f| f.3).unwrap_or(1.0)))));
+                    }
+                }
+            }
+            Message::AddMarker => {
+                // Over a marked range the marker spans it; otherwise it marks the playhead.
+                let (at, duration) = match self.range {
+                    Some((a, b)) => (a, b - a),
+                    None => (self.playhead, 0.0),
+                };
+                let color = self.marker_color;
+                if let Some(id) = self.edit("Add marker", |p| Ok(p.add_marker(at, duration, color))) {
+                    self.selected_marker = Some(id);
+                    self.selection.clear();
+                    self.side_tab = SideTab::Inspector;
+                }
+            }
+            Message::SelectMarker(id) => {
+                self.selected_marker = id;
+                if id.is_some() {
+                    self.selection.clear();
+                    self.side_tab = SideTab::Inspector;
+                    self.lanes_cache.clear();
+                }
+            }
+            Message::MoveMarker(id, at) => {
+                self.edit_merge("Move marker", Some(&format!("marker-move:{id}")), |p| p.move_marker(id, at));
+            }
+            Message::MarkerName(id, name) => {
+                self.edit_merge("Rename marker", Some(&format!("marker-name:{id}")), |p| {
+                    p.marker_mut(id)?.name = name;
+                    Ok(())
+                });
+            }
+            Message::MarkerColorOf(id, color) => {
+                self.marker_color = color;
+                self.edit("Marker color", |p| {
+                    p.marker_mut(id)?.color = color;
+                    Ok(())
+                });
+            }
+            Message::DeleteMarker(id) => {
+                if self.edit("Delete marker", |p| p.delete_marker(id)).is_some() {
+                    self.selected_marker = None;
+                }
+            }
+            Message::SeparateAudio => {
+                let p = &self.doc.project;
+                let ids: Vec<Id> = self.selection.iter().copied().filter(|&id| p.clip(id).is_some_and(|c| c.part == crate::clip::Part::Whole && p.clip_has_sound(c) && p.clip_has_picture(c))).collect();
+                if ids.is_empty() {
+                    self.notify("Select a video clip with sound to separate its audio", false);
+                } else if let Some(sounds) = self.edit("Separate audio", |p| ids.iter().map(|&id| p.separate_audio(id)).collect::<anyhow::Result<Vec<_>>>()) {
+                    self.notify(if sounds.len() == 1 { "Audio separated — it's on its own track now" } else { "Audio separated" }, false);
+                    self.selection = sounds;
+                }
+            }
+            Message::ToggleClipMute => {
+                let p = &self.doc.project;
+                let ids: Vec<Id> = self.selection.iter().copied().filter(|&id| p.clip(id).is_some_and(|c| p.clip_has_sound(c))).collect();
+                let mute = !ids.iter().all(|&id| p.clip(id).is_some_and(|c| c.audio.muted));
+                if !ids.is_empty() {
+                    self.edit(if mute { "Mute clip" } else { "Unmute clip" }, |p| {
+                        for id in &ids {
+                            p.ensure_unlocked(*id)?;
+                            p.clip_mut(*id)?.audio.muted = mute;
+                        }
+                        Ok(())
+                    });
+                }
+            }
             Message::SetRange(r) => {
                 self.range = r;
                 self.range_anchor = None;
@@ -808,6 +1124,7 @@ impl Editor {
                 let (key, desc) = edit.describe();
                 let key = format!("{key}:{id}");
                 self.edit_merge(desc, Some(&key), |p| {
+                    p.ensure_unlocked(id)?;
                     if let Edit::Speed(s) = edit {
                         return p.set_speed(id, s);
                     }
@@ -831,16 +1148,18 @@ impl Editor {
             },
             Message::AddText => {
                 let at = self.playhead;
-                if let Some(id) = self.edit("Add text", |p| p.add_text_clip(None, at, crate::edit::DEFAULT_STILL, TextLayer::default())) {
+                let still = self.prefs.still_seconds;
+                if let Some(id) = self.edit("Add text", |p| p.add_text_clip(None, at, still, TextLayer::default())) {
                     self.selection = vec![id];
                     self.side_tab = SideTab::Inspector;
                 }
             }
             Message::AddShape(preset) => {
                 let at = self.playhead;
+                let still = self.prefs.still_seconds;
                 let (shape, radius) = preset.build();
                 if let Some(id) = self.edit("Add shape", |p| {
-                    let id = p.add_shape_clip(None, at, crate::edit::DEFAULT_STILL, shape)?;
+                    let id = p.add_shape_clip(None, at, still, shape)?;
                     p.clip_mut(id)?.look.corner_radius = radius;
                     Ok(id)
                 }) {
@@ -939,6 +1258,11 @@ impl Editor {
                 return iced::widget::operation::snap_to_end(assistant_panel::SCROLL_ID);
             }
             Message::ChatStop => self.agent.stop(),
+            Message::OpenLink(url) => crate::platform::open_url(&url),
+            Message::CopyText(text) => {
+                self.notify("Copied", false);
+                return iced::clipboard::write(text);
+            }
             Message::ChatNew => {
                 self.agent.reset();
                 self.chat.clear();
@@ -954,9 +1278,9 @@ impl Editor {
                     match ev {
                         crate::assistant::Event::TextDelta(t) => match self.chat.last_mut() {
                             Some(ChatItem::Reply(r)) => r.push_str(&t),
-                            _ => self.chat.push(ChatItem::Reply(t)),
+                            _ => self.chat.push(ChatItem::Reply(assistant_panel::Reply::new(&t))),
                         },
-                        crate::assistant::Event::Text(t) => self.chat.push(ChatItem::Reply(t)),
+                        crate::assistant::Event::Text(t) => self.chat.push(ChatItem::Reply(assistant_panel::Reply::new(&t))),
                         crate::assistant::Event::ToolStart { id, name, input } => {
                             self.chat.push(ChatItem::Tool { id, label: crate::assistant::describe_tool(&name, &input), state: ToolState::Running, detail: String::new(), image: None })
                         }
@@ -985,8 +1309,19 @@ impl Editor {
             }
             Message::ToolImported(call, results, add) => return self.finish_tool_import(call, results, add),
             Message::ToolSound(call, sound, r) => return self.finish_tool_sound(call, sound, r),
+            Message::CropEdit(target) => {
+                self.crop_edit = target;
+                if let Some(clip) = target {
+                    self.zoom_edit = None;
+                    self.focus_clip(clip);
+                }
+                self.lanes_cache.clear();
+            }
             Message::ZoomEdit(target) => {
                 self.zoom_edit = target;
+                if target.is_some() {
+                    self.crop_edit = None;
+                }
                 if let Some((clip, zoom)) = target {
                     self.stop_playback();
                     self.selection = vec![clip];
@@ -1035,11 +1370,16 @@ impl Editor {
                     self.lanes_cache.clear();
                     return Task::none();
                 }
+                if self.crop_edit.take().is_some() {
+                    self.lanes_cache.clear();
+                    return Task::none();
+                }
                 if self.range_anchor.take().is_some() {
                     return Task::none();
                 }
                 if self.renaming.take().is_none() {
                     self.range = None;
+                    self.selected_marker = None;
                     self.selection.clear();
                     self.lanes_cache.clear();
                 }
@@ -1055,6 +1395,9 @@ impl Editor {
                 } else if self.export.as_ref().is_none_or(|e| !e.is_running()) {
                     self.stop_playback();
                     self.export = Some(export_dialog::ExportDialog::new(&self.doc.project, self.path.as_deref()));
+                    if let Some(d) = &mut self.export {
+                        d.quality = self.prefs.export_quality;
+                    }
                 }
             }
             Message::CloseExport => {
@@ -1181,6 +1524,202 @@ impl Editor {
         Task::run(stream, Message::ExportProgress)
     }
 
+    /// Preview scale that fits the whole canvas in a stage of `size`.
+    fn fit_scale(&self, size: Size) -> f32 {
+        let (cw, ch) = self.doc.project.canvas.size();
+        ((size.width - PREVIEW_ROOM * 2.0) / cw as f32).min((size.height - PREVIEW_ROOM * 2.0) / ch as f32).max(0.01)
+    }
+
+    /// The canvas size on screen and its top-left corner inside a stage of `size`.
+    fn canvas_placement(&self, size: Size) -> (f32, f32, iced::Vector) {
+        let (cw, ch) = self.doc.project.canvas.size();
+        let k = self.preview_zoom.unwrap_or_else(|| self.fit_scale(size));
+        let (w, h) = ((cw as f32 * k).floor(), (ch as f32 * k).floor());
+        let pan = clamp_pan(self.preview_pan, size, w, h);
+        (w, h, iced::Vector::new(((size.width - w) / 2.0 + pan.x).floor(), ((size.height - h) / 2.0 + pan.y).floor()))
+    }
+
+    /// Current preview zoom as a percentage (the fit scale when fitting).
+    pub fn preview_percent(&self) -> f32 {
+        self.preview_zoom.unwrap_or_else(|| self.fit_scale(self.stage_size.get())) * 100.0
+    }
+
+    pub fn preview_fit(&self) -> bool {
+        self.preview_zoom.is_none()
+    }
+
+    /// Zooms the preview by `factor`, keeping the canvas point under `at` (stage coordinates) in place.
+    fn zoom_preview_at(&mut self, factor: f32, at: Point) {
+        let size = self.stage_size.get();
+        let (w, h, origin) = self.canvas_placement(size);
+        let old = w / self.doc.project.canvas.size().0 as f32;
+        let new = (old * factor).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
+        let (cw, ch) = self.doc.project.canvas.size();
+        let (nw, nh) = (cw as f32 * new, ch as f32 * new);
+        // Canvas point under the cursor stays under the cursor.
+        let (px, py) = ((at.x - origin.x) / w.max(1.0), (at.y - origin.y) / h.max(1.0));
+        let (ox, oy) = (at.x - px * nw, at.y - py * nh);
+        self.preview_zoom = Some(new);
+        self.preview_pan = clamp_pan(iced::Vector::new(ox - (size.width - nw) / 2.0, oy - (size.height - nh) / 2.0), size, nw, nh);
+    }
+
+    /// Right-click menu for the timeline and the preview: actions for the selected clips,
+    /// or general ones when nothing is selected.
+    fn context_menu(&self) -> Element<'_, Message> {
+        use crate::clip::{Content, Part};
+        let p = &self.doc.project;
+        let clips: Vec<&crate::clip::Clip> = self.selection.iter().filter_map(|id| p.clip(*id)).collect();
+        let t = self.playhead;
+        let mut items = Vec::new();
+        if clips.is_empty() {
+            items.push(MenuItem::new(code::TYPE, "Add text at playhead", Message::AddText).shortcut("T"));
+            items.push(MenuItem::new(code::FLAG, if self.range.is_some() { "Add marker over range" } else { "Add marker at playhead" }, Message::AddMarker).shortcut("Shift+M"));
+            items.push(MenuItem::new(code::SQUARE_DASHED, if self.range_anchor.is_some() { "Set range end (B)" } else { "Set range start (A)" }, Message::MarkRange).shortcut("R"));
+            if self.range.is_some() {
+                items.push(MenuItem::new(code::X, "Clear range", Message::SetRange(None)));
+            }
+            return widgets::menu(items, 240.0);
+        }
+        let under_playhead = clips.iter().any(|c| t > c.start + 0.1 && t < c.end() - 0.1);
+        let split = MenuItem::new(code::SCISSORS, "Split at playhead", Message::SplitAtPlayhead).shortcut("S");
+        items.push(if under_playhead { split } else { split.disabled() });
+        items.push(MenuItem::new(code::COPY, "Duplicate", Message::DuplicateSelection).shortcut("Ctrl+D"));
+        let separable = clips.iter().any(|c| c.part == Part::Whole && p.clip_has_sound(c) && p.clip_has_picture(c));
+        let sounding: Vec<_> = clips.iter().filter(|c| p.clip_has_sound(c)).collect();
+        if separable || !sounding.is_empty() {
+            items.push(MenuItem::Separator);
+        }
+        if separable {
+            items.push(MenuItem::new(code::UNLINK, "Separate audio", Message::SeparateAudio));
+        }
+        if !sounding.is_empty() {
+            let all_muted = sounding.iter().all(|c| c.audio.muted);
+            items.push(MenuItem::new(if all_muted { code::VOLUME_2 } else { code::VOLUME_X }, if all_muted { "Unmute audio" } else { "Mute audio" }, Message::ToggleClipMute));
+        }
+        // Volume of just the marked range (the rest of the clip stays as it is).
+        if let ([c], Some((a, b))) = (sounding.as_slice(), self.range) {
+            if a.max(c.start) + 0.05 < b.min(c.end()) {
+                items.push(MenuItem::new(code::VOLUME_X, "Mute the marked range", Message::RangeVolume(c.id, 0.0)));
+                items.push(MenuItem::new(code::VOLUME_1, "Lower the marked range to 30%", Message::RangeVolume(c.id, 0.3)));
+            }
+        }
+        if let [c] = clips.as_slice() {
+            let media_picture = matches!(c.content, Content::Media { .. }) && p.clip_has_picture(c);
+            if media_picture {
+                items.push(MenuItem::Separator);
+                let zoom = MenuItem::new(code::ZOOM_IN, "Add zoom at playhead", Message::AddZoomAtPlayhead).shortcut("Z");
+                items.push(if t >= c.start && t < c.end() { zoom } else { zoom.disabled() });
+                items.push(MenuItem::new(code::CROP, "Crop…", Message::CropEdit(Some(c.id))));
+            }
+            if p.clip_has_picture(c) {
+                if !media_picture {
+                    items.push(MenuItem::Separator);
+                }
+                items.push(MenuItem::new(code::REFRESH_CW, "Reset position and size", Message::Edit(c.id, Edit::ResetTransform)));
+            }
+        }
+        items.push(MenuItem::Separator);
+        items.push(MenuItem::new(code::TRASH_2, if clips.len() == 1 { "Delete" } else { "Delete clips" }, Message::DeleteSelection).shortcut("Del").danger());
+        widgets::menu(items, 240.0)
+    }
+
+    /// Applies a library effect: dropped on a target, or (clicked) to the selection.
+    fn apply_effect(&mut self, effect: library::Effect, target: Option<DropTarget>) -> Task<Message> {
+        use library::Effect;
+        let dropped_on = match target {
+            Some(DropTarget::Canvas { clip, .. } | DropTarget::Timeline { clip, .. }) => clip,
+            None => None,
+        };
+        // Markers and blurs are new clips, placed in time and on the picture: dropped on the
+        // timeline they start there; otherwise they cover the marked range (or 3 s from the
+        // playhead), centered where they were dropped on the preview.
+        if matches!(effect, Effect::Highlight(_) | Effect::Blur) {
+            let (start, duration) = match (target, self.range) {
+                (Some(DropTarget::Timeline { t, .. }), _) => (t, 3.0),
+                (_, Some((a, b))) if b - a >= 0.1 => (a, b - a),
+                _ => (self.playhead, 3.0),
+            };
+            let (track, at) = match target {
+                Some(DropTarget::Timeline { track, .. }) => (track, None),
+                Some(DropTarget::Canvas { at, .. }) => (None, Some(at)),
+                None => (None, None),
+            };
+            // Only use the hovered track if it's a free video track there; otherwise pick one.
+            let p = &self.doc.project;
+            let track = track.filter(|tr| p.track(*tr).is_some_and(|t| t.kind == TrackKind::Visual && !t.locked) && (p.nearest_free(*tr, start, duration, &[]) - start).abs() < 1e-6);
+            let marker = self.marker_color;
+            let created = self.edit(&format!("Add {}", effect.label().to_lowercase()), |p| {
+                let id = match effect {
+                    Effect::Highlight(h) => {
+                        let (shape, radius, name) = h.build(marker);
+                        let id = p.add_shape_clip(track, start, duration, shape)?;
+                        let c = p.clip_mut(id)?;
+                        c.look.corner_radius = radius;
+                        c.name = Some(name.to_string());
+                        id
+                    }
+                    _ => p.add_blur_clip(track, start, duration, crate::clip::BlurLayer::default())?,
+                };
+                if let Some((x, y)) = at {
+                    let c = p.clip_mut(id)?;
+                    (c.transform.x, c.transform.y) = (x, y);
+                }
+                Ok(id)
+            });
+            if created.is_some() && effect == Effect::Blur {
+                self.notify("Blur added — drag its box over what to hide, and trim it on the timeline", false);
+            }
+            if let Some(id) = created {
+                self.selection = vec![id];
+                self.side_tab = SideTab::Inspector;
+            }
+            return Task::none();
+        }
+        let targets: Vec<Id> = match (target, dropped_on) {
+            (Some(_), Some(clip)) => vec![clip],
+            (Some(_), None) => {
+                self.notify("Drop it on a clip", false);
+                return Task::none();
+            }
+            (None, _) => self.selection.clone(),
+        };
+        if targets.is_empty() {
+            self.notify("Select a clip first, or drag the effect onto one", false);
+            return Task::none();
+        }
+        if target.is_some() {
+            self.selection = targets.clone();
+            self.lanes_cache.clear();
+        }
+        match effect {
+            Effect::Transition(kind) => self.update(Message::ApplyTransition(kind)),
+            Effect::Intro(kind) => self.update(Message::ApplyMotion { intro: true, kind }),
+            Effect::Outro(kind) => self.update(Message::ApplyMotion { intro: false, kind }),
+            Effect::Blur | Effect::Highlight(_) => Task::none(),
+        }
+    }
+
+    /// Selects a clip for on-canvas editing and moves the playhead onto it if needed.
+    fn focus_clip(&mut self, clip: Id) {
+        self.stop_playback();
+        self.selection = vec![clip];
+        self.side_tab = SideTab::Inspector;
+        if let Some((a, b)) = self.doc.project.clip(clip).map(|c| (c.start, c.end())) {
+            if self.playhead < a || self.playhead >= b {
+                self.seek(a + (b - a).min(1.0) / 2.0);
+            }
+        }
+        self.lanes_cache.clear();
+    }
+
+    /// The marked range, or A to the playhead while the end is still being chosen.
+    fn shown_range(&self) -> Option<(f64, f64)> {
+        match self.range_anchor {
+            Some(a) => Some((a.min(self.playhead), a.max(self.playhead))),
+            None => self.range,
+        }
+    }
+
     fn set_range(&mut self, a: f64, b: f64) {
         self.range = Some((a, b));
         self.range_anchor = None;
@@ -1191,7 +1730,7 @@ impl Editor {
     fn add_zoom_at_playhead(&mut self) {
         let t = self.playhead;
         let p = &self.doc.project;
-        let visual = |c: &crate::clip::Clip| c.asset().and_then(|a| p.asset(a)).is_some_and(|a| a.is_visual()) && t >= c.start && t < c.end();
+        let visual = |c: &crate::clip::Clip| c.asset().is_some() && p.clip_has_picture(c) && t >= c.start && t < c.end();
         let selected = self.selection.iter().filter_map(|id| p.clip(*id)).find(|c| visual(c)).map(|c| c.id);
         let topmost = p.tracks.iter().find_map(|tr| p.clips_on(tr.id).find(|c| visual(c)).map(|c| c.id));
         let Some(clip_id) = selected.or(topmost) else {
@@ -1237,6 +1776,12 @@ impl Editor {
         self.selection.retain(|id| p.clip(*id).is_some());
         if self.zoom_edit.is_some_and(|(c, z)| !p.clip(c).is_some_and(|c| c.zooms.iter().any(|zz| zz.id == z))) {
             self.zoom_edit = None;
+        }
+        if self.selected_marker.is_some_and(|m| !p.markers.iter().any(|x| x.id == m)) {
+            self.selected_marker = None;
+        }
+        if self.crop_edit.is_some_and(|c| p.clip(c).is_none()) {
+            self.crop_edit = None;
         }
         if self.renaming.as_ref().is_some_and(|(t, _)| p.track(*t).is_none()) {
             self.renaming = None;
@@ -1320,15 +1865,15 @@ impl Editor {
             pane_grid::Content::new(container(body).width(Fill).height(Fill)).title_bar(pane_grid::TitleBar::new(header).style(style::panel_header)).style(style::panel)
         })
         // Small gaps of the black background between the rounded blocks.
-        .spacing(6)
-        .min_size(160)
+        .spacing(PANE_GAP)
+        .min_size(PANE_MIN)
         .on_resize(10, Message::PaneResized)
         .style(|_| pane_grid::Style {
             hovered_region: pane_grid::Highlight { background: ACCENT_SOFT.into(), border: iced::Border { color: ACCENT, width: 1.0, radius: R_LG.into() } },
             picked_split: pane_grid::Line { color: ACCENT, width: 2.0 },
             hovered_split: pane_grid::Line { color: Color { a: 0.6, ..ACCENT }, width: 2.0 },
         });
-        let body = container(grid).padding(iced::Padding { top: 0.0, right: 6.0, bottom: 6.0, left: 6.0 }).width(Fill).height(Fill).style(style::backdrop);
+        let body = container(grid).padding(GRID_PAD).width(Fill).height(Fill).style(style::backdrop);
         let mut layers: Vec<Element<'_, Message>> = vec![body.into()];
         if let Some((msg, error, _)) = &self.toast {
             let toast = container(
@@ -1386,23 +1931,25 @@ impl Editor {
     fn preview(&self) -> Element<'_, Message> {
         let (cw, ch) = self.doc.project.canvas.size();
         let stage = responsive(move |size: Size| {
-            // A little room around the canvas so selection handles stay reachable at its edges.
-            const ROOM: f32 = 14.0;
-            let fit = ((size.width - ROOM * 2.0) / cw as f32).min((size.height - ROOM * 2.0) / ch as f32).max(0.01);
-            let (w, h) = ((cw as f32 * fit).floor(), (ch as f32 * fit).floor());
-            let origin = iced::Vector::new(((size.width - w) / 2.0).floor(), ((size.height - h) / 2.0).floor());
-            // Decode a little above the on-screen size so high-DPI screens stay sharp.
-            self.frames.set_preview_width(w * 1.5);
+            self.stage_size.set(size);
+            let (w, h, origin) = self.canvas_placement(size);
+            // Decode a little above the on-screen size so high-DPI screens stay sharp (never above the canvas).
+            self.frames.set_preview_width(self.preview_quality().decode_width(w, cw as f32));
             self.frames.collect_idle();
             let project = &self.doc.project;
             // While editing a zoom, show that clip unzoomed so the whole frame is visible.
             let editing = self.zoom_edit.and_then(|(clip, zoom)| project.clip(clip).and_then(|c| c.zooms.iter().find(|z| z.id == zoom).map(|z| (clip, *z))));
+            // While cropping, show the whole frame too, so the crop can be widened again.
+            let cropping = self.crop_edit.filter(|clip| self.selection == [*clip]).and_then(|clip| project.clip(clip).map(|c| (clip, c.crop.clamped())));
             let unzoomed;
-            let shown = match editing {
-                Some((clip, _)) => {
+            let shown = match editing.map(|(clip, _)| clip).or(cropping.map(|(clip, _)| clip)) {
+                Some(clip) => {
                     let mut p = project.clone();
                     if let Ok(c) = p.clip_mut(clip) {
                         c.zooms.clear();
+                        if cropping.is_some() {
+                            c.crop = Default::default();
+                        }
                     }
                     unzoomed = p;
                     &unzoomed
@@ -1411,10 +1958,9 @@ impl Editor {
             };
             let scene = std::sync::Arc::new(scene::evaluate(shown, self.playhead, (cw, ch), &self.frames.bind(project), self.playing.is_some()));
             // The overlay spans the whole stage, so handles keep working past the canvas edge.
-            let overlay = canvas_overlay::Overlay { project, scene: scene.clone(), selection: &self.selection, zoom_edit: editing, origin, display: Size::new(w, h) };
-            let canvas = iced::widget::shader(preview::Preview { scene }).width(w).height(h);
-            let frame = container(canvas).padding(1).style(|_| container::Style { border: iced::Border { color: CANVAS_BORDER, width: 1.0, radius: 0.0.into() }, ..Default::default() });
-            stack![container(frame).center(Fill), iced::widget::canvas(overlay).width(Fill).height(Fill)].into()
+            let overlay = canvas_overlay::Overlay { project, scene: scene.clone(), selection: &self.selection, zoom_edit: editing, crop_edit: cropping, dragging: self.effect_dnd, origin, display: Size::new(w, h), zoomed: self.preview_zoom.is_some() };
+            let canvas = iced::widget::shader(preview::Preview { scene, canvas: iced::Rectangle::new(Point::new(origin.x, origin.y), Size::new(w, h)) }).width(Fill).height(Fill);
+            stack![canvas, iced::widget::canvas(overlay).width(Fill).height(Fill)].into()
         });
         let duration = self.doc.project.duration();
         let fps = self.doc.project.canvas.fps;
@@ -1434,15 +1980,29 @@ impl Editor {
         .align_y(Alignment::Center);
         let transport = row![container(time).width(Fill), controls, container(tools).width(Fill).align_right(Fill)].align_y(Alignment::Center);
         let bar = column![widgets::divider(), container(transport).padding([7, 12])];
-        column![container(stage).height(Fill), bar].into()
+        let stage = ContextMenu::new(container(stage).height(Fill), move || self.context_menu()).style(|_, _| iced_aw::style::context_menu::Style { background: Color::TRANSPARENT.into() });
+        column![stage, bar].into()
     }
 
     fn inspector(&self) -> Element<'_, Message> {
         match self.side_tab {
             SideTab::Inspector => match self.selection.as_slice() {
-                [] => inspector::empty(),
+                [] => match self.selected_marker.and_then(|id| self.doc.project.markers.iter().find(|m| m.id == id)) {
+                    Some(m) => inspector::marker(m),
+                    None => inspector::empty(),
+                },
                 [id] => match self.doc.project.clip(*id) {
-                    Some(c) => inspector::view(&self.doc.project, c, self.zoom_edit.map(|(_, z)| z), self.range, self.hex_draft.as_ref()),
+                    Some(c) => {
+                        let ctx = inspector::Ctx {
+                            zoom_edit: self.zoom_edit.map(|(_, z)| z),
+                            crop_edit: self.crop_edit == Some(c.id),
+                            range: self.range,
+                            hex: self.hex_draft.as_ref(),
+                            collapsed: &self.collapsed,
+                            query: &self.inspector_query,
+                        };
+                        column![container(inspector::search_bar(&self.inspector_query)).padding(iced::Padding { top: 8.0, right: 10.0, bottom: 4.0, left: 4.0 }), inspector::view(&self.doc.project, c, &ctx)].into()
+                    }
                     None => inspector::empty(),
                 },
                 many => inspector::multiple(many.len()),
@@ -1479,6 +2039,7 @@ impl Editor {
             widgets::tip(labeled_tool(code::SCISSORS, "Split", false, Message::SplitAtPlayhead), "Split at the playhead", Some("S"), tip_pos()),
             widgets::tip(labeled_tool(code::SQUARE_DASHED, range_label, self.range_anchor.is_some() || self.range.is_some(), Message::MarkRange), "Mark A, move the playhead, mark B", Some("R  ·  I / O"), tip_pos()),
             widgets::tip(labeled_tool(code::ZOOM_IN, "Zoom", self.zoom_edit.is_some(), Message::AddZoomAtPlayhead), "Add a zoom or pan at the playhead", Some("Z"), tip_pos()),
+            widgets::tip(labeled_tool(code::FLAG, "Marker", self.selected_marker.is_some(), Message::AddMarker), "Add a marker at the playhead (or over the marked range)", Some("Shift+M"), tip_pos()),
             container(widgets::vdivider(16.0)).padding([0, 4]),
             widgets::tip(widgets::icon_button(code::TRASH_2, (!self.selection.is_empty() || self.zoom_edit.is_some()).then_some(Message::DeleteSelection)), "Delete", Some("Del"), tip_pos()),
             widgets::tip(widgets::icon_toggle(code::MAGNET, self.snapping, Message::ToggleSnapping), "Snapping", Some("N"), tip_pos()),
@@ -1503,7 +2064,7 @@ impl Editor {
             let add = DropDownless::add_track_button(project);
             let ruler = row![
                 container(add).width(HEADER_W).height(RULER_H).padding([0, 8]).center_y(RULER_H),
-                iced::widget::canvas(Ruler { view: self.view, playhead: self.playhead, range: self.range, anchor: self.range_anchor }).width(Fill).height(RULER_H),
+                iced::widget::canvas(Ruler { markers: &project.markers, selected_marker: self.selected_marker, view: self.view, playhead: self.playhead, range: self.range, anchor: self.range_anchor }).width(Fill).height(RULER_H),
             ];
             let lanes = Lanes {
                 project,
@@ -1513,8 +2074,9 @@ impl Editor {
                 view: self.view,
                 snapping: self.snapping,
                 zoom_edit: self.zoom_edit,
-                range: self.range,
+                range: self.shown_range(),
                 dnd: self.dnd,
+                dnd_effect: self.effect_dnd,
                 missing: &self.missing,
                 cache: &self.lanes_cache,
                 overflow,
@@ -1535,7 +2097,8 @@ impl Editor {
             }));
             let body = row![
                 headers,
-                stack![iced::widget::canvas(timeline::LanesBase(lanes)).width(Fill).height(Fill), iced::widget::canvas(lanes).width(Fill).height(Fill)],
+                ContextMenu::new(stack![iced::widget::canvas(timeline::LanesBase(lanes)).width(Fill).height(Fill), iced::widget::canvas(lanes).width(Fill).height(Fill)], move || self.context_menu())
+                    .style(|_, _| iced_aw::style::context_menu::Style { background: Color::TRANSPARENT.into() }),
             ];
             column![ruler, container(widgets::divider()), container(body).height(Fill).clip(true)].into()
         })
@@ -1611,6 +2174,20 @@ impl Editor {
     }
 }
 
+/// Room around the fitted canvas so selection handles stay reachable at its edges.
+const PREVIEW_ROOM: f32 = 14.0;
+pub const PREVIEW_ZOOM_MIN: f32 = 0.05;
+pub const PREVIEW_ZOOM_MAX: f32 = 8.0;
+/// Zoom levels offered in the toolbar (besides Fit).
+pub const PREVIEW_ZOOMS: [f32; 8] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0];
+
+/// Keeps a zoomed canvas from being panned out of view (no panning when it fits).
+fn clamp_pan(pan: iced::Vector, stage: Size, w: f32, h: f32) -> iced::Vector {
+    let mx = ((w - stage.width) / 2.0 + PREVIEW_ROOM).max(0.0);
+    let my = ((h - stage.height) / 2.0 + PREVIEW_ROOM).max(0.0);
+    iced::Vector::new(pan.x.clamp(-mx, mx), pan.y.clamp(-my, my))
+}
+
 /// Editing actions (mostly from shortcuts) that a modal dialog keeps from reaching the project.
 pub fn blocked_by_dialog(m: &Message) -> bool {
     matches!(
@@ -1631,6 +2208,10 @@ pub fn blocked_by_dialog(m: &Message) -> bool {
             | Message::GoEnd
             | Message::ToggleSnapping
             | Message::ImportPicked(_)
+            | Message::AddMarker
+            | Message::ToggleMute
+            | Message::SeparateAudio
+            | Message::ToggleClipMute
     )
 }
 
@@ -1644,7 +2225,7 @@ fn audio_fingerprint(p: &Project) -> u64 {
             for v in [c.start, c.duration, src_in, speed, c.audio.volume, c.audio.fade_in, c.audio.fade_out] {
                 v.to_bits().hash(&mut h);
             }
-            c.audio.muted.hash(&mut h);
+            (c.audio.muted, c.part).hash(&mut h);
             for g in &c.audio.gains {
                 (g.at.to_bits(), g.duration.to_bits(), g.volume.to_bits()).hash(&mut h);
             }
@@ -1709,7 +2290,7 @@ fn editor_event(event: Event, status: event::Status, _window: window::Id) -> Opt
         Event::Window(window::Event::FileDropped(path)) => Some(Message::ImportPicked(vec![path])),
         Event::Window(window::Event::FileHovered(_)) => Some(Message::FileHover(true)),
         Event::Window(window::Event::FilesHoveredLeft) => Some(Message::FileHover(false)),
-        Event::Keyboard(keyboard::Event::KeyPressed { key: Key::Named(key::Named::Escape), .. }) => Some(Message::Escape),
+        Event::Keyboard(keyboard::Event::KeyPressed { key: Key::Named(key::Named::Escape), .. }) if status == event::Status::Ignored => Some(Message::Escape),
         Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) if status == event::Status::Ignored => {
             let cmd = modifiers.command();
             match key.as_ref() {
@@ -1732,6 +2313,7 @@ fn editor_event(event: Event, status: event::Status, _window: window::Id) -> Opt
                 Key::Character("o") if !cmd => Some(Message::MarkOut),
                 Key::Character("n") if !cmd => Some(Message::ToggleSnapping),
                 Key::Character("t") if !cmd => Some(Message::AddText),
+                Key::Character("m" | "M") if modifiers.shift() && !cmd => Some(Message::AddMarker),
                 Key::Character("m") if !cmd => Some(Message::ToggleMute),
                 Key::Character("=" | "+") => Some(Message::ZoomBy(1.4)),
                 Key::Character("-") => Some(Message::ZoomBy(1.0 / 1.4)),

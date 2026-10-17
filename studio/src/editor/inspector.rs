@@ -2,7 +2,7 @@
 
 use std::ops::RangeInclusive;
 
-use iced::widget::{button, column, container, pick_list, row, slider, space, text, text_input, toggler};
+use iced::widget::{button, checkbox, column, container, pick_list, row, slider, space, text, text_input, toggler};
 use iced::{Alignment, Color, Element, Fill, Length};
 
 use super::Message;
@@ -68,6 +68,18 @@ pub enum Edit {
     ZoomFocusX(Id, f64),
     ZoomFocusY(Id, f64),
     ZoomFocus(Id, f64, f64),
+    Crop(crate::clip::Crop),
+    CropLeft(f64),
+    CropTop(f64),
+    CropRight(f64),
+    CropBottom(f64),
+    /// Blur clips: strength (0..100), oval or box, and the box size in canvas units.
+    BlurStrength(f64),
+    BlurEllipse(bool),
+    BlurWidth(f64),
+    BlurHeight(f64),
+    /// A shape resized on the canvas: width and height (canvas units) and its new center.
+    ShapeBox(f64, f64, f64, f64),
 }
 
 impl Edit {
@@ -92,11 +104,13 @@ impl Edit {
             Edit::Text(_) => ("text", "Edit text"),
             Edit::Font(_) | Edit::FontSize(_) | Edit::Weight(_) | Edit::TextColor(_) | Edit::Align(_) | Edit::TextBox(_) => ("text-style", "Text style"),
             Edit::Intro(_) | Edit::Outro(_) | Edit::IntroDuration(_) | Edit::OutroDuration(_) => ("motion", "Animation"),
-            Edit::ShapeKind(_) | Edit::ShapeWidth(_) | Edit::ShapeHeight(_) | Edit::ShapeThickness(_) => ("shape", "Shape"),
+            Edit::ShapeKind(_) | Edit::ShapeWidth(_) | Edit::ShapeHeight(_) | Edit::ShapeThickness(_) | Edit::ShapeBox(..) => ("shape", "Shape"),
             Edit::ShapeFill(_) | Edit::ShapeGradient(_) | Edit::ShapeFillTo(_) | Edit::ShapeRadial(_) | Edit::ShapeAngle(_) => ("shape-fill", "Shape fill"),
             Edit::Transition(_) | Edit::TransitionDuration(_) => ("transition", "Transition"),
             Edit::RemoveZoom(_) => ("remove-zoom", "Remove zoom"),
             Edit::ZoomScale(..) | Edit::ZoomFocusX(..) | Edit::ZoomFocusY(..) | Edit::ZoomFocus(..) => ("zoom", "Zoom"),
+            Edit::Crop(_) | Edit::CropLeft(_) | Edit::CropTop(_) | Edit::CropRight(_) | Edit::CropBottom(_) => ("crop", "Crop"),
+            Edit::BlurStrength(_) | Edit::BlurEllipse(_) | Edit::BlurWidth(_) | Edit::BlurHeight(_) => ("blur", "Blur"),
         }
     }
 
@@ -160,6 +174,27 @@ impl Edit {
                 z.focus_x = x;
                 z.focus_y = y;
             }),
+            Edit::Crop(k) => c.crop = k.clamped(),
+            Edit::CropLeft(v) => c.crop.left = v.clamp(0.0, (crate::clip::Crop::MAX - c.crop.right).max(0.0)),
+            Edit::CropTop(v) => c.crop.top = v.clamp(0.0, (crate::clip::Crop::MAX - c.crop.bottom).max(0.0)),
+            Edit::CropRight(v) => c.crop.right = v.clamp(0.0, (crate::clip::Crop::MAX - c.crop.left).max(0.0)),
+            Edit::CropBottom(v) => c.crop.bottom = v.clamp(0.0, (crate::clip::Crop::MAX - c.crop.top).max(0.0)),
+            edit if matches!(c.content, Content::Blur(_)) => {
+                if let Content::Blur(b) = &mut c.content {
+                    match edit {
+                        Edit::BlurStrength(v) => b.strength = v.clamp(0.0, 100.0),
+                        Edit::BlurEllipse(on) => b.ellipse = on,
+                        Edit::BlurWidth(v) => b.width = v.clamp(4.0, 4000.0),
+                        Edit::BlurHeight(v) => b.height = v.clamp(4.0, 4000.0),
+                        Edit::ShapeBox(w, h, x, y) => {
+                            b.width = w.clamp(4.0, 4000.0);
+                            b.height = h.clamp(4.0, 4000.0);
+                            (c.transform.x, c.transform.y) = (x, y);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             edit if matches!(c.content, Content::Shape(_)) => {
                 if let Content::Shape(s) = &mut c.content {
                     match edit {
@@ -172,6 +207,11 @@ impl Edit {
                         Edit::ShapeRadial(r) => s.radial = r,
                         Edit::ShapeAngle(a) => s.gradient_angle = a,
                         Edit::ShapeThickness(v) => s.thickness = v,
+                        Edit::ShapeBox(w, h, x, y) => {
+                            s.width = w.clamp(4.0, 4000.0);
+                            s.height = h.clamp(4.0, 4000.0);
+                            (c.transform.x, c.transform.y) = (x, y);
+                        }
                         _ => {}
                     }
                 }
@@ -254,18 +294,22 @@ const MOTIONS: [MotionChoice; 8] = [
     MotionChoice(Some(MotionKind::ZoomIn)),
 ];
 
-pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, range: Option<(f64, f64)>, hex: Option<&'a HexDraft>) -> Element<'a, Message> {
+pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<'a, Message> {
+    let (zoom_edit, range, hex) = (ctx.zoom_edit, ctx.range, ctx.hex);
     let id = clip.id;
     let e = move |edit: Edit| Message::Edit(id, edit);
     let kind = clip.asset().and_then(|a| project.asset(a)).map(|a| a.kind);
-    let is_visual = !matches!(kind, Some(MediaKind::Audio));
-    let has_audio = clip.asset().and_then(|a| project.asset(a)).is_some_and(|a| a.has_audio);
-    let is_video = kind == Some(MediaKind::Video);
+    let is_visual = project.clip_has_picture(clip);
+    let has_audio = project.clip_has_sound(clip);
+    let sound_only = clip.part == crate::clip::Part::Sound;
+    let is_video = kind == Some(MediaKind::Video) && !sound_only;
 
     let (glyph, color, kind_label) = match (&clip.content, kind) {
         (Content::Text(_), _) => (code::TYPE, clip::TEXT, "Text"),
         (Content::Shape(_), _) => (code::SQUARE, clip::EFFECT, "Shape"),
+        (Content::Blur(_), _) => (code::DROPLETS, clip::BLUR, "Blur"),
         (_, Some(MediaKind::Audio)) => (code::AUDIO_LINES, clip::AUDIO, "Audio"),
+        _ if sound_only => (code::AUDIO_LINES, clip::AUDIO, "Audio"),
         (_, Some(MediaKind::Image)) => (code::IMAGE, clip::IMAGE, "Image"),
         _ => (code::FILM, clip::VIDEO, "Video"),
     };
@@ -297,6 +341,13 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
     .padding([S3, S3]);
 
     let mut col = column![header].spacing(S2);
+    let mut shown = 0;
+
+    // A blur clip only has its blur and its place.
+    if let Content::Blur(b) = &clip.content {
+        let col = blur_clip(clip, b, ctx, col, &mut shown);
+        return widgets::scroll(col.padding(iced::Padding { top: 0.0, right: 10.0, bottom: 12.0, left: 4.0 })).height(Fill).into();
+    }
 
     if let Content::Text(t) = &clip.content {
         let font_pick = pick_list(&FONTS[..], FONTS.iter().find(|f| **f == t.font).copied(), move |f: &str| e(Edit::Font(f.to_string())))
@@ -307,7 +358,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
             .menu_style(style::select_menu);
         let weights = [(400u16, "Regular"), (500, "Medium"), (600, "Semibold"), (700, "Bold")];
         let aligns = [Align::Left, Align::Center, Align::Right];
-        col = col.push(section(
+        col = add(col, &mut shown, ctx.section(
             code::TYPE,
             "Text",
             column![
@@ -342,7 +393,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
             slider_row("Height", s.height, 10.0..=2400.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::ShapeHeight(v))),
         ]
         .spacing(S3);
-        if s.kind == crate::clip::ShapeKind::Ring {
+        if matches!(s.kind, crate::clip::ShapeKind::Ring | crate::clip::ShapeKind::Frame) {
             body = body.push(slider_row("Thickness", s.thickness, 1.0..=200.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::ShapeThickness(v))));
         }
         body = body.push(color_row(if s.fill_to.is_some() { "Color 1" } else { "Fill" }, s.fill, (id, "shape1", hex), move |c| e(Edit::ShapeFill(c))));
@@ -357,7 +408,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
                 body = body.push(slider_row("Direction", s.gradient_angle, 0.0..=360.0, 1.0, |v| format!("{v:.0}°"), move |v| e(Edit::ShapeAngle(v))));
             }
         }
-        col = col.push(section(code::SQUARE, "Shape", body.into()));
+        col = add(col, &mut shown, ctx.section(code::SHAPES, "Shape", body.into()));
     }
 
     if is_visual {
@@ -379,7 +430,10 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
                 .align_y(Alignment::Center),
             );
         }
-        col = col.push(section_with_reset(code::MOVE, "Transform", e(Edit::ResetTransform), transform.into()));
+        col = add(col, &mut shown, ctx.section_reset(code::MOVE, "Transform", e(Edit::ResetTransform), transform.into()));
+        if matches!(clip.content, Content::Media { .. }) {
+            col = add(col, &mut shown, crop_section(clip, ctx));
+        }
 
         if !matches!(clip.content, Content::Text(_)) {
             let l = &clip.look;
@@ -398,11 +452,11 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
                     .push(slider_row("Distance", l.shadow.offset_y, -100.0..=100.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::ShadowOffset(v))))
                     .push(slider_row("Strength", l.shadow.opacity * 100.0, 0.0..=100.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::ShadowOpacity(v / 100.0))));
             }
-            col = col.push(section(code::SQUARE, "Frame style", frame.into()));
+            col = add(col, &mut shown, ctx.section(code::FRAME, "Frame style", frame.into()));
         }
 
         let g = &clip.grade;
-        col = col.push(section_with_reset(
+        col = add(col, &mut shown, ctx.section_reset(
             code::PALETTE,
             "Color",
             e(Edit::ResetGrade),
@@ -433,7 +487,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
         if let Some(m) = clip.outro {
             anim = anim.push(slider_row("Duration", m.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::OutroDuration(v))));
         }
-        col = col.push(section(code::SPARKLES, "Animation", anim.into()));
+        col = add(col, &mut shown, ctx.section(code::SPARKLES, "Animation", anim.into()));
 
         let transition_pick = pick_list(&TRANSITIONS[..], Some(TransitionChoice(clip.transition.map(|t| t.kind))), move |t: TransitionChoice| e(Edit::Transition(t.0)))
             .padding([6, 9])
@@ -445,10 +499,10 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
         if let Some(t) = clip.transition {
             trans = trans.push(slider_row("Duration", t.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::TransitionDuration(v))));
         }
-        col = col.push(section(code::BLEND, "Transition in", trans.into()));
+        col = add(col, &mut shown, ctx.section(code::BLEND, "Transition in", trans.into()));
     }
 
-    if is_video || kind == Some(MediaKind::Image) {
+    if is_video || (kind == Some(MediaKind::Image) && is_visual) {
         let mut zooms = column![].spacing(S3);
         for (i, z) in clip.zooms.iter().enumerate() {
             let zid = z.id;
@@ -461,16 +515,17 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
                             text(format!("Zoom {}", i + 1)).font(INTER_SEMIBOLD).size(T_SMALL),
                             text(format!("{:.1}s – {:.1}s", z.at, z.at + z.duration)).size(T_CAPTION).color(TEXT_3),
                             space().width(Fill),
-                            widgets::tip(
-                                widgets::icon_toggle(code::SCAN, editing, Message::ZoomEdit(if editing { None } else { Some((id, zid)) })).width(24).height(24),
-                                if editing { "Done editing" } else { "Edit on canvas" },
-                                None,
-                                iced::widget::tooltip::Position::Left,
-                            ),
                             widgets::icon_button(code::TRASH_2, Some(e(Edit::RemoveZoom(zid)))).width(24).height(24),
                         ]
                         .spacing(6)
                         .align_y(Alignment::Center),
+                        checkbox(editing)
+                            .label("Edit on canvas")
+                            .on_toggle(move |on| Message::ZoomEdit(on.then_some((id, zid))))
+                            .size(15)
+                            .spacing(8)
+                            .text_size(T_SMALL)
+                            .style(style::checkbox),
                         slider_row("Zoom", z.scale * 100.0, 100.0..=500.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::ZoomScale(zid, v / 100.0))),
                         slider_row("Focus X", z.focus_x * 100.0, 0.0..=100.0, 0.5, |v| format!("{v:.0}%"), move |v| e(Edit::ZoomFocusX(zid, v / 100.0))),
                         slider_row("Focus Y", z.focus_y * 100.0, 0.0..=100.0, 0.5, |v| format!("{v:.0}%"), move |v| e(Edit::ZoomFocusY(zid, v / 100.0))),
@@ -488,12 +543,12 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
             );
         }
         zooms = zooms.push(widgets::secondary_button(Some(code::PLUS), "Add zoom at playhead", Some(Message::AddZoomAtPlayhead)).width(Fill));
-        col = col.push(section(code::ZOOM_IN, "Zoom & pan", zooms.into()));
+        col = add(col, &mut shown, ctx.section(code::ZOOM_IN, "Zoom & pan", zooms.into()));
     }
 
     if let Content::Media { speed, .. } = clip.content {
         if kind != Some(MediaKind::Image) {
-            col = col.push(section(
+            col = add(col, &mut shown, ctx.section(
                 code::GAUGE,
                 "Speed",
                 slider_row("Speed", speed * 100.0, 25.0..=400.0, 5.0, |v| format!("{:.2}×", v / 100.0), move |v| e(Edit::Speed(v / 100.0))),
@@ -533,23 +588,162 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, zoom_edit: Option<Id>, ran
                 part = part.push(text("Mark a range (R) to change the volume of just one part of this clip.").size(T_CAPTION).color(TEXT_3));
             }
         }
+        if !a.gains.is_empty() {
+            part = part.push(text("Changed parts").font(INTER_SEMIBOLD).size(T_CAPTION).color(TEXT_3));
+        }
         for g in &a.gains {
             let gid = g.id;
             part = part.push(
-                row![
-                    text(format!("{} – {}", super::fmt_timecode_short(clip.start + g.at), super::fmt_timecode_short(clip.start + g.at + g.duration))).size(T_CAPTION).color(TEXT_2).width(Fill),
-                    text(if g.volume == 0.0 { "Muted".to_string() } else { format!("{:.0}%", g.volume * 100.0) }).font(INTER_MEDIUM).size(T_CAPTION),
-                    widgets::icon_button(code::X, Some(Message::RemoveGain(id, gid))).width(22).height(22),
+                column![
+                    row![
+                        text(format!("{} – {}", super::fmt_timecode_short(clip.start + g.at), super::fmt_timecode_short(clip.start + g.at + g.duration))).size(T_CAPTION).color(TEXT_2).width(Fill),
+                        widgets::tip(widgets::icon_button(code::X, Some(Message::RemoveGain(id, gid))).width(22).height(22), "Back to the clip volume", None, iced::widget::tooltip::Position::Left),
+                    ]
+                    .spacing(S2)
+                    .align_y(Alignment::Center),
+                    slider_row("Volume", g.volume * 100.0, 0.0..=200.0, 1.0, |v| if v == 0.0 { "Muted".into() } else { format!("{v:.0}%") }, move |v| Message::GainVolume(id, gid, v / 100.0)),
                 ]
-                .spacing(S2)
-                .align_y(Alignment::Center),
+                .spacing(4),
             );
         }
         audio = audio.push(container(part).padding(S3).width(Fill).style(style::inset));
-        col = col.push(section(code::VOLUME_2, "Audio", audio.into()));
+        col = add(col, &mut shown, ctx.section(code::VOLUME_2, "Audio", audio.into()));
     }
 
+    // Header plus at least one section: otherwise the search found nothing here.
+    if shown == 0 {
+        col = col.push(container(text(format!("No settings match \u{201c}{}\u{201d}", ctx.query.trim())).size(T_SMALL).color(TEXT_3)).padding([S2, S3]));
+    }
     widgets::scroll(col.padding(iced::Padding { top: 0.0, right: 10.0, bottom: 12.0, left: 4.0 })).height(Fill).into()
+}
+
+/// Adds a section if the search shows it, counting what is shown.
+fn add<'a>(col: iced::widget::Column<'a, Message>, shown: &mut usize, section: Option<Element<'a, Message>>) -> iced::widget::Column<'a, Message> {
+    match section {
+        Some(s) => {
+            *shown += 1;
+            col.push(s)
+        }
+        None => col,
+    }
+}
+
+/// Crop sliders, with on-canvas cropping.
+fn crop_section<'a>(clip: &'a Clip, ctx: &Ctx<'a>) -> Option<Element<'a, Message>> {
+    let id = clip.id;
+    let e = move |edit: Edit| Message::Edit(id, edit);
+    let k = clip.crop;
+    let pct = |v: f64| format!("{:.0}%", v);
+    let max = crate::clip::Crop::MAX * 100.0;
+    let body = column![
+        checkbox(ctx.crop_edit).label("Crop on canvas").on_toggle(move |on| Message::CropEdit(on.then_some(id))).size(15).spacing(8).text_size(T_SMALL).style(style::checkbox),
+        slider_row("Left", k.left * 100.0, 0.0..=max, 0.5, pct, move |v| e(Edit::CropLeft(v / 100.0))),
+        slider_row("Right", k.right * 100.0, 0.0..=max, 0.5, pct, move |v| e(Edit::CropRight(v / 100.0))),
+        slider_row("Top", k.top * 100.0, 0.0..=max, 0.5, pct, move |v| e(Edit::CropTop(v / 100.0))),
+        slider_row("Bottom", k.bottom * 100.0, 0.0..=max, 0.5, pct, move |v| e(Edit::CropBottom(v / 100.0))),
+    ]
+    .spacing(S3);
+    ctx.section_reset(code::CROP, "Crop", e(Edit::Crop(Default::default())), body.into())
+}
+
+/// A blur clip: how strong, what shape, how big, and where.
+fn blur_clip<'a>(clip: &'a Clip, b: &crate::clip::BlurLayer, ctx: &Ctx<'a>, col: iced::widget::Column<'a, Message>, shown: &mut usize) -> iced::widget::Column<'a, Message> {
+    let id = clip.id;
+    let e = move |edit: Edit| Message::Edit(id, edit);
+    let body = column![
+        slider_row("Strength", b.strength, 0.0..=100.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::BlurStrength(v))),
+        row![
+            text("Shape").size(T_SMALL).color(TEXT_2).width(84),
+            widgets::segmented(&[false, true], b.ellipse, |el| if *el { "Oval".into() } else { "Box".into() }, move |el| e(Edit::BlurEllipse(el))),
+        ]
+        .align_y(Alignment::Center),
+        slider_row("Width", b.width, 10.0..=2400.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::BlurWidth(v))),
+        slider_row("Height", b.height, 10.0..=2400.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::BlurHeight(v))),
+        text("Blurs the video and images under it, only inside the box and only while it's on the timeline. Drag it on the preview; trim it on the timeline.").size(T_CAPTION).color(TEXT_3),
+    ]
+    .spacing(S3);
+    let col = add(col, shown, ctx.section(code::DROPLETS, "Blur", body.into()));
+    let tr = &clip.transform;
+    let place = column![
+        slider_row("Position X", tr.x * 100.0, -50.0..=150.0, 0.1, |v| format!("{v:.0}%"), move |v| e(Edit::X(v / 100.0))),
+        slider_row("Position Y", tr.y * 100.0, -50.0..=150.0, 0.1, |v| format!("{v:.0}%"), move |v| e(Edit::Y(v / 100.0))),
+    ]
+    .spacing(S3);
+    add(col, shown, ctx.section(code::MOVE, "Transform", place.into()))
+}
+
+/// What the inspector shows besides the clip: edit modes, the range, typed colors,
+/// collapsed sections and the search text.
+pub struct Ctx<'a> {
+    pub zoom_edit: Option<Id>,
+    pub crop_edit: bool,
+    pub range: Option<(f64, f64)>,
+    pub hex: Option<&'a HexDraft>,
+    pub collapsed: &'a std::collections::BTreeSet<String>,
+    pub query: &'a str,
+}
+
+/// Words that find a section in the search box, besides its title.
+fn keywords(title: &str) -> &'static str {
+    match title {
+        "Text" => "font size weight bold color align background box type words",
+        "Shape" => "width height size fill gradient color radial linear direction thickness ring",
+        "Transform" => "position x y move scale size rotation rotate angle opacity transparency framing fit fill",
+        "Frame style" => "corners rounded radius border outline stroke drop shadow blur distance strength",
+        "Color" => "brightness contrast saturation warmth temperature grade",
+        "Crop" => "cut trim edges left right top bottom",
+        "Blur" => "hide privacy pixelate blur area censor obscure strength oval box",
+        "Animation" => "intro outro in out motion fade slide pop zoom duration",
+        "Transition in" => "crossfade slide push wipe zoom through duration",
+        "Zoom & pan" => "camera focus magnify pan",
+        "Speed" => "fast slow time tempo",
+        "Audio" => "volume mute fade sound range level loud quiet",
+        _ => "",
+    }
+}
+
+impl<'a> Ctx<'a> {
+    /// Whether the search text (if any) finds this section.
+    fn matches(&self, title: &str) -> bool {
+        let q = self.query.trim().to_lowercase();
+        q.is_empty() || q.split_whitespace().all(|w| title.to_lowercase().contains(w) || keywords(title).contains(w))
+    }
+
+    fn section(&self, glyph: char, title: &'static str, body: Element<'a, Message>) -> Option<Element<'a, Message>> {
+        self.section_with(glyph, title, None, body)
+    }
+
+    fn section_reset(&self, glyph: char, title: &'static str, reset: Message, body: Element<'a, Message>) -> Option<Element<'a, Message>> {
+        self.section_with(glyph, title, Some(reset), body)
+    }
+
+    /// A card with a clickable header that collapses it; hidden when the search doesn't find it.
+    fn section_with(&self, glyph: char, title: &'static str, reset: Option<Message>, body: Element<'a, Message>) -> Option<Element<'a, Message>> {
+        if !self.matches(title) {
+            return None;
+        }
+        // While searching, every found section is open.
+        let open = !self.query.trim().is_empty() || !self.collapsed.contains(title);
+        let toggle = button(
+            row![
+                icon(if open { code::CHEVRON_DOWN } else { code::CHEVRON_RIGHT }, 12).color(TEXT_3),
+                tinted(glyph, 13, TEXT_3),
+                text(title).font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_2),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+        )
+        .width(Fill)
+        .padding([2, 0])
+        .style(|_, _| button::Style::default())
+        .on_press(Message::ToggleSection(title));
+        let mut head = row![toggle].align_y(Alignment::Center);
+        if let (Some(reset), true) = (reset, open) {
+            head = head.push(widgets::tip(widgets::icon_button(code::REFRESH_CW, Some(reset)).width(24).height(24), "Reset", None, iced::widget::tooltip::Position::Left));
+        }
+        let content = if open { column![head, body].spacing(S3) } else { column![head] };
+        Some(container(content).padding(S3).width(Fill).style(style::card).into())
+    }
 }
 
 fn section<'a>(glyph: char, title: &'a str, body: Element<'a, Message>) -> Element<'a, Message> {
@@ -557,17 +751,26 @@ fn section<'a>(glyph: char, title: &'a str, body: Element<'a, Message>) -> Eleme
     container(column![head, body].spacing(S3)).padding(S3).width(Fill).style(style::card).into()
 }
 
-fn section_with_reset<'a>(glyph: char, title: &'a str, reset: Message, body: Element<'a, Message>) -> Element<'a, Message> {
-    let head = row![
-        tinted(glyph, 13, TEXT_3),
-        text(title).font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_2),
-        space().width(Fill),
-        widgets::tip(widgets::icon_button(code::REFRESH_CW, Some(reset)).width(24).height(24), "Reset", None, iced::widget::tooltip::Position::Left),
+/// The search box above the inspector.
+pub fn search_bar<'a>(query: &str) -> Element<'a, Message> {
+    let mut r = row![
+        icon(code::SEARCH, 13).color(TEXT_3),
+        text_input("Search settings and effects…", query).id(SEARCH_ID).on_input(Message::InspectorSearch).size(T_SMALL).padding([5, 0]).style(|t, s| {
+            let mut st = style::input(t, s);
+            st.border = iced::Border { width: 0.0, ..st.border };
+            st.background = Color::TRANSPARENT.into();
+            st
+        }),
     ]
-    .spacing(7)
+    .spacing(8)
     .align_y(Alignment::Center);
-    container(column![head, body].spacing(S3)).padding(S3).width(Fill).style(style::card).into()
+    if !query.is_empty() {
+        r = r.push(button(icon(code::X, 12).color(TEXT_3)).padding(4).style(style::ghost).on_press(Message::InspectorSearch(String::new())));
+    }
+    container(r).padding([2, 10]).style(style::inset).into()
 }
+
+pub const SEARCH_ID: &str = "inspector-search";
 
 fn slider_row<'a>(name: &'a str, value: f64, range: RangeInclusive<f64>, step: f64, fmt: impl Fn(f64) -> String, on_change: impl Fn(f64) -> Message + 'a) -> Element<'a, Message> {
     let v = value.clamp(*range.start(), *range.end());
@@ -642,6 +845,54 @@ fn color_row<'a>(name: &'a str, value: Rgba, field: (Id, &'static str, Option<&'
         .width(74)
         .style(style::input);
     column![row![text(name).size(T_SMALL).color(TEXT_2).width(Fill), hex].align_y(Alignment::Center), swatches].spacing(6).into()
+}
+
+/// A timeline marker: name, color, where it is.
+pub fn marker(m: &crate::model::Marker) -> Element<'_, Message> {
+    let id = m.id;
+    let color = Color::from_rgb(m.color.0, m.color.1, m.color.2);
+    let when = if m.duration > 0.0 {
+        format!("{} – {}", super::fmt_timecode_short(m.at), super::fmt_timecode_short(m.at + m.duration))
+    } else {
+        super::fmt_timecode_short(m.at)
+    };
+    let header = row![
+        container(tinted(code::FLAG, 15, color)).center(32).style(style::badge(color)),
+        column![
+            text_input("Marker name", &m.name).on_input(move |s| Message::MarkerName(id, s)).font(INTER_SEMIBOLD).size(T_BODY).padding([3, 6]).style(style::input),
+            text(format!("Timeline marker · {when}")).size(T_CAPTION).color(TEXT_3),
+        ]
+        .spacing(2)
+        .width(Fill),
+    ]
+    .spacing(S3)
+    .align_y(Alignment::Center);
+    let swatches = row(super::library::MARKER_COLORS.iter().map(|&hex| {
+        let c = Rgba::hex(hex);
+        let selected = c.to_hex() == m.color.to_hex();
+        button(space().width(18).height(18))
+            .padding(0)
+            .style(move |_, status| button::Style {
+                background: Some(Color::from_rgb(c.0, c.1, c.2).into()),
+                border: iced::Border { color: if selected { Color::WHITE } else if matches!(status, button::Status::Hovered) { LINE_STRONG } else { LINE }, width: if selected { 2.0 } else { 1.0 }, radius: 10.0.into() },
+                ..Default::default()
+            })
+            .on_press(Message::MarkerColorOf(id, c))
+            .into()
+    }))
+    .spacing(6);
+    let body = column![
+        swatches,
+        row![
+            widgets::secondary_button(Some(code::SKIP_BACK), "Go to marker", Some(Message::Seek(m.at))),
+            space().width(Fill),
+            widgets::ghost_button(Some(code::TRASH_2), "Delete", Some(Message::DeleteMarker(id))),
+        ]
+        .align_y(Alignment::Center),
+        text("Drag the flag on the ruler to move it. Markers help you find your way; they don't show in the video.").size(T_CAPTION).color(TEXT_3),
+    ]
+    .spacing(S3);
+    widgets::scroll(column![container(header).padding([S3, S3]), section(code::PALETTE, "Color", body.into())].spacing(S2).padding(iced::Padding { top: 0.0, right: 10.0, bottom: 12.0, left: 4.0 })).height(Fill).into()
 }
 
 pub fn empty<'a>() -> Element<'a, Message> {

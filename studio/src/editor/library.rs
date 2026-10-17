@@ -5,7 +5,7 @@ use iced::{Alignment, Color, Element, Fill, Length, mouse};
 use iced_aw::ContextMenu;
 
 use super::{Editor, LibraryTab, Message, fmt_duration};
-use crate::clip::{MotionKind, TransitionKind};
+use crate::clip::{MotionKind, Rgba, TransitionKind};
 use crate::model::MediaKind;
 use crate::ui::icons::{code, icon, tinted};
 use crate::ui::tokens::*;
@@ -138,12 +138,19 @@ impl Editor {
 
     fn effects_tab(&self) -> Element<'_, Message> {
         let has_selection = !self.selection.is_empty();
-        let card = |glyph: char, label: &'static str, msg: Message| -> Element<'_, Message> {
-            button(column![container(icon(glyph, 18).color(ACCENT_HOVER)).center_x(Fill).height(30).align_y(Alignment::Center), text(label).font(INTER_MEDIUM).size(T_SMALL)].spacing(4).align_x(Alignment::Center))
+        // Click applies to the selection; drag drops onto any clip (timeline or preview).
+        let card = |glyph: char, label: &'static str, effect: Effect| -> Element<'_, Message> {
+            let hovered = self.effect_hover == Some(effect);
+            let body = container(column![container(icon(glyph, 18).color(ACCENT_HOVER)).center_x(Fill).height(30).align_y(Alignment::Center), text(label).font(INTER_MEDIUM).size(T_SMALL)].spacing(4).align_x(Alignment::Center))
                 .width(Fill)
                 .padding([10, 6])
-                .style(style::choice_card(false))
-                .on_press_maybe(has_selection.then_some(msg))
+                .style(move |t| effect_card(t, hovered));
+            mouse_area(body)
+                .on_press(Message::EffectPress(effect))
+                .on_release(Message::EffectClick(effect))
+                .on_enter(Message::EffectHover(Some(effect)))
+                .on_exit(Message::EffectHover(None))
+                .interaction(mouse::Interaction::Grab)
                 .into()
         };
         let transitions = [
@@ -166,16 +173,48 @@ impl Editor {
         fn grid(items: Vec<Element<'_, Message>>) -> iced::widget::Grid<'_, Message> {
             iced::widget::grid(items).fluid(110).spacing(6).height(iced::widget::grid::Sizing::EvenlyDistribute(Length::Shrink))
         }
-        let hint = if has_selection { "Applies to the selected clips." } else { "Select a clip on the timeline first." };
+        let hint = if has_selection { "Click to apply to the selected clips, or drag onto any clip." } else { "Drag onto a clip on the timeline or the preview." };
+        let highlights = [
+            (code::RECTANGLE_HORIZONTAL, "Box", Highlight::Box),
+            (code::CIRCLE, "Circle", Highlight::Circle),
+            (code::HIGHLIGHTER, "Highlight", Highlight::Marker),
+            (code::MINUS, "Underline", Highlight::Underline),
+        ];
+        // The color new markers get (each one can be recolored in the inspector later).
+        let swatches = row(MARKER_COLORS.iter().map(|&hex| {
+            let c = Rgba::hex(hex);
+            let selected = c.to_hex() == self.marker_color.to_hex();
+            button(space().width(18).height(18))
+                .padding(0)
+                .style(move |_, status| button::Style {
+                    background: Some(Color::from_rgb(c.0, c.1, c.2).into()),
+                    border: iced::Border {
+                        color: if selected { Color::WHITE } else if matches!(status, button::Status::Hovered) { LINE_STRONG } else { LINE },
+                        width: if selected { 2.0 } else { 1.0 },
+                        radius: 10.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .on_press(Message::MarkerColor(c))
+                .into()
+        }))
+        .spacing(6);
+        let timeline_marker = widgets::secondary_button(Some(code::FLAG), "Add timeline marker", Some(Message::AddMarker)).width(Fill);
         widgets::scroll(
             column![
-                text(hint).size(T_CAPTION).color(if has_selection { TEXT_3 } else { WARNING }),
+                text(hint).size(T_CAPTION).color(TEXT_3),
+                widgets::section("Markers"),
+                swatches,
+                grid(highlights.iter().map(|&(g, l, k)| card(g, l, Effect::Highlight(k))).collect()),
+                widgets::tip(timeline_marker, "A colored flag on the ruler (or a span over the marked range)", Some("Shift+M"), iced::widget::tooltip::Position::Top),
+                widgets::section("Hide"),
+                grid(vec![card(code::DROPLETS, "Blur area", Effect::Blur)]),
                 widgets::section("Transition in"),
-                grid(transitions.iter().map(|&(g, l, k)| card(g, l, Message::ApplyTransition(k))).collect()),
+                grid(transitions.iter().map(|&(g, l, k)| card(g, l, Effect::Transition(k))).collect()),
                 widgets::section("Animate in"),
-                grid(motions.iter().map(|&(g, l, k)| card(g, l, Message::ApplyMotion { intro: true, kind: k })).collect()),
+                grid(motions.iter().map(|&(g, l, k)| card(g, l, Effect::Intro(k))).collect()),
                 widgets::section("Animate out"),
-                grid(motions.iter().map(|&(g, l, k)| card(g, l, Message::ApplyMotion { intro: false, kind: k })).collect()),
+                grid(motions.iter().map(|&(g, l, k)| card(g, l, Effect::Outro(k))).collect()),
             ]
             .spacing(S3)
             .padding([8, 10]),
@@ -212,6 +251,85 @@ impl Editor {
         )
         .height(Fill)
         .into()
+    }
+}
+
+/// Something from the Effects tab that can be clicked onto the selection or dragged onto a clip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Effect {
+    Transition(TransitionKind),
+    Intro(MotionKind),
+    Outro(MotionKind),
+    Blur,
+    Highlight(Highlight),
+}
+
+impl Effect {
+    pub fn label(self) -> &'static str {
+        match self {
+            Effect::Transition(_) => "Transition",
+            Effect::Intro(_) => "Animate in",
+            Effect::Outro(_) => "Animate out",
+            Effect::Blur => "Blur area",
+            Effect::Highlight(h) => h.label(),
+        }
+    }
+}
+
+/// On-video markers that point at part of the picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Highlight {
+    Box,
+    Circle,
+    /// A translucent highlighter stroke.
+    Marker,
+    Underline,
+}
+
+impl Highlight {
+    pub fn label(self) -> &'static str {
+        match self {
+            Highlight::Box => "Box",
+            Highlight::Circle => "Circle",
+            Highlight::Marker => "Highlight",
+            Highlight::Underline => "Underline",
+        }
+    }
+
+    /// The shape, its corner radius, and its clip name.
+    pub fn build(self, color: Rgba) -> (crate::clip::ShapeLayer, f64, &'static str) {
+        use crate::clip::{ShapeKind, ShapeLayer};
+        let mut s = match self {
+            Highlight::Box => ShapeLayer::new(ShapeKind::Frame, 520.0, 300.0, color, None),
+            Highlight::Circle => ShapeLayer::new(ShapeKind::Ring, 360.0, 360.0, color, None),
+            Highlight::Marker => ShapeLayer::new(ShapeKind::Rectangle, 520.0, 90.0, Rgba(color.0, color.1, color.2, 0.4), None),
+            Highlight::Underline => ShapeLayer::new(ShapeKind::Rectangle, 520.0, 14.0, color, None),
+        };
+        s.thickness = 10.0;
+        let radius = match self {
+            Highlight::Box => 18.0,
+            Highlight::Circle => 0.0,
+            Highlight::Marker => 10.0,
+            Highlight::Underline => 7.0,
+        };
+        (s, radius, match self {
+            Highlight::Box => "Box marker",
+            Highlight::Circle => "Circle marker",
+            Highlight::Marker => "Highlight",
+            Highlight::Underline => "Underline",
+        })
+    }
+}
+
+/// Colors offered for markers (on the video and on the timeline).
+pub const MARKER_COLORS: [u32; 8] = [0xFFD43B, 0xD6FF00, 0x2EF2A2, 0x4C8DFF, 0x8B7CF6, 0xFF6363, 0xFFA94D, 0xFFFFFF];
+
+fn effect_card(_: &iced::Theme, hovered: bool) -> container::Style {
+    container::Style {
+        background: Some(if hovered { SURFACE_3 } else { SURFACE_2 }.into()),
+        border: iced::Border { color: if hovered { LINE_STRONG } else { LINE }, width: 1.0, radius: R_LG.into() },
+        text_color: Some(TEXT_1),
+        ..Default::default()
     }
 }
 

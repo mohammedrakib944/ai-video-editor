@@ -14,6 +14,11 @@ struct Layer {
     grade: vec4<f32>,        // brightness, contrast, saturation, temperature
     canvas: vec4<f32>,       // width, height, target is sRGB (1/0), has texture (1/0)
     shape: vec4<f32>,        // outline kind, ring thickness, gradient kind (0 linear / 1 radial), gradient angle (rad)
+    view: vec4<f32>,         // canvas px -> clip space: x * view.x + view.y, y * view.z + view.w
+    // Blurred areas of the source (up to 4): rect (u0, v0, u1, v1) then
+    // (radius u, radius v, feather in uv, shape 0 rectangle / 1 ellipse). Radius 0 = unused.
+    blur_rect: array<vec4<f32>, 4>,
+    blur_params: array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<uniform> layer: Layer;
@@ -34,7 +39,7 @@ fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
     let s = sin(layer.params.x);
     let p = vec2<f32>(local.x * c - local.y * s, local.x * s + local.y * c) + layer.rect.xy;
     var out: VsOut;
-    out.pos = vec4<f32>(p.x / layer.canvas.x * 2.0 - 1.0, 1.0 - p.y / layer.canvas.y * 2.0, 0.0, 1.0);
+    out.pos = vec4<f32>(p.x * layer.view.x + layer.view.y, p.y * layer.view.z + layer.view.w, 0.0, 1.0);
     out.local = local;
     return out;
 }
@@ -98,8 +103,46 @@ fn sd_shape(p: vec2<f32>, half: vec2<f32>, radius: f32) -> f32 {
         return sd_star(p, m - radius) - radius;
     } else if (kind < 4.5) {
         return sd_hexagon(p, m * 0.866 - radius) - radius;
+    } else if (kind > 5.5) {
+        // Frame: an outlined rounded rectangle.
+        let t = layer.shape.y * 0.5;
+        return abs(sd_round_box(p, half - vec2<f32>(t), max(radius - t, 0.0))) - t;
     }
     return abs(sd_ellipse(p, half - vec2<f32>(layer.shape.y * 0.5))) - layer.shape.y * 0.5;
+}
+
+// How much of blur area `i` covers source point `uv` (0..1, soft at the edge).
+fn blur_mask(i: i32, uv: vec2<f32>) -> f32 {
+    let r = layer.blur_rect[i];
+    let p = layer.blur_params[i];
+    let feather = max(p.z, 1e-4);
+    let c = (r.xy + r.zw) * 0.5;
+    let half = max((r.zw - r.xy) * 0.5, vec2<f32>(1e-4));
+    var d: f32;
+    if (p.w > 0.5) {
+        d = (length((uv - c) / half) - 1.0) * min(half.x, half.y);
+    } else {
+        let q = abs(uv - c) - half;
+        d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
+    }
+    return 1.0 - smoothstep(-feather, feather, d);
+}
+
+// Gaussian-weighted 9×9 samples around `uv`, `radius` in uv units.
+fn blurred(uv: vec2<f32>, radius: vec2<f32>) -> vec4<f32> {
+    var acc = vec4<f32>(0.0);
+    var total = 0.0;
+    for (var y = -4; y <= 4; y++) {
+        for (var x = -4; x <= 4; x++) {
+            let o = vec2<f32>(f32(x), f32(y)) / 4.0;
+            let w = exp(-dot(o, o) * 2.0);
+            let lo = min(layer.uv.xy, layer.uv.zw);
+            let hi = max(layer.uv.xy, layer.uv.zw);
+            acc = acc + textureSampleLevel(tex, samp, clamp(uv + o * radius, lo, hi), 0.0) * w;
+            total = total + w;
+        }
+    }
+    return acc / total;
 }
 
 fn to_linear(c: vec3<f32>) -> vec3<f32> {
@@ -142,7 +185,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var texel = vec4<f32>(1.0);
     if (layer.canvas.w > 0.5) {
         let f = in.local / max(half, vec2<f32>(0.0001)) * 0.5 + 0.5;
-        texel = textureSample(tex, samp, mix(layer.uv.xy, layer.uv.zw, f));
+        let suv = mix(layer.uv.xy, layer.uv.zw, f);
+        texel = textureSample(tex, samp, suv);
+        for (var i = 0; i < 4; i++) {
+            let radius = layer.blur_params[i].xy;
+            if (radius.x > 0.0) {
+                let m = blur_mask(i, suv);
+                if (m > 0.001) {
+                    texel = mix(texel, blurred(suv, radius), m);
+                }
+            }
+        }
     }
     // Gradient position: along the angle (CSS-style, 180° = top to bottom) or out from the center.
     let n = in.local / max(half, vec2<f32>(0.0001));

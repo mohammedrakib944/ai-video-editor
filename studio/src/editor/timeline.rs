@@ -89,6 +89,7 @@ pub fn content_height(project: &Project) -> f32 {
 
 fn clip_color(project: &Project, clip: &Clip) -> Color {
     match &clip.content {
+        Content::Media { .. } if clip.part == crate::clip::Part::Sound => clip::AUDIO,
         Content::Media { asset, .. } => match project.asset(*asset).map(|a| a.kind) {
             Some(MediaKind::Audio) => clip::AUDIO,
             Some(MediaKind::Image) => clip::IMAGE,
@@ -96,6 +97,7 @@ fn clip_color(project: &Project, clip: &Clip) -> Color {
         },
         Content::Text(_) => clip::TEXT,
         Content::Shape(_) => clip::EFFECT,
+        Content::Blur(_) => clip::BLUR,
     }
 }
 
@@ -111,6 +113,7 @@ pub fn clip_label(project: &Project, clip: &Clip) -> String {
         Content::Media { asset, .. } => project.asset(*asset).map(|a| a.name.clone()).unwrap_or_else(|| "Missing media".into()),
         Content::Text(t) => t.text.lines().next().unwrap_or("Text").to_string(),
         Content::Shape(_) => "Shape".into(),
+        Content::Blur(_) => "Blur".into(),
     }
 }
 
@@ -123,21 +126,58 @@ pub fn fmt_ruler(t: f64, fine: bool) -> String {
 
 // ---------------------------------------------------------------- ruler
 
-pub struct Ruler {
+pub struct Ruler<'a> {
     pub view: View,
+    pub markers: &'a [crate::model::Marker],
+    pub selected_marker: Option<Id>,
     pub playhead: f64,
     pub range: Option<(f64, f64)>,
-    /// Range start marked, waiting for its end.
+    /// Range start marked, waiting for its end: the range then follows the playhead.
     pub anchor: Option<f64>,
+}
+
+impl Ruler<'_> {
+    /// The marker under ruler point `p`: point markers by their pennant, spans by their band.
+    fn marker_at(&self, p: Point) -> Option<&crate::model::Marker> {
+        if p.y < MARKER_TOP - 2.0 {
+            return None;
+        }
+        self.markers.iter().rev().find(|m| {
+            let x = self.view.x(m.at);
+            (p.x - x).abs() <= 6.0 || (m.duration > 0.0 && p.x >= x && p.x <= self.view.x(m.at + m.duration) && p.y >= RULER_H - 8.0)
+        })
+    }
+
+    /// The range to show: the marked one, or A to the playhead while B is still to come.
+    fn shown(&self) -> Option<(f64, f64)> {
+        match self.anchor {
+            Some(a) => Some((a.min(self.playhead), a.max(self.playhead))),
+            None => self.range,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RulerDrag {
+    Scrub,
+    /// Dragging one end of the range; `fixed` is the other end.
+    RangeEdge { fixed: f64 },
+    /// Shift+drag: drawing a new range from `from`.
+    RangeNew { from: f64 },
+    /// Moving a marker; `grab` is how far after its start it was picked up.
+    Marker { id: Id, grab: f64, moved: bool },
 }
 
 #[derive(Default)]
 pub struct RulerState {
-    scrubbing: bool,
+    drag: Option<RulerDrag>,
     modifiers: keyboard::Modifiers,
 }
 
-impl canvas::Program<Message> for Ruler {
+/// Distance (px) at which a range flag can be grabbed.
+const FLAG_GRAB: f32 = 7.0;
+
+impl canvas::Program<Message> for Ruler<'_> {
     type State = RulerState;
 
     fn update(&self, state: &mut RulerState, event: &canvas::Event, bounds: Rectangle, cursor: mouse::Cursor) -> Option<Action<Message>> {
@@ -148,14 +188,50 @@ impl canvas::Program<Message> for Ruler {
             }
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let p = cursor.position_in(bounds)?;
-                state.scrubbing = true;
-                Some(Action::publish(Message::Seek(self.view.t(p.x).max(0.0))).and_capture())
+                let t = self.view.t(p.x).max(0.0);
+                if let Some(m) = self.marker_at(p) {
+                    state.drag = Some(RulerDrag::Marker { id: m.id, grab: t - m.at, moved: false });
+                    return Some(Action::publish(Message::SelectMarker(Some(m.id))).and_capture());
+                }
+                if state.modifiers.shift() {
+                    state.drag = Some(RulerDrag::RangeNew { from: t });
+                    return Some(Action::publish(Message::SetRange(None)).and_capture());
+                }
+                // The flags of a marked range can be dragged to adjust it.
+                if let (None, Some((a, b))) = (self.anchor, self.range) {
+                    let (da, db) = ((self.view.x(a) - p.x).abs(), (self.view.x(b) - p.x).abs());
+                    if da.min(db) <= FLAG_GRAB {
+                        state.drag = Some(RulerDrag::RangeEdge { fixed: if da <= db { b } else { a } });
+                        return Some(Action::capture());
+                    }
+                }
+                state.drag = Some(RulerDrag::Scrub);
+                Some(Action::publish(Message::Seek(t)).and_capture())
             }
-            canvas::Event::Mouse(mouse::Event::CursorMoved { position }) if state.scrubbing => {
-                Some(Action::publish(Message::Seek(self.view.t(position.x - bounds.x).max(0.0))).and_capture())
+            canvas::Event::Mouse(mouse::Event::CursorMoved { position }) if state.drag.is_some() => {
+                let t = self.view.t(position.x - bounds.x).max(0.0);
+                let msg = match state.drag? {
+                    RulerDrag::Scrub => Message::Seek(t),
+                    RulerDrag::Marker { id, grab, .. } => {
+                        state.drag = Some(RulerDrag::Marker { id, grab, moved: true });
+                        Message::MoveMarker(id, (t - grab).max(0.0))
+                    }
+                    RulerDrag::RangeEdge { fixed } | RulerDrag::RangeNew { from: fixed } => {
+                        if (t - fixed).abs() < 0.05 {
+                            return Some(Action::capture());
+                        }
+                        Message::SetRange(Some((t.min(fixed), t.max(fixed))))
+                    }
+                };
+                Some(Action::publish(msg).and_capture())
             }
-            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.scrubbing => {
-                state.scrubbing = false;
+            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.drag.is_some() => {
+                // A click on a marker (no drag) jumps to it.
+                if let Some(RulerDrag::Marker { id, moved: false, .. }) = state.drag.take() {
+                    if let Some(m) = self.markers.iter().find(|m| m.id == id) {
+                        return Some(Action::publish(Message::Seek(m.at)).and_capture());
+                    }
+                }
                 Some(Action::capture())
             }
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
@@ -173,15 +249,19 @@ impl canvas::Program<Message> for Ruler {
         let size = bounds.size();
         f.fill_rectangle(Point::ORIGIN, size, SURFACE_1);
         f.fill_rectangle(Point::new(0.0, size.height - 1.0), Size::new(size.width, 1.0), LINE);
-        if let Some((a, b)) = self.range {
+        if let Some((a, b)) = self.shown() {
             let (x0, x1) = (self.view.x(a), self.view.x(b));
-            f.fill_rectangle(Point::new(x0, 0.0), Size::new(x1 - x0, size.height), Color { a: 0.18, ..ACCENT });
-            for (x, label) in [(x0, "A"), (x1, "B")] {
-                flag(&mut f, x, label);
+            let pending = self.anchor.is_some();
+            f.fill_rectangle(Point::new(x0, 0.0), Size::new(x1 - x0, size.height), Color { a: if pending { 0.10 } else { 0.18 }, ..ACCENT });
+            match self.anchor {
+                // While marking, A stays put and B rides on the playhead.
+                Some(anchor) => flag(&mut f, self.view.x(anchor), "A"),
+                None => {
+                    for (x, label) in [(x0, "A"), (x1, "B")] {
+                        flag(&mut f, x, label);
+                    }
+                }
             }
-        }
-        if let Some(a) = self.anchor {
-            flag(&mut f, self.view.x(a), "A");
         }
         let steps = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0];
         let step = steps.iter().copied().find(|s| s * self.view.zoom >= 84.0).unwrap_or(1800.0);
@@ -197,6 +277,9 @@ impl canvas::Program<Message> for Ruler {
             if major {
                 f.fill_text(Text { content: fmt_ruler(t, step < 1.0), position: Point::new(x + 5.0, 7.0), color: TEXT_3, size: 10.5.into(), font: INTER_MEDIUM, ..Text::default() });
             }
+        }
+        for m in self.markers {
+            marker_glyph(&mut f, self.view, m, self.selected_marker == Some(m.id), size);
         }
         // Playhead head.
         let x = self.view.x(self.playhead);
@@ -215,8 +298,36 @@ impl canvas::Program<Message> for Ruler {
         vec![f.into_geometry()]
     }
 
-    fn mouse_interaction(&self, state: &RulerState, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
-        if state.scrubbing || cursor.is_over(bounds) { mouse::Interaction::ResizingHorizontally } else { mouse::Interaction::default() }
+    // The ruler keeps the normal pointer, even over the playhead and while scrubbing.
+}
+
+/// Top of the marker pennants on the ruler.
+const MARKER_TOP: f32 = 14.0;
+
+/// A marker on the ruler: a pennant at its start, and a band along the bottom for spans.
+fn marker_glyph(f: &mut Frame, view: View, m: &crate::model::Marker, selected: bool, size: Size) {
+    let color = Color::from_rgba(m.color.0, m.color.1, m.color.2, 1.0);
+    let x = view.x(m.at).round();
+    if m.duration > 0.0 {
+        let x1 = view.x(m.at + m.duration);
+        f.fill_rectangle(Point::new(x, size.height - 6.0), Size::new((x1 - x).max(2.0), 5.0), Color { a: 0.85, ..color });
+    }
+    if x < -10.0 || x > size.width + 10.0 {
+        return;
+    }
+    f.fill_rectangle(Point::new(x - 0.5, MARKER_TOP + 6.0), Size::new(1.0, size.height - MARKER_TOP - 6.0), color);
+    let pennant = Path::new(|b| {
+        b.move_to(Point::new(x - 5.0, MARKER_TOP));
+        b.line_to(Point::new(x + 5.0, MARKER_TOP));
+        b.line_to(Point::new(x + 5.0, MARKER_TOP + 5.0));
+        b.line_to(Point::new(x, MARKER_TOP + 10.0));
+        b.line_to(Point::new(x - 5.0, MARKER_TOP + 5.0));
+        b.close();
+    });
+    f.fill(&pennant, color);
+    if selected {
+        f.stroke(&pennant, Stroke::default().with_color(Color::WHITE).with_width(1.5));
+        f.fill_text(Text { content: m.name.clone(), position: Point::new(x + 9.0, MARKER_TOP + 4.0), color: TEXT_1, size: 10.5.into(), font: INTER_SEMIBOLD, align_y: alignment::Vertical::Center, ..Text::default() });
     }
 }
 
@@ -254,6 +365,8 @@ pub struct Lanes<'a> {
     pub range: Option<(f64, f64)>,
     /// Asset being dragged in from the library.
     pub dnd: Option<Id>,
+    /// Effect being dragged in from the library.
+    pub dnd_effect: Option<super::library::Effect>,
     /// Assets whose file can't be found.
     pub missing: &'a std::collections::HashSet<Id>,
     pub cache: &'a Caches,
@@ -347,6 +460,12 @@ impl Lanes<'_> {
         if let Some((a, b)) = self.range {
             pts.extend([a, b]);
         }
+        for m in &self.project.markers {
+            pts.push(m.at);
+            if m.duration > 0.0 {
+                pts.push(m.at + m.duration);
+            }
+        }
         pts
     }
 
@@ -406,6 +525,10 @@ impl canvas::Program<Message> for Lanes<'_> {
                     state.drag = Some(Drag::Pan { x0: p.x, scroll0: self.view.scroll });
                     return Some(Action::capture());
                 }
+                // Right-click selects the clip under the cursor, so the context menu acts on it.
+                if *button == mouse::Button::Right {
+                    return Some(Action::publish(Message::Select(self.hit(p).map(|(c, _)| c.id), false)));
+                }
                 if *button != mouse::Button::Left {
                     return None;
                 }
@@ -442,7 +565,7 @@ impl canvas::Program<Message> for Lanes<'_> {
                 state.hover = local;
                 let Some(drag) = state.drag.as_mut() else {
                     // Keep the drop preview following the cursor during a library drag.
-                    return self.dnd.map(|_| Action::request_redraw());
+                    return (self.dnd.is_some() || self.dnd_effect.is_some()).then(Action::request_redraw);
                 };
                 match drag {
                     Drag::Pan { x0, scroll0 } => {
@@ -455,7 +578,7 @@ impl canvas::Program<Message> for Lanes<'_> {
                         }
                         *moved = true;
                         let c = self.project.clip(*clip)?;
-                        let kind = self.project.kind_for(&c.content);
+                        let kind = self.project.clip_kind(c);
                         if let Some((row, row_kind, _, _)) = self.row_at(p.y) {
                             if row_kind == kind && !self.project.track(row).is_some_and(|t| t.locked) {
                                 *track = row;
@@ -504,6 +627,12 @@ impl canvas::Program<Message> for Lanes<'_> {
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(_)) => {
                 state.guide = None;
+                if let (Some(effect), Some(p)) = (self.dnd_effect, local) {
+                    let clip = self.hit(p).map(|(c, _)| c.id);
+                    let track = self.row_at(p.y).map(|r| r.0);
+                    let (t, _) = self.snap(self.view.t(p.x).max(0.0), None);
+                    return Some(Action::publish(Message::DropEffect { effect, target: super::DropTarget::Timeline { clip, track, t } }).and_capture());
+                }
                 if let (Some(asset), Some(p)) = (self.dnd, local) {
                     let track = self.row_at(p.y).map(|r| r.0);
                     let (t, _) = self.snap(self.view.t(p.x).max(0.0), None);
@@ -573,6 +702,27 @@ impl canvas::Program<Message> for Lanes<'_> {
                 }
             }
             _ => {}
+        }
+
+        // Where a dragged effect would land.
+        if let (Some(_), Some(p)) = (self.dnd_effect, state.hover) {
+            if let Some((c, _)) = self.hit(p) {
+                if let Some((_, _, top, rh)) = self.row_of(c.track) {
+                    let r = Rectangle::new(Point::new(self.view.x(c.start), top), Size::new((c.duration * self.view.zoom) as f32, rh));
+                    ghost(&mut o, r, ACCENT);
+                }
+            }
+        }
+
+        // Timeline markers: a thin line in their color (spans are lightly shaded).
+        for m in &self.project.markers {
+            let color = Color::from_rgba(m.color.0, m.color.1, m.color.2, 1.0);
+            let x = self.view.x(m.at);
+            if m.duration > 0.0 {
+                let x1 = self.view.x(m.at + m.duration);
+                o.fill_rectangle(Point::new(x, 0.0), Size::new(x1 - x, h), Color { a: 0.05, ..color });
+            }
+            o.fill_rectangle(Point::new(x - 0.5, 0.0), Size::new(1.0, h), Color { a: 0.45, ..color });
         }
 
         // Drop preview for a library drag.
@@ -709,7 +859,7 @@ impl Lanes<'_> {
     fn filmstrip(&self, clip: &Clip) -> Option<(&crate::model::Asset, &super::media_cache::AssetMedia)> {
         let a = clip.asset().and_then(|a| self.project.asset(a))?;
         let m = self.media.get(a.id)?;
-        (a.is_visual() && !m.strip.is_empty()).then_some((a, m))
+        (self.project.clip_has_picture(clip) && !m.strip.is_empty()).then_some((a, m))
     }
 
     fn draw_clip_base(&self, f: &mut Frame, clip: &Clip, r: Rectangle, dim: bool) {
@@ -762,7 +912,7 @@ impl Lanes<'_> {
         let asset = clip.asset().and_then(|a| self.project.asset(a));
         let peaks = clip.asset().and_then(|a| self.media.get(a)).and_then(|m| m.peaks.clone());
         if let (Some(a), Some(peaks)) = (asset, peaks) {
-            if a.kind == MediaKind::Audio && !peaks.is_empty() {
+            if (a.kind == MediaKind::Audio || clip.part == crate::clip::Part::Sound) && !peaks.is_empty() {
                 let mid = r.y + r.height * 0.6;
                 let amp = r.height * 0.34 * (clip.audio.volume.min(2.0) as f32);
                 let wave_color = Color { a: if dim { 0.3 } else { 0.85 }, ..mix(color, Color::WHITE, 0.25) };
@@ -786,7 +936,7 @@ impl Lanes<'_> {
         }
 
         // Volume line (like Camtasia's audio envelope), shown once part of the clip is changed.
-        let audible = asset.is_some_and(|a| a.has_audio);
+        let audible = self.project.clip_has_sound(clip);
         if audible && !clip.audio.gains.is_empty() {
             let (x_start, x_end) = (inner.x.max(0.0), (inner.x + inner.width).min(f.size().width));
             let level = |v: f64| r.y + 5.0 + (1.0 - (v / 1.5).clamp(0.0, 1.0) as f32) * (r.height - 10.0);

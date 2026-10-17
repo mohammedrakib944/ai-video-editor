@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use crate::clip::Content;
-use crate::model::{MediaKind, Project, TrackKind};
+use crate::model::{Project, TrackKind};
 
 /// One input file for the mix, with the seek and length to read.
 pub struct AudioInput {
@@ -22,7 +22,7 @@ pub fn mix_graph(project: &Project, first_input: usize, total: f64) -> (Vec<Audi
         let Some(a) = project.asset(asset) else { continue };
         let Some(track) = project.track(clip.track) else { continue };
         // Muted audio tracks and hidden video tracks are silent.
-        let audible = a.has_audio && a.kind != MediaKind::Image && !clip.audio.muted && clip.audio.volume > 0.0 && !track.muted && !(track.kind == TrackKind::Visual && track.hidden);
+        let audible = project.clip_has_sound(clip) && !clip.audio.muted && clip.audio.volume > 0.0 && !track.muted && !(track.kind == TrackKind::Visual && track.hidden);
         if !audible || clip.start >= total {
             continue;
         }
@@ -52,7 +52,9 @@ pub fn mix_graph(project: &Project, first_input: usize, total: f64) -> (Vec<Audi
         graph = format!("anullsrc=r=48000:cl=stereo,atrim=duration={total:.6}[aout]");
     } else {
         let labels: String = (0..n).map(|i| format!("[a{i}]")).collect();
-        graph.push_str(&format!(";\n{labels}amix=inputs={n}:normalize=0:dropout_transition=0,apad,atrim=duration={total:.6}[aout]"));
+        // Pad up to the total only: an endless apad keeps FFmpeg generating silence while the
+        // video is still encoding, which slows long exports to a crawl.
+        graph.push_str(&format!(";\n{labels}amix=inputs={n}:normalize=0:dropout_transition=0,apad=whole_dur={total:.6},atrim=duration={total:.6}[aout]"));
     }
     (inputs, graph)
 }

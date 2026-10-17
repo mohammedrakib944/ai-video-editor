@@ -10,7 +10,7 @@ use iced_aw::DropDown;
 
 use crate::editor::{self, Editor, SideTab};
 use crate::model::{FILE_EXTENSION, Project};
-use crate::settings::{self, Settings};
+use crate::settings::Settings;
 use crate::start::{self, Start};
 use crate::ui::chrome::{self, WindowAction};
 use crate::ui::icons::{code, icon};
@@ -27,11 +27,13 @@ enum Screen {
 pub enum Message {
     Window(WindowAction),
     WindowResized,
+    WindowSize(iced::Size),
     Maximized(bool),
     Start(start::Message),
     Editor(editor::Message),
     AppMenu(bool),
     FormatMenu(bool),
+    ZoomMenu(bool),
     Autosave,
     NewProject,
     Open,
@@ -50,6 +52,10 @@ pub enum Message {
     AiChecked(crate::settings::AiProvider, Result<String, String>),
     /// Media dropped on the start screen: make a project from it.
     StartDrop(PathBuf),
+    OpenSettings,
+    Settings(crate::settings_dialog::Message),
+    /// Preview zoom from the toolbar menu (None = fit).
+    PreviewZoom(Option<f32>),
 }
 
 pub struct App {
@@ -58,10 +64,13 @@ pub struct App {
     maximized: bool,
     app_menu: bool,
     format_menu: bool,
+    zoom_menu: bool,
     ai_dialog: bool,
+    settings_dialog: bool,
     ai_checking: bool,
     ai_detail: Option<Result<String, String>>,
     error: Option<String>,
+    window_size: iced::Size,
 }
 
 impl App {
@@ -70,7 +79,7 @@ impl App {
             eprintln!("assistant server: {e}");
         }
         let error = (!crate::ffmpeg::is_available()).then(|| format!("FFmpeg was not found, so media can't be imported or previewed. {}", crate::ffmpeg::missing_hint()));
-        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, ai_dialog: false, ai_checking: false, ai_detail: None, error };
+        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, ai_dialog: false, settings_dialog: false, ai_checking: false, ai_detail: None, error, window_size: iced::Size::ZERO };
         let path = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file());
         let task = match path {
             Some(p) => Task::done(Message::OpenPicked(Some(p))),
@@ -79,10 +88,15 @@ impl App {
         (app, task.chain(snapshot_task()))
     }
 
+    /// The interface size from Settings.
+    pub fn scale_factor(&self) -> f32 {
+        self.settings.prefs.sane().ui_scale
+    }
+
     pub fn title(&self) -> String {
         match &self.screen {
-            Screen::Start(_) => "AI Video Editor".into(),
-            Screen::Editor(e) => format!("{}{} — AI Video Editor", e.project().name, if e.doc.is_dirty() { " •" } else { "" }),
+            Screen::Start(_) => "AI Video Studio".into(),
+            Screen::Editor(e) => format!("{}{} — AI Video Studio", e.project().name, if e.doc.is_dirty() { " •" } else { "" }),
         }
     }
 
@@ -90,7 +104,7 @@ impl App {
         let editor = match &self.screen {
             Screen::Editor(e) => {
                 // Save automatically a moment after each change.
-                let autosave = if e.doc.is_dirty() && e.path.is_some() { iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::Autosave) } else { Subscription::none() };
+                let autosave = if e.doc.is_dirty() && e.path.is_some() { iced::time::every(std::time::Duration::from_secs(self.settings.prefs.sane().autosave_seconds)).map(|_| Message::Autosave) } else { Subscription::none() };
                 Subscription::batch([e.subscription().map(Message::Editor), autosave])
             }
             Screen::Start(_) => event::listen_with(|event, _, _| match event {
@@ -98,7 +112,7 @@ impl App {
                 _ => None,
             }),
         };
-        Subscription::batch([window::resize_events().map(|_| Message::WindowResized), event::listen_with(shortcut), editor, crate::mcp::subscription().map(Message::Mcp)])
+        Subscription::batch([window::resize_events().map(|(_, size)| Message::WindowSize(size)), event::listen_with(shortcut), editor, crate::mcp::subscription().map(Message::Mcp)])
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -106,6 +120,13 @@ impl App {
             Message::Window(action) => return window_task(action).chain(Task::done(Message::WindowResized)),
             Message::WindowResized => return window::latest().and_then(window::is_maximized).map(Message::Maximized),
             Message::Maximized(m) => self.maximized = m,
+            Message::WindowSize(size) => {
+                self.window_size = size;
+                if let Screen::Editor(e) = &mut self.screen {
+                    let _ = e.update(editor::Message::WindowSize(size));
+                }
+                return window::latest().and_then(window::is_maximized).map(Message::Maximized);
+            }
             Message::Start(msg) => {
                 if let Screen::Start(start) = &mut self.screen {
                     start.update(&msg);
@@ -123,8 +144,30 @@ impl App {
             }
             Message::Editor(editor::Message::OpenAiConnect) | Message::OpenAi => self.ai_dialog = true,
             // The Connect AI dialog is modal: shortcuts don't edit the project behind it.
-            Message::Editor(ref m) if self.ai_dialog && editor::blocked_by_dialog(m) => {}
+            Message::Editor(ref m) if (self.ai_dialog || self.settings_dialog) && editor::blocked_by_dialog(m) => {}
             Message::Editor(editor::Message::Escape) if self.ai_dialog => self.ai_dialog = false,
+            Message::Editor(editor::Message::Escape) if self.settings_dialog => self.settings_dialog = false,
+            Message::OpenSettings => {
+                self.app_menu = false;
+                self.settings_dialog = true;
+            }
+            Message::Settings(crate::settings_dialog::Message::Close) => self.settings_dialog = false,
+            Message::Settings(crate::settings_dialog::Message::BrowseFolder) => {
+                let dir = self.settings.projects_dir();
+                return Task::perform(
+                    async move { rfd::AsyncFileDialog::new().set_title("Folder for new projects").set_directory(dir).pick_folder().await.map(|h| h.path().to_path_buf()) },
+                    |p| Message::Settings(crate::settings_dialog::Message::FolderPicked(p)),
+                );
+            }
+            Message::Settings(m) => {
+                if crate::settings_dialog::apply(&mut self.settings.prefs, &m) {
+                    self.settings.prefs = self.settings.prefs.sane();
+                    self.settings.save();
+                    if let Screen::Editor(e) = &mut self.screen {
+                        e.apply_prefs(&self.settings.prefs, false);
+                    }
+                }
+            }
             Message::Ai(msg) => match msg {
                 crate::ai_connect::Message::Close => self.ai_dialog = false,
                 crate::ai_connect::Message::Connect(provider) => {
@@ -178,6 +221,13 @@ impl App {
             }
             Message::AppMenu(open) => self.app_menu = open,
             Message::FormatMenu(open) => self.format_menu = open,
+            Message::ZoomMenu(open) => self.zoom_menu = open,
+            Message::PreviewZoom(z) => {
+                self.zoom_menu = false;
+                if let Screen::Editor(e) = &mut self.screen {
+                    let _ = e.update(editor::Message::PreviewZoom(z));
+                }
+            }
             Message::Autosave => {
                 if let Screen::Editor(e) = &mut self.screen {
                     if let (true, Some(path)) = (e.doc.is_dirty(), e.path.clone()) {
@@ -221,7 +271,7 @@ impl App {
                 self.app_menu = false;
                 let Screen::Editor(e) = &self.screen else { return Task::none() };
                 let name = format!("{}.{FILE_EXTENSION}", e.project().name);
-                let dir = settings::projects_dir();
+                let dir = self.settings.projects_dir();
                 return Task::perform(
                     async move {
                         let _ = std::fs::create_dir_all(&dir);
@@ -244,7 +294,8 @@ impl App {
             }
             Message::ToggleAssistant => {
                 if let Screen::Editor(e) = &mut self.screen {
-                    e.side_tab = if e.side_tab == SideTab::Assistant { SideTab::Inspector } else { SideTab::Assistant };
+                    let tab = if e.side_tab == SideTab::Assistant { SideTab::Inspector } else { SideTab::Assistant };
+                    return e.update(editor::Message::SideTab(tab)).map(Message::Editor);
                 }
             }
             Message::Mcp(call) => match &mut self.screen {
@@ -272,6 +323,7 @@ impl App {
     /// Saves the project (if it has a file) and the layout.
     fn persist(&mut self) {
         if let Screen::Editor(e) = &mut self.screen {
+            self.settings.inspector_collapsed = e.collapsed.clone();
             self.settings.layout = e.layout();
             if let (true, Some(path)) = (e.doc.is_dirty(), e.path.clone()) {
                 if e.doc.project.save(&path).is_ok() {
@@ -286,7 +338,7 @@ impl App {
         let Screen::Start(start) = &self.screen else { return Task::none() };
         let name = if start.name.trim().is_empty() { "Untitled project".to_string() } else { start.name.trim().to_string() };
         let project = Project::new(&name, start.canvas);
-        let dir = settings::projects_dir();
+        let dir = self.settings.projects_dir();
         let path = unique_path(&dir, &name);
         let saved = std::fs::create_dir_all(&dir).map_err(anyhow::Error::from).and_then(|_| project.save(&path));
         let path = match saved {
@@ -311,7 +363,11 @@ impl App {
         }
         let mut editor = Editor::new(project, path, self.settings.layout);
         editor.set_ai(self.settings.ai);
+        editor.apply_prefs(&self.settings.prefs, true);
+        editor.collapsed = self.settings.inspector_collapsed.clone();
+        let _ = editor.update(editor::Message::WindowSize(self.window_size));
         let task = editor.boot().map(Message::Editor);
+        let task = task.chain(window::latest().and_then(window::size).map(Message::WindowSize));
         self.screen = Screen::Editor(Box::new(editor));
         task
     }
@@ -359,9 +415,15 @@ impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let (left, center, right): (Element<'_, Message>, Element<'_, Message>, Element<'_, Message>) = match &self.screen {
             Screen::Start(_) => (
-                row![chrome::logo(), text("AI Video Editor").font(INTER_SEMIBOLD).size(T_BODY)].spacing(S2 + 2.0).align_y(Alignment::Center).into(),
+                row![chrome::logo(), text("AI Video Studio").font(INTER_SEMIBOLD).size(T_BODY)].spacing(S2 + 2.0).align_y(Alignment::Center).into(),
                 space().into(),
-                crate::ai_connect::chip(self.settings.ai, Message::OpenAi),
+                row![
+                    crate::ai_connect::chip(self.settings.ai, Message::OpenAi),
+                    widgets::tip(widgets::icon_button(code::SETTINGS, Some(Message::OpenSettings)), "Settings", Some("Ctrl+,"), iced::widget::tooltip::Position::Bottom),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .into(),
             ),
             Screen::Editor(e) => self.editor_title(e),
         };
@@ -381,8 +443,14 @@ impl App {
         }
         let mut window_content: Element<'_, Message> = content.into();
         if let Screen::Editor(e) = &self.screen {
-            if let Some(asset) = e.dnd.and_then(|id| e.project().asset(id)) {
-                let ghost = container(row![icon(code::FILM, 13), text(&asset.name).size(T_SMALL)].spacing(6).align_y(Alignment::Center)).padding([6, 10]).style(style::popover);
+            // What's being dragged: media from the library, or an effect.
+            let dragged = match (e.dnd.and_then(|id| e.project().asset(id)), e.effect_dnd) {
+                (Some(asset), _) => Some((code::FILM, asset.name.as_str())),
+                (None, Some(effect)) => Some((code::SPARKLES, effect.label())),
+                _ => None,
+            };
+            if let Some((glyph, label)) = dragged {
+                let ghost = container(row![icon(glyph, 13), text(label).size(T_SMALL)].spacing(6).align_y(Alignment::Center)).padding([6, 10]).style(style::popover);
                 let inset = if chrome::draws_frame(self.maximized) { chrome::SHADOW_INSET + 1.0 } else { 0.0 };
                 window_content = iced::widget::stack![
                     window_content,
@@ -390,6 +458,10 @@ impl App {
                 ]
                 .into();
             }
+        }
+        if self.settings_dialog {
+            let dialog = crate::settings_dialog::view(&self.settings.prefs, crate::settings::projects_dir()).map(Message::Settings);
+            window_content = iced::widget::stack![window_content, dialog].into();
         }
         if self.ai_dialog {
             let dialog = crate::ai_connect::view(crate::ai_connect::State {
@@ -416,6 +488,8 @@ impl App {
                 MenuItem::Separator,
                 MenuItem::new(code::SAVE, "Save", Message::Save).shortcut("Ctrl+S"),
                 MenuItem::new(code::COPY, "Save as…", Message::SaveAs).shortcut("Ctrl+Shift+S"),
+                MenuItem::Separator,
+                MenuItem::new(code::SLIDERS_HORIZONTAL, "Settings…", Message::OpenSettings).shortcut("Ctrl+,"),
                 MenuItem::Separator,
                 MenuItem::new(code::X, "Close project", Message::CloseProject),
                 MenuItem::new(code::ARROW_UP_RIGHT, "Quit", Message::Quit).shortcut("Ctrl+Q"),
@@ -469,13 +543,46 @@ impl App {
         .width(380)
         .padding(S4)
         .style(style::popover);
-        let center = DropDown::new(chip, panel, self.format_menu).on_dismiss(Message::FormatMenu(false)).width(iced::Length::Fixed(380.0)).alignment(iced_aw::drop_down::Alignment::Bottom).offset(8.0);
+        let format = DropDown::new(chip, panel, self.format_menu).on_dismiss(Message::FormatMenu(false)).width(iced::Length::Fixed(380.0)).alignment(iced_aw::drop_down::Alignment::Bottom).offset(8.0);
+
+        // Preview zoom: only changes how the canvas is shown, never the video's size.
+        let percent = e.preview_percent();
+        let zoom_label = if e.preview_fit() { format!("Fit · {percent:.0}%") } else { format!("{percent:.0}%") };
+        let zoom_chip = button(row![icon(code::SEARCH, 12).color(TEXT_3), text(zoom_label).font(INTER_MEDIUM).size(T_SMALL).color(TEXT_2), icon(code::CHEVRON_DOWN, 12).color(TEXT_3)].spacing(6).align_y(Alignment::Center))
+            .padding([5, 10])
+            .style(|t, s| {
+                let mut st = style::secondary(t, s);
+                if matches!(s, iced::widget::button::Status::Active) {
+                    st.background = Some(SURFACE_0.into());
+                    st.shadow = Default::default();
+                }
+                st
+            })
+            .on_press(Message::ZoomMenu(!self.zoom_menu));
+        const LABELS: [&str; 8] = ["25%", "50%", "75%", "100%", "150%", "200%", "300%", "400%"];
+        let level = |label: &'static str, z: Option<f32>, shortcut: Option<&'static str>| {
+            let current = match z {
+                None => e.preview_fit(),
+                Some(z) => !e.preview_fit() && (percent - z * 100.0).abs() < 0.5,
+            };
+            MenuItem::Action { icon: current.then_some(code::CHECK), label, shortcut, on_press: Some(Message::PreviewZoom(z)), danger: false }
+        };
+        let mut items = vec![level("Fit to window", None, Some("Ctrl+0")), MenuItem::Separator];
+        items.extend(editor::PREVIEW_ZOOMS.iter().zip(LABELS).map(|(&z, l)| level(l, Some(z), (z == 1.0).then_some("Ctrl+1"))));
+        let zoom_menu = DropDown::new(zoom_chip, widgets::menu(items, 190.0), self.zoom_menu)
+            .on_dismiss(Message::ZoomMenu(false))
+            .width(iced::Length::Fixed(190.0))
+            .alignment(iced_aw::drop_down::Alignment::Bottom)
+            .offset(8.0);
+        let center = row![format, zoom_menu].spacing(6).align_y(Alignment::Center);
         let pos = iced::widget::tooltip::Position::Bottom;
         let right = row![
             widgets::tip(widgets::icon_button(code::UNDO_2, e.doc.can_undo().then_some(Message::Editor(editor::Message::Undo))), e.doc.undo_label().unwrap_or("Undo"), Some("Ctrl+Z"), pos),
             widgets::tip(widgets::icon_button(code::REDO_2, e.doc.can_redo().then_some(Message::Editor(editor::Message::Redo))), e.doc.redo_label().unwrap_or("Redo"), Some("Ctrl+Shift+Z"), pos),
             container(widgets::vdivider(18.0)).padding([0, 6]),
             widgets::tip(crate::ai_connect::chip(self.settings.ai, Message::OpenAi), "AI connection", None, pos),
+            space().width(4),
+            widgets::tip(widgets::icon_button(code::SETTINGS, Some(Message::OpenSettings)), "Settings", Some("Ctrl+,"), pos),
             space().width(4),
             widgets::tip(widgets::icon_toggle(code::SPARKLES, e.side_tab == SideTab::Assistant, Message::ToggleAssistant), "Assistant", Some("Ctrl+K"), pos),
             space().width(6),
@@ -492,7 +599,8 @@ fn snapshot_task() -> Task<Message> {
     if !cfg!(debug_assertions) || std::env::var("STUDIO_SNAPSHOT").is_err() {
         return Task::none();
     }
-    let delay = std::env::var("STUDIO_SNAPSHOT_DELAY").ok().and_then(|d| d.parse().ok()).unwrap_or(5.0);
+    // At least 2 s, so every step below runs after the window is up (and no wait goes negative).
+    let delay: f64 = std::env::var("STUDIO_SNAPSHOT_DELAY").ok().and_then(|d| d.parse().ok()).unwrap_or(5.0_f64).max(2.0);
     // Optionally scroll the track list first (`STUDIO_SNAPSHOT_SCROLL=pixels`).
     let scroll: f32 = std::env::var("STUDIO_SNAPSHOT_SCROLL").ok().and_then(|d| d.parse().ok()).unwrap_or(0.0);
     let scroll_first = Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay)), move |_| Message::Editor(editor::Message::ScrollTracks(scroll)));
@@ -506,6 +614,8 @@ fn snapshot_task() -> Task<Message> {
     let open = match std::env::var("STUDIO_SNAPSHOT_OPEN").as_deref() {
         Ok("ai") => Task::done(Message::OpenAi),
         Ok("assistant") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::ToggleAssistant),
+        Ok("settings") => Task::done(Message::OpenSettings),
+        Ok("effects") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::LibraryTab(editor::LibraryTab::Transitions))),
         _ => Task::none(),
     };
     // `STUDIO_SNAPSHOT_SELECT=clip[,range_start,range_end]` selects a clip (and a range).
@@ -516,7 +626,27 @@ fn snapshot_task() -> Task<Message> {
         }
         _ => Task::none(),
     };
-    Task::batch([open, scroll_first, hscroll, select, shot])
+    // `STUDIO_SNAPSHOT_ZOOM=2` zooms the preview to 200% (`fit` fits it).
+    let zoom = match std::env::var("STUDIO_SNAPSHOT_ZOOM").ok().and_then(|z| z.parse::<f32>().ok()) {
+        Some(z) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.4)), move |_| Message::PreviewZoom(Some(z))),
+        None => Task::none(),
+    };
+    // `STUDIO_SNAPSHOT_CHAT=reply.md` shows a sample conversation with that reply.
+    let chat = match std::env::var("STUDIO_SNAPSHOT_CHAT").ok().and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(md) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), move |_| Message::Editor(editor::Message::DevChat("How should I structure the launch video?".into(), md.clone()))),
+        None => Task::none(),
+    };
+    // `STUDIO_SNAPSHOT_REOPEN=1` switches to the assistant tab last (after a selection opened the inspector).
+    let reopen = match std::env::var("STUDIO_SNAPSHOT_REOPEN") {
+        Ok(_) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.1)), |_| Message::ToggleAssistant),
+        Err(_) => Task::none(),
+    };
+    // `STUDIO_SNAPSHOT_SEEK=seconds` moves the playhead.
+    let seek = match std::env::var("STUDIO_SNAPSHOT_SEEK").ok().and_then(|d| d.parse::<f64>().ok()) {
+        Some(t) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.5)), move |_| Message::Editor(editor::Message::Seek(t))),
+        None => Task::none(),
+    };
+    Task::batch([open, scroll_first, hscroll, select, zoom, chat, reopen, seek, shot])
 }
 
 fn window_task(action: WindowAction) -> Task<Message> {
@@ -542,6 +672,9 @@ fn shortcut(event: Event, status: event::Status, _window: window::Id) -> Option<
         Key::Character("k") => Some(Message::ToggleAssistant),
         Key::Character("e") => Some(Message::Editor(editor::Message::OpenExport)),
         Key::Character("q") => Some(Message::Quit),
+        Key::Character(",") => Some(Message::OpenSettings),
+        Key::Character("0") => Some(Message::PreviewZoom(None)),
+        Key::Character("1") => Some(Message::PreviewZoom(Some(1.0))),
         Key::Named(key::Named::Escape) => Some(Message::AppMenu(false)),
         _ => None,
     }

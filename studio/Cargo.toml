@@ -10,7 +10,7 @@ name = "ai-video-studio"
 path = "src/main.rs"
 
 [dependencies]
-iced = { version = "0.14", features = ["advanced", "canvas", "image", "lazy", "tokio", "wgpu"] }
+iced = { version = "0.14", features = ["advanced", "canvas", "image", "lazy", "markdown", "tokio", "wgpu"] }
 anyhow = "1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

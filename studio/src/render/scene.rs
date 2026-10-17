@@ -43,7 +43,15 @@ pub struct LayerSpec {
     /// Outline: kind (0 rectangle, 1 ellipse, 2 triangle, 3 star, 4 hexagon, 5 ring),
     /// ring thickness in px, gradient kind (0 linear, 1 radial), gradient angle in radians.
     pub shape: [f32; 4],
+    /// Blurred areas: (u0, v0, u1, v1, radius u, radius v, feather, ellipse), radius 0 = unused.
+    pub blurs: [[f32; 8]; MAX_BLURS],
+    /// Video and images: blur clips above can blur this layer.
+    pub blurrable: bool,
+    /// A blur clip (drawn invisibly; it blurs the layers below): strength in canvas px, ellipse (1/0).
+    pub blur_box: Option<[f32; 2]>,
 }
+
+pub use crate::clip::MAX_BLURS;
 
 #[derive(Debug, Clone)]
 pub struct Scene {
@@ -66,6 +74,17 @@ pub fn evaluate(project: &Project, t: f64, size: (u32, u32), sources: &dyn Sourc
     for track in project.tracks.iter().rev().filter(|tr| tr.kind == TrackKind::Visual && !tr.hidden) {
         let Some(clip) = project.clips_on(track.id).find(|c| t >= c.start && t < c.end()) else { continue };
         if let Some(layer) = clip_layer(project, clip, t, w, h, unit, sources, playing) {
+            // A blur clip blurs the video and images already below it, then stays as an
+            // invisible layer so it can be picked and resized on the canvas.
+            if let Some([radius, ellipse]) = layer.blur_box {
+                if radius > 0.0 {
+                    for below in layers.iter_mut().filter(|l: &&mut LayerSpec| l.blurrable) {
+                        blur_under(below, layer.center, layer.size, radius, ellipse);
+                    }
+                }
+                layers.push(LayerSpec { opacity: 0.0, ..layer });
+                continue;
+            }
             layers.push(layer);
         }
     }
@@ -74,13 +93,16 @@ pub fn evaluate(project: &Project, t: f64, size: (u32, u32), sources: &dyn Sourc
 
 #[allow(clippy::too_many_arguments)]
 fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32, sources: &dyn Sources, playing: bool) -> Option<LayerSpec> {
+    if clip.part == clip::Part::Sound {
+        return None;
+    }
     let local = t - clip.start;
     let animated = |prop: Prop, base: f64| clip.keyframes.get(&prop).and_then(|k| clip::sample(k, local)).unwrap_or(base);
     let tr = &clip.transform;
     let mut x = animated(Prop::X, tr.x) as f32 * w;
     let mut y = animated(Prop::Y, tr.y) as f32 * h;
     let mut scale = animated(Prop::Scale, tr.scale) as f32;
-    let rotation = (animated(Prop::Rotation, tr.rotation) as f32).to_radians();
+    let rotation = if matches!(clip.content, Content::Blur(_)) { 0.0 } else { (animated(Prop::Rotation, tr.rotation) as f32).to_radians() };
     let mut opacity = animated(Prop::Opacity, tr.opacity) as f32;
     let mut uv = [0.0f32, 0.0, 1.0, 1.0];
 
@@ -154,12 +176,14 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
                 crate::clip::ShapeKind::Star => 3.0,
                 crate::clip::ShapeKind::Hexagon => 4.0,
                 crate::clip::ShapeKind::Ring => 5.0,
+                crate::clip::ShapeKind::Frame => 6.0,
             };
             shape = [kind, s.thickness as f32 * unit * scale, if s.radial { 1.0 } else { 0.0 }, (s.gradient_angle as f32).to_radians()];
             let top = [s.fill.0, s.fill.1, s.fill.2, s.fill.3];
             let bottom = s.fill_to.map(|c| [c.0, c.1, c.2, c.3]).unwrap_or(top);
             (None, natural, 0, top, bottom, false)
         }
+        Content::Blur(b) => (None, [(b.width as f32 * unit).max(1.0), (b.height as f32 * unit).max(1.0)], 0, [0.0; 4], [0.0; 4], false),
     };
 
     // Media fits the canvas; text and shapes keep their own size.
@@ -174,14 +198,28 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
     };
     let mut size = [base[0] * scale, base[1] * scale];
 
-    // Camtasia-style zoom: magnify part of the frame inside the clip's own bounds.
+    // Crop: show part of the frame and leave that part where it was.
+    let crop = if is_media { clip.crop.clamped() } else { clip::Crop::default() };
+    if !crop.is_none() {
+        let (cl, ct, cr, cb) = (crop.left as f32, crop.top as f32, crop.right as f32, crop.bottom as f32);
+        let full = size;
+        size = [full[0] * (1.0 - cl - cr), full[1] * (1.0 - ct - cb)];
+        let (s, c) = rotation.sin_cos();
+        let (dx, dy) = ((cl - cr) / 2.0 * full[0], (ct - cb) / 2.0 * full[1]);
+        x += dx * c - dy * s;
+        y += dx * s + dy * c;
+        uv = [cl, ct, 1.0 - cr, 1.0 - cb];
+    }
+
+    // Camtasia-style zoom: magnify part of the (cropped) frame inside the clip's own bounds.
     if !clip.zooms.is_empty() {
         let cam = clip::camera_at(&clip.zooms, local);
         let span = 1.0 / cam.scale.max(1.0) as f32;
         let half = span / 2.0;
         let cx = (cam.focus_x as f32).clamp(half, 1.0 - half);
         let cy = (cam.focus_y as f32).clamp(half, 1.0 - half);
-        uv = [cx - half, cy - half, cx + half, cy + half];
+        let (u0, v0, du, dv) = (uv[0], uv[1], uv[2] - uv[0], uv[3] - uv[1]);
+        uv = [u0 + (cx - half) * du, v0 + (cy - half) * dv, u0 + (cx + half) * du, v0 + (cy + half) * dv];
     }
 
     // Transition into this clip.
@@ -235,7 +273,41 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
         tint_bottom,
         grade: [g.brightness as f32, g.contrast as f32, g.saturation as f32, g.temperature as f32],
         shape,
+        blurs: [[0.0; 8]; MAX_BLURS],
+        blurrable: is_media,
+        blur_box: match clip.content {
+            // Strength 100 is a 60 px radius at 1080p; it fades in and out with the clip.
+            Content::Blur(b) => {
+                let fade = clip::BLUR_FADE.min(clip.duration / 2.0).max(1e-4);
+                let edge = (local / fade).min((clip.duration - local) / fade).clamp(0.0, 1.0) as f32;
+                Some([b.strength.clamp(0.0, 100.0) as f32 * 0.6 * unit * edge * opacity.clamp(0.0, 1.0), if b.ellipse { 1.0 } else { 0.0 }])
+            }
+            _ => None,
+        },
     })
+}
+
+/// Blurs the part of `target` under a blur box (canvas pixels), through the layer's
+/// rotation, crop and zoom, in the first free blur slot.
+fn blur_under(target: &mut LayerSpec, center: [f32; 2], size: [f32; 2], radius: f32, ellipse: f32) {
+    let Some(slot) = target.blurs.iter_mut().find(|b| b[4] == 0.0) else { return };
+    let [u0, v0, u1, v1] = target.uv;
+    let (s, c) = (-target.rotation).sin_cos();
+    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        let (px, py) = (center[0] + dx * size[0] / 2.0 - target.center[0], center[1] + dy * size[1] / 2.0 - target.center[1]);
+        // Into the layer's own (unrotated) box, then into its source texture.
+        let (lx, ly) = (px * c - py * s, px * s + py * c);
+        let (fx, fy) = (lx / target.size[0].max(1e-3) + 0.5, ly / target.size[1].max(1e-3) + 0.5);
+        let (sx, sy) = (u0 + fx * (u1 - u0), v0 + fy * (v1 - v0));
+        (lo, hi) = ([lo[0].min(sx), lo[1].min(sy)], [hi[0].max(sx), hi[1].max(sy)]);
+    }
+    // Nothing to do if the box misses the visible part of the layer.
+    if hi[0] <= u0.min(u1) || lo[0] >= u0.max(u1) || hi[1] <= v0.min(v1) || lo[1] >= v0.max(v1) {
+        return;
+    }
+    let (ru, rv) = (radius / target.size[0].max(1e-3) * (u1 - u0).abs(), radius / target.size[1].max(1e-3) * (v1 - v0).abs());
+    *slot = [lo[0], lo[1], hi[0], hi[1], ru.max(1e-5), rv.max(1e-5), 0.003, ellipse];
 }
 
 /// Text layers get their own texture slots, separate from media clip ids.
@@ -292,6 +364,52 @@ mod tests {
         assert_eq!(s.layers[0].uv, [0.0, 0.5, 0.5, 1.0], "focus is clamped so the crop stays inside the frame");
         let early = evaluate(&p, 0.2, (1920, 1080), &NoSources, false);
         assert!(early.layers[0].opacity < 0.9);
+    }
+
+    #[test]
+    fn crop_keeps_the_rest_of_the_frame_in_place() {
+        let (mut p, c) = project();
+        p.clip_mut(c).unwrap().crop = clip::Crop { left: 0.25, top: 0.0, right: 0.0, bottom: 0.5 };
+        let l = &evaluate(&p, 1.0, (1920, 1080), &NoSources, false).layers[0];
+        assert_eq!(l.size, [1440.0, 540.0], "a quarter cut from the left, half from the bottom");
+        assert_eq!(l.center, [1920.0 * 0.625, 270.0], "what's left stays where it was");
+        assert_eq!(l.uv, [0.25, 0.0, 1.0, 0.5]);
+    }
+
+    #[test]
+    fn zoom_happens_inside_the_crop() {
+        let (mut p, c) = project();
+        let clip = p.clip_mut(c).unwrap();
+        clip.crop = clip::Crop { left: 0.5, top: 0.0, right: 0.0, bottom: 0.0 };
+        clip.zooms.push(Zoom { id: 9, at: 0.0, duration: 4.0, scale: 2.0, focus_x: 0.5, focus_y: 0.5, ramp: 0.1 });
+        let l = &evaluate(&p, 2.0, (1920, 1080), &NoSources, false).layers[0];
+        assert_eq!(l.uv, [0.625, 0.25, 0.875, 0.75], "the zoom magnifies the middle of the cropped part");
+    }
+
+    #[test]
+    fn a_blur_clip_blurs_only_its_box_and_only_while_it_is_on() {
+        let (mut p, _) = project();
+        let b = p.add_blur_clip(None, 2.0, 3.0, clip::BlurLayer { width: 480.0, height: 270.0, strength: 50.0, ellipse: true }).unwrap();
+        (p.clip_mut(b).unwrap().transform.x, p.clip_mut(b).unwrap().transform.y) = (0.25, 0.5);
+        let before = evaluate(&p, 1.0, (1920, 1080), &NoSources, false);
+        assert_eq!(before.layers.len(), 1);
+        assert_eq!(before.layers[0].blurs[0][4], 0.0, "no blur before the blur clip starts");
+        let during = evaluate(&p, 3.0, (1920, 1080), &NoSources, false);
+        let (video, blur) = (&during.layers[0], &during.layers[1]);
+        let r = video.blurs[0];
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        assert!(near(r[0], 0.125) && near(r[1], 0.375) && near(r[2], 0.375) && near(r[3], 0.625), "the box, in the footage's coordinates: {r:?}");
+        assert!(r[4] > 0.0 && r[7] == 1.0, "has a radius and is an ellipse");
+        assert_eq!(video.blurs[1][4], 0.0, "unused slots have no radius");
+        assert_eq!(blur.opacity, 0.0, "the blur clip itself draws nothing");
+        assert_eq!(evaluate(&p, 6.0, (1920, 1080), &NoSources, false).layers[0].blurs[0][4], 0.0, "and none after it ends");
+    }
+
+    #[test]
+    fn separated_sound_is_not_drawn() {
+        let (mut p, c) = project();
+        p.clip_mut(c).unwrap().part = clip::Part::Sound;
+        assert!(evaluate(&p, 1.0, (1920, 1080), &NoSources, false).layers.is_empty());
     }
 
     #[test]

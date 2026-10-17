@@ -165,6 +165,9 @@ pub struct FrameServer {
     max_width: Cell<u32>,
     /// Set by background threads when new pixels arrive.
     signal: Arc<AtomicBool>,
+    /// During playback: video frames asked for, and how many were shown late (Auto quality).
+    frames_asked: Cell<u32>,
+    frames_late: Cell<u32>,
 }
 
 impl Default for FrameServer {
@@ -177,6 +180,8 @@ impl Default for FrameServer {
             texts: RefCell::default(),
             max_width: Cell::new(1280),
             signal: Arc::default(),
+            frames_asked: Cell::new(0),
+            frames_late: Cell::new(0),
         }
     }
 }
@@ -190,6 +195,11 @@ impl FrameServer {
 
     pub fn bind<'a>(&'a self, project: &'a Project) -> Bound<'a> {
         Bound { server: self, project }
+    }
+
+    /// Frames asked for during playback and how many were late, since the last call.
+    pub fn take_lag(&self) -> (u32, u32) {
+        (self.frames_asked.replace(0), self.frames_late.replace(0))
     }
 
     /// Whether frames are still being decoded for the last request.
@@ -268,7 +278,14 @@ impl Sources for Bound<'_> {
             dec.shared.wake.notify_all();
         }
         let half = dec.shared.frame_dur * 0.5;
-        let pick = s.frames.iter().rev().find(|f| f.pts <= src_time + half).or_else(|| s.frames.front()).map(|f| f.frame.clone());
+        let timed = s.frames.iter().rev().find(|f| f.pts <= src_time + half).or_else(|| s.frames.front());
+        if playing {
+            // Late: nothing decoded yet, or the newest frame is a few frames behind.
+            let late = timed.is_none_or(|f| f.pts < src_time - dec.shared.frame_dur * 2.5);
+            server.frames_asked.set(server.frames_asked.get() + 1);
+            server.frames_late.set(server.frames_late.get() + late as u32);
+        }
+        let pick = timed.map(|f| f.frame.clone());
         if let Some(f) = &pick {
             s.last = Some(f.clone());
         }

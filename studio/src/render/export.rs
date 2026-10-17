@@ -17,7 +17,7 @@ use super::{audio, scene};
 use crate::ffmpeg;
 use crate::model::Project;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Quality {
     High,
     Standard,
@@ -214,7 +214,7 @@ impl Offscreen {
     pub fn render(&mut self, scene: &scene::Scene, out: &mut Vec<u8>) -> anyhow::Result<()> {
         let (w, h) = self.size;
         let gpu = &self.gpu;
-        self.compositor.prepare(&gpu.device, &gpu.queue, scene, 1.0);
+        self.compositor.prepare(&gpu.device, &gpu.queue, scene, 1.0, Compositor::full_view(w, h));
         let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("offscreen") });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -371,6 +371,49 @@ mod tests {
         let out2 = dir.join("cancelled.mp4");
         assert!(export(&p, &out2, Quality::Small, &cancel, &|_| {}).is_err());
         assert!(!out2.exists() && !dir.join("cancelled.mp4.part").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// RMS level (dB) of a file's audio between `from` and `to` seconds.
+    fn rms_db(path: &Path, from: f64, to: f64) -> f64 {
+        let out = ffmpeg::ffmpeg().unwrap().args(["-ss", &ffmpeg::secs(from), "-t", &ffmpeg::secs(to - from), "-i"]).arg(path).args(["-vn", "-af", "astats", "-f", "null", "-"]).args(["-loglevel", "info"]).output().unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        log.lines().filter_map(|l| l.split("RMS level dB:").nth(1)).last().and_then(|v| v.trim().parse().ok()).expect("astats output")
+    }
+
+    #[test]
+    fn long_1080p_export_with_short_separated_audio_finishes_and_plays_it_once() {
+        let dir = std::env::temp_dir().join(format!("studio-export-long-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        let ok = ffmpeg::ffmpeg()
+            .unwrap()
+            .args(["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30:duration=2", "-f", "lavfi", "-i", "sine=frequency=330:duration=2"])
+            .args(["-pix_fmt", "yuv420p", "-c:a", "aac", "-ac", "2", "-shortest", "-y"])
+            .arg(&src)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let mut p = Project::new("t", Canvas::default());
+        let a = p.add_asset(&src, &crate::media::probe(&src).unwrap());
+        let v = p.add_media_clip(a, None, 0.0).unwrap();
+        p.separate_audio(v).unwrap();
+        // Text runs on to 10 s, long after the sound ends at 2 s.
+        p.add_text_clip(None, 0.0, 10.0, TextLayer::default()).unwrap();
+
+        let out = dir.join("out.mp4");
+        let started = Instant::now();
+        export(&p, &out, Quality::Small, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert!(started.elapsed().as_secs() < 90, "export took {:?}", started.elapsed());
+        let info = probe_json(&out);
+        for s in info["streams"].as_array().unwrap() {
+            let d: f64 = s["duration"].as_str().unwrap().parse().unwrap();
+            assert!((d - 10.0).abs() < 0.1, "{} stream lasts {d}", s["codec_type"]);
+        }
+        let (exported, source) = (rms_db(&out, 0.3, 1.7), rms_db(&src, 0.3, 1.7));
+        assert!((exported - source).abs() < 1.5, "the separated sound plays once: {exported:.1} dB vs {source:.1} dB");
+        assert!(rms_db(&out, 3.0, 9.0) < -80.0, "silence after the sound ends");
         std::fs::remove_dir_all(dir).ok();
     }
 }

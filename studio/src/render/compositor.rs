@@ -8,8 +8,8 @@ use iced::wgpu;
 use super::scene::{LayerSpec, Scene};
 
 /// Uniforms per layer, padded to the dynamic-offset alignment.
-const STRIDE: u64 = 256;
-const UNIFORM_SIZE: u64 = 176;
+const STRIDE: u64 = 512;
+const UNIFORM_SIZE: u64 = 320;
 
 struct Slot {
     texture: wgpu::Texture,
@@ -35,6 +35,11 @@ pub struct Compositor {
 }
 
 impl Compositor {
+    /// The `view` that fills a whole render target with the canvas.
+    pub fn full_view(width: u32, height: u32) -> [f32; 4] {
+        [2.0 / width.max(1) as f32, -1.0, -2.0 / height.max(1) as f32, 1.0]
+    }
+
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Compositor {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("layer"), source: wgpu::ShaderSource::Wgsl(include_str!("layer.wgsl").into()) });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -105,7 +110,8 @@ impl Compositor {
     }
 
     /// Uploads textures and per-layer uniforms. `aa` is canvas pixels per screen pixel.
-    pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &Scene, aa: f32) {
+    /// `view` maps canvas pixels to clip space: x * view[0] + view[1], y * view[2] + view[3].
+    pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &Scene, aa: f32, view: [f32; 4]) {
         self.frame_no += 1;
         let count = scene.layers.len() as u64 + 1;
         if count > self.capacity {
@@ -138,6 +144,9 @@ impl Compositor {
             tint_bottom: scene.background,
             grade: [0.0; 4],
             shape: [0.0, 0.0, 0.0, std::f32::consts::PI],
+            blurs: [[0.0; 8]; super::scene::MAX_BLURS],
+            blurrable: false,
+            blur_box: None,
         };
         let mut staging = vec![0u8; (count * STRIDE) as usize];
         self.draws.clear();
@@ -168,7 +177,8 @@ impl Compositor {
                 layer.slot
             });
             let pad = if layer.shadow_color[3] > 0.0 { layer.shadow_blur * 2.0 + layer.shadow_y.abs() + 2.0 } else { 2.0 * aa };
-            let u: [f32; 44] = [
+            let mut u = [0.0f32; 80];
+            u[..48].copy_from_slice(&[
                 layer.center[0], layer.center[1], layer.size[0] / 2.0, layer.size[1] / 2.0,
                 layer.rotation, layer.opacity, layer.radius, layer.border,
                 layer.shadow_blur, layer.shadow_y, pad, aa,
@@ -180,7 +190,13 @@ impl Compositor {
                 layer.grade[0], layer.grade[1], layer.grade[2], layer.grade[3],
                 w, h, if self.srgb_target { 1.0 } else { 0.0 }, if has_texture { 1.0 } else { 0.0 },
                 layer.shape[0], layer.shape[1], layer.shape[2], layer.shape[3],
-            ];
+                view[0], view[1], view[2], view[3],
+            ]);
+            for (i, b) in layer.blurs.iter().enumerate() {
+                // The shader keeps the four rects, then the four parameter sets.
+                u[48 + i * 4..52 + i * 4].copy_from_slice(&b[..4]);
+                u[64 + i * 4..68 + i * 4].copy_from_slice(&b[4..]);
+            }
             let offset = i as u64 * STRIDE;
             staging[offset as usize..(offset + UNIFORM_SIZE) as usize].copy_from_slice(bytemuck::cast_slice(&u));
             self.draws.push((key, offset as u32));

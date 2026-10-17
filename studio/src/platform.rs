@@ -17,3 +17,15 @@ pub fn open(path: &Path) {
     #[cfg(not(windows))]
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
+
+/// Opens a web link in the default browser. Only http(s) and mailto links are opened.
+pub fn open_url(url: &str) {
+    let lower = url.trim().to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")) {
+        return;
+    }
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(url.trim()).spawn();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("xdg-open").arg(url.trim()).spawn();
+}

@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::clip::Clip;
 
 pub const FILE_EXTENSION: &str = "aivp";
-pub const FORMAT_VERSION: u32 = 1;
+/// 2: crop, separated audio, blur clips, timeline markers. Version 1 files still open.
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Aspect {
@@ -156,6 +157,18 @@ pub struct Track {
     pub height: Option<f32>,
 }
 
+/// A colored note on the timeline: a point in time, or a span when `duration` > 0.
+/// Markers are for finding your way around; they don't appear in the video.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Marker {
+    pub id: Id,
+    pub at: f64,
+    #[serde(default)]
+    pub duration: f64,
+    pub name: String,
+    pub color: crate::clip::Rgba,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub version: u32,
@@ -166,12 +179,14 @@ pub struct Project {
     pub tracks: Vec<Track>,
     #[serde(default)]
     pub clips: Vec<Clip>,
+    #[serde(default)]
+    pub markers: Vec<Marker>,
     pub next_id: Id,
 }
 
 impl Project {
     pub fn new(name: &str, canvas: Canvas) -> Project {
-        let mut p = Project { version: FORMAT_VERSION, name: name.to_string(), canvas, assets: Vec::new(), tracks: Vec::new(), clips: Vec::new(), next_id: 1 };
+        let mut p = Project { version: FORMAT_VERSION, name: name.to_string(), canvas, assets: Vec::new(), tracks: Vec::new(), clips: Vec::new(), markers: Vec::new(), next_id: 1 };
         for (name, kind) in [("Text", TrackKind::Visual), ("Overlay", TrackKind::Visual), ("Main", TrackKind::Visual), ("Voiceover", TrackKind::Audio), ("Music", TrackKind::Audio)] {
             p.add_track(kind, name, None);
         }

@@ -58,6 +58,77 @@ impl Default for Transform {
     }
 }
 
+/// Cropping, as fractions of the source frame cut from each edge.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Crop {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+}
+
+impl Crop {
+    /// Largest total crop on one axis, so something always stays visible.
+    pub const MAX: f64 = 0.95;
+
+    pub fn is_none(&self) -> bool {
+        *self == Crop::default()
+    }
+
+    /// The same crop with every edge in range and opposite edges leaving at least 5% visible.
+    pub fn clamped(self) -> Crop {
+        let c = |v: f64| v.clamp(0.0, Crop::MAX);
+        let (mut l, mut t, mut r, mut b) = (c(self.left), c(self.top), c(self.right), c(self.bottom));
+        if l + r > Crop::MAX {
+            let k = Crop::MAX / (l + r);
+            (l, r) = (l * k, r * k);
+        }
+        if t + b > Crop::MAX {
+            let k = Crop::MAX / (t + b);
+            (t, b) = (t * k, b * k);
+        }
+        Crop { left: l, top: t, right: r, bottom: b }
+    }
+}
+
+/// A blur clip: blurs the video and images under it, inside its box, while it's on
+/// the timeline. It sits on a video track like a highlight; position comes from the
+/// clip's transform, the box size is in canvas units.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BlurLayer {
+    pub width: f64,
+    pub height: f64,
+    /// 0..100.
+    pub strength: f64,
+    #[serde(default)]
+    pub ellipse: bool,
+}
+
+impl Default for BlurLayer {
+    fn default() -> Self {
+        BlurLayer { width: 560.0, height: 200.0, strength: 60.0, ellipse: false }
+    }
+}
+
+/// Seconds a blur takes to fade in and out at the ends of its clip.
+pub const BLUR_FADE: f64 = 0.15;
+
+/// Most blur boxes that can cover one layer at the same moment.
+pub const MAX_BLURS: usize = 4;
+
+/// Which part of a video clip plays: after "Separate audio" the picture and the
+/// sound are two clips of the same media.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum Part {
+    #[default]
+    Whole,
+    /// Picture only (its sound was separated).
+    Picture,
+    /// Sound only, on an audio track.
+    Sound,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Shadow {
@@ -354,6 +425,8 @@ pub enum ShapeKind {
     Hexagon,
     /// An outlined ellipse.
     Ring,
+    /// An outlined (rounded) rectangle.
+    Frame,
 }
 
 impl std::fmt::Display for ShapeKind {
@@ -363,7 +436,7 @@ impl std::fmt::Display for ShapeKind {
 }
 
 impl ShapeKind {
-    pub const ALL: [ShapeKind; 6] = [ShapeKind::Rectangle, ShapeKind::Ellipse, ShapeKind::Triangle, ShapeKind::Star, ShapeKind::Hexagon, ShapeKind::Ring];
+    pub const ALL: [ShapeKind; 7] = [ShapeKind::Rectangle, ShapeKind::Ellipse, ShapeKind::Triangle, ShapeKind::Star, ShapeKind::Hexagon, ShapeKind::Ring, ShapeKind::Frame];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -373,6 +446,7 @@ impl ShapeKind {
             ShapeKind::Star => "Star",
             ShapeKind::Hexagon => "Hexagon",
             ShapeKind::Ring => "Ring",
+            ShapeKind::Frame => "Frame",
         }
     }
 }
@@ -400,7 +474,7 @@ pub struct ShapeLayer {
     /// A radial gradient from the center instead of a linear one.
     #[serde(default)]
     pub radial: bool,
-    /// Outline thickness for rings, canvas units.
+    /// Outline thickness for rings and frames, canvas units.
     #[serde(default = "default_thickness")]
     pub thickness: f64,
 }
@@ -417,6 +491,7 @@ pub enum Content {
     Media { asset: Id, src_in: f64, speed: f64 },
     Text(TextLayer),
     Shape(ShapeLayer),
+    Blur(BlurLayer),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -447,6 +522,10 @@ pub struct Clip {
     pub outro: Option<Motion>,
     #[serde(default)]
     pub transition: Option<Transition>,
+    #[serde(default)]
+    pub crop: Crop,
+    #[serde(default)]
+    pub part: Part,
 }
 
 impl Clip {
@@ -467,6 +546,8 @@ impl Clip {
             intro: None,
             outro: None,
             transition: None,
+            crop: Crop::default(),
+            part: Part::Whole,
         }
     }
 
@@ -535,6 +616,15 @@ mod tests {
         assert_eq!(sample(&keys, 1.0), Some(5.0));
         assert_eq!(sample(&keys, 3.0), Some(10.0));
         assert_eq!(sample(&[], 1.0), None);
+    }
+
+    #[test]
+    fn crop_always_leaves_part_of_the_frame() {
+        let c = Crop { left: 0.8, top: -0.2, right: 0.6, bottom: 0.3 }.clamped();
+        assert!((c.left + c.right - Crop::MAX).abs() < 1e-9, "opposite edges are scaled back");
+        assert!(c.left > c.right, "keeping their proportions");
+        assert_eq!((c.top, c.bottom), (0.0, 0.3));
+        assert!(Crop::default().is_none());
     }
 
     #[test]

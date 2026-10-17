@@ -10,6 +10,7 @@ mod edit;
 mod editor;
 mod ffmpeg;
 mod fonts;
+mod icon;
 mod mcp;
 mod media;
 mod model;
@@ -17,6 +18,7 @@ mod platform;
 mod playback;
 mod render;
 mod settings;
+mod settings_dialog;
 mod sfx;
 mod start;
 mod ui;
@@ -37,12 +39,33 @@ fn prefer_xwayland() {
     }
 }
 
+/// `ai-video-studio --write-icons DIR` writes the app icon as PNGs (every size) and a
+/// Windows `.ico` into DIR, for packaging, then exits.
+fn write_icons(dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    for size in icon::SIZES {
+        let path = dir.join(format!("ai-video-studio-{size}.png"));
+        image::save_buffer(&path, &icon::rgba(size), size, size, image::ExtendedColorType::Rgba8).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    std::fs::write(dir.join("ai-video-studio.ico"), icon::ico()).map_err(|e| e.to_string())
+}
+
 fn main() -> iced::Result {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--write-icons") {
+        let dir = std::path::PathBuf::from(args.get(2).map(String::as_str).unwrap_or("icons"));
+        if let Err(e) = write_icons(&dir) {
+            eprintln!("Couldn't write the icons: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     #[cfg(target_os = "linux")]
     prefer_xwayland();
     let mut application = iced::application(app::App::new, app::App::update, app::App::view)
         .title(app::App::title)
         .subscription(app::App::subscription)
+        .scale_factor(app::App::scale_factor)
         .theme(theme())
         .default_font(tokens::INTER)
         .antialiasing(true)
@@ -73,6 +96,7 @@ fn window_settings() -> window::Settings {
         min_size: Some(Size::new(1100.0, 680.0)),
         decorations: false,
         transparent: false,
+        icon: window::icon::from_rgba(icon::rgba(128), 128, 128).ok(),
         platform_specific: platform_specific(),
         ..Default::default()
     }

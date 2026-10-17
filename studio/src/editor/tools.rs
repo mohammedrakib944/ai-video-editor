@@ -111,17 +111,17 @@ pub fn schemas() -> Vec<Value> {
             "Add a rectangle or ellipse (cards, highlights, backgrounds). Returns the clip id.",
             merged(&[style_props()], json!({
                 "start": num("Timeline seconds"), "duration": num("Seconds (default 4)"),
-                "shape": choice(&["rectangle", "ellipse", "triangle", "star", "hexagon", "ring"], "Default rectangle (use corner_radius for rounded cards and pills)"),
+                "shape": choice(&["rectangle", "ellipse", "triangle", "star", "hexagon", "ring", "frame"], "Default rectangle (use corner_radius for rounded cards and pills). ring and frame are outlines: use them, in a bright color, to circle or box part of the picture"),
                 "width": num("Canvas units"), "height": num("Canvas units"),
                 "color": string("#RRGGBB fill"), "color_to": string("#RRGGBB second color for a gradient"),
                 "gradient": choice(&["linear", "radial"], "Gradient style when color_to is set"),
                 "gradient_angle": num("Linear gradient direction in degrees: 180 top→bottom, 90 left→right"),
-                "thickness": num("Ring outline thickness, canvas units"),
+                "thickness": num("Outline thickness for ring and frame, canvas units"),
                 "track_id": int("Optional video track"),
             })),
             &["start", "width", "height", "color"],
         ),
-        tool("update_clip", "Change any properties of a clip. Only the fields you pass change.", merged(&[style_props(), text_props()], json!({ "clip_id": int(""), "name": string("Label on the timeline"), "speed": num("Playback speed, 0.25–4 (video/audio)") })), &["clip_id"]),
+        tool("update_clip", "Change any properties of a clip. Only the fields you pass change.", merged(&[style_props(), text_props()], json!({ "clip_id": int(""), "name": string("Label on the timeline"), "speed": num("Playback speed, 0.25–4 (video/audio)"), "crop_left": num("Video/image crop: fraction of the source frame cut from the left (0–0.95); the rest stays in place"), "crop_right": num("Fraction cut from the right"), "crop_top": num("Fraction cut from the top"), "crop_bottom": num("Fraction cut from the bottom") })), &["clip_id"]),
         tool("move_clip", "Move a clip to a new start time (and optionally another track of the same kind).", json!({ "clip_id": int(""), "start": num("Timeline seconds"), "track_id": int("Optional") }), &["clip_id", "start"]),
         tool("trim_clip", "Change where a clip starts and/or ends on the timeline (media can't extend past its source).", json!({ "clip_id": int(""), "start": num("New start, timeline seconds"), "end": num("New end, timeline seconds") }), &["clip_id"]),
         tool("split_clip", "Split clips at a time. Without clip_id, splits every clip under that time.", json!({ "time": num("Timeline seconds"), "clip_id": int("Optional") }), &["time"]),
@@ -155,6 +155,17 @@ pub fn schemas() -> Vec<Value> {
             json!({ "clip_id": int(""), "start": num("Timeline seconds"), "end": num("Timeline seconds"), "volume": num("0 = silent, 0.3 = ducked, 1 = original, up to 2") }),
             &["clip_id", "start", "end", "volume"],
         ),
+        tool(
+            "add_blur",
+            "Blur part of the picture for a time range (faces, emails, passwords): a blur clip on a video track that blurs the video and images under it, only inside its box and only between start and end. Move or trim it like any clip (move_clip, trim_clip); remove it with delete_clips. Returns the clip id.",
+            json!({ "start": num("Timeline seconds"), "end": num("Timeline seconds (default start + 3)"), "x": num("Box center, fraction of the canvas width"), "y": num("Box center, fraction of the canvas height"), "width": num("Fraction of the canvas width"), "height": num("Fraction of the canvas height"), "strength": num("0–100, default 60"), "ellipse": boolean("Oval instead of a box"), "track_id": int("Optional video track; it must be above the footage to blur (default: a free top track)") }),
+            &["start", "x", "y", "width", "height"],
+        ),
+        tool("update_blur", "Change a blur clip's box or strength. Only the fields you pass change. Change its timing with move_clip / trim_clip.", json!({ "clip_id": int(""), "x": num("Canvas fraction"), "y": num("Canvas fraction"), "width": num("Canvas fraction"), "height": num("Canvas fraction"), "strength": num("0–100"), "ellipse": boolean("") }), &["clip_id"]),
+        tool("separate_audio", "Put the sound of a video clip on an audio track of its own (same timing and volume); the video keeps playing silently. Returns the new audio clip id.", json!({ "clip_id": int("") }), &["clip_id"]),
+        tool("add_marker", "Add a timeline marker: a colored flag at a time, or a span when duration > 0. Markers organize the edit (sections, notes); they don't show in the video. Returns the marker id.", json!({ "time": num("Timeline seconds"), "duration": num("Seconds, 0 for a point (default)"), "name": string("Label"), "color": string("#RRGGBB") }), &["time"]),
+        tool("update_marker", "Change a timeline marker.", json!({ "marker_id": int(""), "time": num(""), "duration": num(""), "name": string(""), "color": string("#RRGGBB") }), &["marker_id"]),
+        tool("delete_marker", "Remove a timeline marker.", json!({ "marker_id": int("") }), &["marker_id"]),
         tool("add_sound", "Add a built-in sound effect on an audio track. Sounds: whoosh, swoosh, pop, click, ding, riser, impact, typing, chime.", json!({ "sound": choice(&["whoosh", "swoosh", "pop", "click", "ding", "riser", "impact", "typing", "chime"], ""), "start": num("Timeline seconds"), "volume": num("0–2, default 1") }), &["sound", "start"]),
         tool("add_track", "Add a track.", json!({ "kind": choice(&["video", "audio"], ""), "name": string("") }), &["kind"]),
         tool("rename_track", "Rename a track.", json!({ "track_id": int(""), "name": string("") }), &["track_id", "name"]),
@@ -319,6 +330,17 @@ fn apply_props(c: &mut Clip, a: &Value) -> anyhow::Result<()> {
     if let (Some(d), Some(t)) = (f(a, "transition_duration"), c.transition.as_mut()) {
         t.duration = d.clamp(0.05, half);
     }
+    if ["crop_left", "crop_right", "crop_top", "crop_bottom"].iter().any(|k| a.get(*k).is_some()) {
+        anyhow::ensure!(matches!(c.content, Content::Media { .. }), "Only video and image clips can be cropped");
+        let k = c.crop;
+        c.crop = crate::clip::Crop {
+            left: f(a, "crop_left").unwrap_or(k.left),
+            right: f(a, "crop_right").unwrap_or(k.right),
+            top: f(a, "crop_top").unwrap_or(k.top),
+            bottom: f(a, "crop_bottom").unwrap_or(k.bottom),
+        }
+        .clamped();
+    }
     if let Content::Text(tl) = &mut c.content {
         if let Some(v) = s(a, "text") {
             tl.text = v.replace("\\n", "\n");
@@ -354,6 +376,8 @@ fn kind_name(p: &Project, c: &Clip) -> &'static str {
     match &c.content {
         Content::Text(_) => "text",
         Content::Shape(_) => "shape",
+        Content::Blur(_) => "blur",
+        Content::Media { .. } if c.part == crate::clip::Part::Sound => "audio",
         Content::Media { asset, .. } => match p.asset(*asset).map(|a| a.kind) {
             Some(MediaKind::Audio) => "audio",
             Some(MediaKind::Image) => "image",
@@ -410,6 +434,23 @@ impl Editor {
                     let zooms: Vec<Value> = c.zooms.iter().map(|z| json!({ "id": z.id, "start": r3(c.start + z.at), "end": r3(c.start + z.at + z.duration), "scale": z.scale, "focus_x": r3(z.focus_x), "focus_y": r3(z.focus_y) })).collect();
                     m.insert("zooms".into(), json!(zooms));
                 }
+                if !c.crop.is_none() {
+                    m.insert("crop".into(), json!({ "left": r3(c.crop.left), "right": r3(c.crop.right), "top": r3(c.crop.top), "bottom": r3(c.crop.bottom) }));
+                }
+                if let Content::Blur(b) = &c.content {
+                    let (cw, ch) = p.canvas.size();
+                    let per = cw.min(ch) as f64 / 1080.0;
+                    m.insert("blur".into(), json!({ "width": r3(b.width * per / cw as f64), "height": r3(b.height * per / ch as f64), "strength": b.strength, "ellipse": b.ellipse }));
+                }
+                match c.part {
+                    crate::clip::Part::Picture => {
+                        m.insert("audio_separated".into(), json!(true));
+                    }
+                    crate::clip::Part::Sound => {
+                        m.insert("separated_from_video".into(), json!(true));
+                    }
+                    crate::clip::Part::Whole => {}
+                }
                 if !c.keyframes.is_empty() {
                     let keys: serde_json::Map<String, Value> =
                         c.keyframes.iter().map(|(k, v)| (format!("{k:?}").to_lowercase(), json!(v.iter().map(|kf| json!({ "time": r3(c.start + kf.t), "value": kf.value })).collect::<Vec<_>>()))).collect();
@@ -427,6 +468,7 @@ impl Editor {
             "tracks": p.tracks.iter().map(|t| json!({ "id": t.id, "name": t.name, "kind": if t.kind == TrackKind::Audio { "audio" } else { "video" }, "locked": t.locked, "hidden": t.hidden, "muted": t.muted })).collect::<Vec<_>>(),
             "media": p.assets.iter().map(|a| json!({ "id": a.id, "name": a.name, "kind": format!("{:?}", a.kind).to_lowercase(), "duration": r3(a.duration), "width": a.width, "height": a.height, "has_audio": a.has_audio, "path": a.path })).collect::<Vec<_>>(),
             "clips": clips,
+            "markers": p.markers.iter().map(|m| json!({ "id": m.id, "time": r3(m.at), "duration": r3(m.duration), "name": m.name, "color": m.color.to_hex() })).collect::<Vec<_>>(),
         })
     }
 
@@ -493,6 +535,7 @@ impl Editor {
                     "star" => ShapeKind::Star,
                     "hexagon" => ShapeKind::Hexagon,
                     "ring" => ShapeKind::Ring,
+                    "frame" | "box" => ShapeKind::Frame,
                     _ => ShapeKind::Rectangle,
                 };
                 let mut shape = ShapeLayer::new(kind, req_f(&a, "width")?.max(1.0), req_f(&a, "height")?.max(1.0), fill, color(&a, "color_to")?);
@@ -657,6 +700,99 @@ impl Editor {
                 let (clip, a0, b0, v) = (req_id(&a, "clip_id")?, req_f(&a, "start")?, req_f(&a, "end")?, req_f(&a, "volume")?);
                 self.ai_edit("Range volume", |p| p.set_range_volume(clip, a0, b0, v))?;
                 Ok(format!("Volume {:.0}% between {a0:.2}s and {b0:.2}s", v * 100.0))
+            })(),
+            "add_blur" => (|| {
+                let start = req_f(&a, "start")?;
+                let end = f(&a, "end").unwrap_or(start + 3.0);
+                anyhow::ensure!(end - start >= 0.1, "The blur must last at least 0.1 s");
+                let (x, y, w, h) = (req_f(&a, "x")?, req_f(&a, "y")?, req_f(&a, "width")?, req_f(&a, "height")?);
+                // Canvas fractions to canvas units (px at a 1080 short side).
+                let (cw, ch) = self.doc.project.canvas.size();
+                let per = 1080.0 / cw.min(ch) as f64;
+                let layer = crate::clip::BlurLayer { width: (w * cw as f64 * per).clamp(4.0, 4000.0), height: (h * ch as f64 * per).clamp(4.0, 4000.0), strength: f(&a, "strength").unwrap_or(60.0).clamp(0.0, 100.0), ellipse: a.get("ellipse").and_then(Value::as_bool).unwrap_or(false) };
+                let track = id(&a, "track_id");
+                let clip = self.ai_edit("Add blur", |p| {
+                    let id = p.add_blur_clip(track, start, end - start, layer)?;
+                    let c = p.clip_mut(id)?;
+                    (c.transform.x, c.transform.y) = (x, y);
+                    Ok(id)
+                })?;
+                self.selection = vec![clip];
+                Ok(format!("Added blur clip {clip}"))
+            })(),
+            "update_blur" => (|| {
+                let clip = req_id(&a, "clip_id")?;
+                let (cw, ch) = self.doc.project.canvas.size();
+                let per = 1080.0 / cw.min(ch) as f64;
+                self.ai_edit("Update blur", |p| {
+                    let c = p.clip_mut(clip)?;
+                    let Content::Blur(b) = &mut c.content else { anyhow::bail!("Clip {clip} is not a blur") };
+                    if let Some(v) = f(&a, "width") {
+                        b.width = (v * cw as f64 * per).clamp(4.0, 4000.0);
+                    }
+                    if let Some(v) = f(&a, "height") {
+                        b.height = (v * ch as f64 * per).clamp(4.0, 4000.0);
+                    }
+                    if let Some(v) = f(&a, "strength") {
+                        b.strength = v.clamp(0.0, 100.0);
+                    }
+                    if let Some(v) = a.get("ellipse").and_then(Value::as_bool) {
+                        b.ellipse = v;
+                    }
+                    if let Some(v) = f(&a, "x") {
+                        c.transform.x = v;
+                    }
+                    if let Some(v) = f(&a, "y") {
+                        c.transform.y = v;
+                    }
+                    Ok(())
+                })?;
+                Ok("Updated blur".into())
+            })(),
+            "separate_audio" => (|| {
+                let clip = req_id(&a, "clip_id")?;
+                let sound = self.ai_edit("Separate audio", |p| p.separate_audio(clip))?;
+                Ok(format!("The sound is now audio clip {sound}; video clip {clip} is silent"))
+            })(),
+            "add_marker" => (|| {
+                let at = req_f(&a, "time")?;
+                let color = color(&a, "color")?.unwrap_or(Rgba::hex(super::library::MARKER_COLORS[0]));
+                let duration = f(&a, "duration").unwrap_or(0.0);
+                let name = s(&a, "name").map(str::to_string);
+                let mid = self.ai_edit("Add marker", |p| {
+                    let id = p.add_marker(at, duration, color);
+                    if let Some(n) = name {
+                        p.marker_mut(id)?.name = n;
+                    }
+                    Ok(id)
+                })?;
+                Ok(format!("Added marker {mid}"))
+            })(),
+            "update_marker" => (|| {
+                let mid = req_id(&a, "marker_id")?;
+                let col = color(&a, "color")?;
+                self.ai_edit("Update marker", |p| {
+                    if let Some(t) = f(&a, "time") {
+                        p.move_marker(mid, t)?;
+                    }
+                    let m = p.marker_mut(mid)?;
+                    if let Some(d) = f(&a, "duration") {
+                        m.duration = d.max(0.0);
+                    }
+                    if let Some(n) = s(&a, "name") {
+                        m.name = n.to_string();
+                    }
+                    if let Some(c) = col {
+                        m.color = c;
+                    }
+                    Ok(())
+                })?;
+                Ok("Updated marker".into())
+            })(),
+            "delete_marker" => (|| {
+                let mid = req_id(&a, "marker_id")?;
+                self.ai_edit("Delete marker", |p| p.delete_marker(mid))?;
+                Ok("Deleted marker".into())
             })(),
             "add_sound" => {
                 let sound = s(&a, "sound").unwrap_or("").to_string();

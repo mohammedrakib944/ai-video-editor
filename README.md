@@ -1,17 +1,10 @@
-# AI Video Editor
+# AI Video Studio
 
 A motion graphics editor for product showcases — Apple-style launch videos and SaaS explainers
 made from screen recordings. Everything works by hand, and an optional AI assistant (your own
 Claude Code) can edit alongside you: every change appears live and can be undone.
 
-This repository contains two apps:
-
-| App | Folder | Binary | Status |
-|---|---|---|---|
-| **Studio** (Iced) | `studio/` | `ai-video-studio` | The current app. All new work happens here. |
-| Original editor (egui) | repo root | `ai-video-editor` | Legacy, kept until Studio covers everything. |
-
-The rest of this file is about **Studio** unless it says otherwise.
+The app lives in `studio/` (binary `ai-video-studio`, built with Iced + wgpu).
 
 ---
 
@@ -96,7 +89,7 @@ app, `vendor/ffmpeg/` in the repo, then `PATH`.
 
 | What | Windows | Linux |
 |---|---|---|
-| Settings (recent projects, layout, connected AI) | `%APPDATA%\AIVideoEditor\studio.json` | `~/.config/ai-video-editor/studio.json` |
+| Settings (recent projects, layout, connected AI, preferences) | `%APPDATA%\AIVideoEditor\studio.json` | `~/.config/ai-video-editor/studio.json` |
 | Built-in sound effects (made on first use) | `%APPDATA%\AIVideoEditor\sounds\` | `~/.config/ai-video-editor/sounds/` |
 | New projects (`.aivp`) | `Videos\AI Video Editor\` | `~/Videos/AI Video Editor/` |
 
@@ -113,25 +106,44 @@ Projects save automatically a couple of seconds after each change.
   **Locate file…** to relink.
 - **Timeline**: as many video and audio tracks as you like (right-click a track header to rename,
   add, move, lock, hide/mute or delete; drag a header's bottom edge to resize the track; drag the
-  gap above the timeline to resize the whole area). Move, trim and snap clips; drag media in from
-  the library.
-- **Split at the playhead** (`S`), **mark a range** with the playhead (`R` for A then B, or `I`/`O`).
+  gap above the timeline to resize the whole area; it starts compact). Move, trim and snap clips;
+  drag media in from the library. **Right-click a clip** (on the timeline or the preview) for split,
+  duplicate, **separate audio** (the sound moves to its own audio track), mute, zoom, crop, range
+  volume and delete.
+- **Split at the playhead** (`S`), **mark a range** with the playhead (`R` for A, then B — the
+  range follows the playhead until you set B; or `I`/`O`). Drag the A/B flags on the ruler to adjust
+  a range, or Shift+drag on the ruler to draw one.
+- **Markers**: colored flags on the ruler (`Shift+M`, or the **Marker** button) — a span when a
+  range is marked. Click one to jump to it and rename or recolor it in the inspector; drag to move.
 - **Zoom & pan, Camtasia-style**: put the playhead where the zoom should start and press `Z`.
   Zooms appear as bands on the clip — drag to move, drag the ends to resize, click to aim the
   focus rectangle on the canvas. Pressing `Z` again right after a zoom adds a smooth **pan**.
 - **Preview**: GPU-rendered, with audio. Click layers to select them; drag to move (snaps to the
-  center), corners to scale, the knob to rotate — handles work past the canvas edge.
-- **Inspector**: position, scale, rotation, opacity, framing; rounded corners, border, drop shadow;
-  color (brightness, contrast, saturation, warmth); speed; volume and fades; **range volume**
-  (change or mute just the marked range of an audio clip); text (Inter, Poppins, Hind Siliguri for
-  Bangla); shapes (rectangle, ellipse, triangle, star, hexagon, ring with linear/radial gradients
+  center), corners to scale, the knob to rotate, the inner dot to round the corners; shapes and
+  markers resize from every side (Shift on a corner keeps the proportions). Handles work past the
+  canvas edge. **Zoom the preview** from the toolbar (Fit, 25–400%), `Ctrl+0` / `Ctrl+1`, or
+  Ctrl + wheel; the wheel or the middle button pans a zoomed preview. This never changes the video size.
+- **Inspector** (search box on top; click a section title to collapse it): position, scale,
+  rotation, opacity, framing; **crop** (sliders, or drag the edges on the canvas); rounded corners,
+  border, drop shadow; color (brightness, contrast, saturation, warmth); speed; volume and fades; **range volume** (change or mute just the marked range of a clip — each changed
+  part keeps its own slider); text (Inter, Poppins, Hind Siliguri for
+  Bangla); shapes (rectangle, ellipse, triangle, star, hexagon, ring, frame with linear/radial gradients
   at any angle); animations in/out; transitions.
 - **Library tabs**: Media, Text (headline, subtitle, Bangla headline, shape presets), Effects
-  (transitions and animations), Sounds (9 original effects — whoosh, pop, click, riser…).
+  (markers — box, circle, highlight, underline in a color you pick — and **blur**: they go on the
+  timeline at the playhead for 3 s, or over the marked range, and you move and resize them on the
+  preview; a blur only blurs the video under its box, only while it's on the timeline; plus
+  transitions and animations: click to apply to the selection, or drag onto any clip), Sounds (9 original effects — whoosh, pop, click, riser…).
 - **Assistant**: describe what you want; it sees the playhead, the selected clip and the marked
-  range. Tool calls show as cards, and it can look at rendered frames to check its work.
+  range. Replies show formatted (headings, lists, code with a copy button, links). Tool calls show
+  as cards, and it can look at rendered frames to check its work.
 - **Export** to MP4 (H.264 + AAC) with progress, time left and cancel. The export uses the same
   renderer as the preview, and a cancelled or failed export leaves no broken file.
+- **Settings** (gear in the title bar, the app menu, or `Ctrl+,`): preview quality — **Auto**
+  (sharp while paused, lighter during playback when the computer can't keep up), Full, High,
+  Balanced or Draft; it never affects exports — interface size (90–125%), snapping on by default,
+  how long new text/shapes/images last, how soon projects autosave, starting with the preview
+  muted, the default export quality, and the folder for new projects. Changes apply right away.
 - **Other AI apps** (Claude Desktop, Cursor, …) can connect to the MCP server shown in the
   Connect AI dialog (`http://127.0.0.1:47822/mcp`) while the app is open.
 
@@ -144,21 +156,28 @@ Projects save automatically a couple of seconds after each change.
 | R · I · O | Mark range (A, then B) · set start · set end |
 | Z | Add a zoom (or pan) at the playhead |
 | T | Add text at the playhead |
-| Delete / Backspace | Delete the selected clips (or the zoom being edited) |
+| Delete / Backspace | Delete the selected clips (or the zoom being edited, or the selected marker) |
 | Ctrl+D | Duplicate |
 | ← / → (Shift: 10 frames) | Step one frame |
 | Home / End | Start / end |
 | + / − · Shift+Z | Zoom the timeline in / out · fit |
 | N · M | Snapping · mute preview |
+| Shift+M | Add a marker (over the marked range, if any) |
+| Ctrl+0 · Ctrl+1 · Ctrl+wheel | Fit the preview · 100% · zoom the preview |
 | Ctrl+Z · Ctrl+Shift+Z or Ctrl+Y | Undo · redo |
 | Ctrl+N · Ctrl+O · Ctrl+S · Ctrl+Shift+S | New · open · save · save as |
-| Ctrl+I · Ctrl+E · Ctrl+K | Import · export · assistant |
-| Esc | Close a dialog, cancel a rename, leave zoom editing, clear the selection |
+| Ctrl+I · Ctrl+E · Ctrl+K · Ctrl+, | Import · export · assistant · settings |
+| Esc | Close a dialog, cancel a rename, leave zoom/crop editing, clear the selection |
 
----
+### Packaging
 
-## Original editor (legacy)
+- **Windows**: `powershell -ExecutionPolicy Bypass -File scriptspackage-studio.ps1` (add `-Zip`
+  for a .zip) builds `distAI Video Studio` — the app with its icon, bundled FFmpeg, icon files
+  and licenses. Close the app running from that folder first.
+- **Linux**: `scripts/package-studio.sh` builds `dist/ai-video-studio-linux-<arch>/` and a `.tar.gz`
+  with the app, the icon in every size, a desktop entry and `install.sh` (installs to `~/.local`,
+  or system-wide with `PREFIX=/usr/local`). FFmpeg comes from the system.
 
-The egui app at the repo root still builds: `cargo run` (or `cargo test`). It uses the same
-FFmpeg setup; its MCP server listens on port 47821 (`AIVE_MCP_PORT`), and
-`powershell -ExecutionPolicy Bypass -File scripts\package.ps1` builds its portable Windows folder.
+The icon is drawn from code (`studio/src/icon.rs`); `ai-video-studio --write-icons DIR` writes it
+as PNGs and an `.ico`.
+
