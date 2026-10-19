@@ -1,0 +1,431 @@
+//! Renders a project to an MP4 file: frames come from the same compositor as
+//! the preview (on a headless GPU device), audio from an FFmpeg mix.
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+use anyhow::{Context, bail};
+use iced::wgpu;
+
+use super::compositor::Compositor;
+use super::frames::FrameServer;
+use super::{audio, scene};
+use crate::ffmpeg;
+use crate::model::Project;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Quality {
+    High,
+    Standard,
+    Small,
+}
+
+impl Quality {
+    pub const ALL: [Quality; 3] = [Quality::High, Quality::Standard, Quality::Small];
+
+    fn crf(self) -> u32 {
+        match self {
+            Quality::High => 17,
+            Quality::Standard => 21,
+            Quality::Small => 26,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Quality::High => "High",
+            Quality::Standard => "Standard",
+            Quality::Small => "Small file",
+        }
+    }
+
+    /// Rough video bitrate in Mbit/s at 1080p30, for size estimates.
+    fn mbps_1080p30(self) -> f64 {
+        match self {
+            Quality::High => 14.0,
+            Quality::Standard => 8.0,
+            Quality::Small => 4.0,
+        }
+    }
+}
+
+/// Estimated file size in megabytes.
+pub fn estimate_mb(size: (u32, u32), fps: u32, quality: Quality, seconds: f64) -> f64 {
+    let pixels = (size.0 * size.1) as f64 / (1920.0 * 1080.0);
+    let video = quality.mbps_1080p30() * pixels.powf(0.75) * (fps as f64 / 30.0).powf(0.6);
+    (video + 0.19) * seconds / 8.0
+}
+
+#[derive(Debug, Clone)]
+pub enum Progress {
+    Rendering { done: u64, total: u64, eta: Option<f64> },
+    Finished { path: PathBuf, seconds: f64 },
+    Failed(String),
+    Cancelled,
+}
+
+struct Gpu {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+fn headless_gpu() -> anyhow::Result<Gpu> {
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }))
+        .context("No graphics adapter available for rendering")?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("export"), ..Default::default() })).context("Could not open the graphics device")?;
+    Ok(Gpu { device, queue })
+}
+
+/// Renders the whole project to `path`. Writes to a temporary file first, so a
+/// failed or cancelled export never leaves a broken video behind.
+pub fn export(project: &Project, path: &Path, quality: Quality, cancel: &AtomicBool, progress: &dyn Fn(Progress)) -> anyhow::Result<PathBuf> {
+    let total = project.duration();
+    if total <= 0.0 {
+        bail!("The timeline is empty — add a clip before exporting");
+    }
+    let (w, h) = project.canvas.size();
+    let fps = project.canvas.fps;
+    let frames_total = (total * fps as f64).ceil() as u64;
+    let started = Instant::now();
+    crate::fonts::ensure_loaded();
+
+    let mut renderer = Offscreen::new(w, h)?;
+
+    // FFmpeg: raw frames on stdin, audio mixed from the source files.
+    let (inputs, graph) = audio::mix_graph(project, 1, total);
+    let graph_file = ffmpeg::work_dir().join(format!("export-{}.txt", std::process::id()));
+    std::fs::write(&graph_file, &graph).context("could not write the audio graph")?;
+    let part = path.with_file_name(format!("{}.part", path.file_name().and_then(|n| n.to_str()).unwrap_or("export.mp4")));
+    let mut cmd = ffmpeg::ffmpeg()?;
+    cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "pipe:0"]);
+    for input in &inputs {
+        cmd.args(["-ss", &ffmpeg::secs(input.seek), "-t", &ffmpeg::secs(input.length), "-i"]).arg(&input.path);
+    }
+    cmd.arg(ffmpeg::filter_script_option()).arg(&graph_file);
+    cmd.args(["-map", "0:v", "-map", "[aout]"]);
+    cmd.args(["-c:v", "libx264", "-preset", "medium", "-crf", &quality.crf().to_string(), "-pix_fmt", "yuv420p", "-r", &fps.to_string()]);
+    cmd.args(["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-f", "mp4", "-y"]).arg(&part);
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().context("could not start FFmpeg")?;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let err_thread = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+
+    // Whatever goes wrong below, the encoder is stopped and the partial file removed.
+    struct Cleanup<'a> {
+        child: &'a mut std::process::Child,
+        files: [&'a Path; 2],
+        done: bool,
+    }
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            if !self.done {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                for f in self.files {
+                    let _ = std::fs::remove_file(f);
+                }
+            }
+        }
+    }
+    let mut guard = Cleanup { child: &mut child, files: [&part, &graph_file], done: false };
+
+    let server = FrameServer::default();
+    server.set_preview_width(w as f32);
+    let sources = ExactSources { inner: server.bind(project), server: &server };
+    let mut row = Vec::new();
+    for n in 0..frames_total {
+        if cancel.load(Ordering::Relaxed) {
+            drop(stdin);
+            bail!("cancelled");
+        }
+        let t = n as f64 / fps as f64;
+        let scene = scene::evaluate(project, t, (w, h), &sources, true);
+        renderer.render(&scene, &mut row)?;
+        if stdin.write_all(&row).is_err() {
+            break;
+        }
+        server.collect_idle();
+        if n % 3 == 0 || n + 1 == frames_total {
+            let elapsed = started.elapsed().as_secs_f64();
+            let eta = (n > 10).then(|| elapsed / (n + 1) as f64 * (frames_total - n - 1) as f64);
+            progress(Progress::Rendering { done: n + 1, total: frames_total, eta });
+        }
+    }
+    drop(stdin);
+    let status = guard.child.wait().context("FFmpeg stopped unexpectedly")?;
+    let log = err_thread.join().unwrap_or_default();
+    if !status.success() {
+        bail!("Encoding failed: {}", log.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("unknown error").trim());
+    }
+    std::fs::rename(&part, path).with_context(|| format!("could not move the video to {}", path.display()))?;
+    guard.done = true;
+    drop(guard);
+    let _ = std::fs::remove_file(&graph_file);
+    Ok(path.to_path_buf())
+}
+
+/// Renders scenes into a CPU buffer on a headless GPU device.
+pub struct Offscreen {
+    gpu: Gpu,
+    compositor: Compositor,
+    target: wgpu::Texture,
+    view: wgpu::TextureView,
+    readback: wgpu::Buffer,
+    size: (u32, u32),
+    padded_row: u32,
+}
+
+impl Offscreen {
+    pub fn new(w: u32, h: u32) -> anyhow::Result<Offscreen> {
+        let gpu = headless_gpu()?;
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let compositor = Compositor::new(&gpu.device, &gpu.queue, format);
+        let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen target"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let padded_row = (w * 4).div_ceil(256) * 256;
+        let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("offscreen readback"),
+            size: (padded_row * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Ok(Offscreen { gpu, compositor, target, view, readback, size: (w, h), padded_row })
+    }
+
+    /// Draws `scene` and copies the pixels (tightly packed RGBA) into `out`.
+    pub fn render(&mut self, scene: &scene::Scene, out: &mut Vec<u8>) -> anyhow::Result<()> {
+        let (w, h) = self.size;
+        let gpu = &self.gpu;
+        self.compositor.prepare(&gpu.device, &gpu.queue, scene, 1.0, Compositor::full_view(w, h));
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("offscreen") });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("offscreen"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.compositor.draw(&mut pass);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &self.target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &self.readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(self.padded_row), rows_per_image: Some(h) } },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let slice = self.readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| anyhow::anyhow!("GPU error: {e}"))?;
+        out.resize((w * h * 4) as usize, 0);
+        {
+            let data = slice.get_mapped_range();
+            let row = (w * 4) as usize;
+            for y in 0..h as usize {
+                let src = y * self.padded_row as usize;
+                out[y * row..(y + 1) * row].copy_from_slice(&data[src..src + row]);
+            }
+        }
+        self.readback.unmap();
+        Ok(())
+    }
+}
+
+/// A JPEG of the project at time `t`, at most `max_width` wide (for the assistant to look at).
+pub fn snapshot_jpeg(project: &Project, t: f64, max_width: u32) -> anyhow::Result<Vec<u8>> {
+    crate::fonts::ensure_loaded();
+    let (cw, ch) = project.canvas.size();
+    let scale = (max_width as f64 / cw as f64).min(1.0);
+    let (w, h) = (((cw as f64 * scale) as u32).max(2) & !1, ((ch as f64 * scale) as u32).max(2) & !1);
+    let server = FrameServer::default();
+    server.set_preview_width(w as f32);
+    let sources = ExactSources { inner: server.bind(project), server: &server };
+    // Render at the reduced size directly: the scene scales everything with the canvas.
+    let scene = scene::evaluate(project, t, (w, h), &sources, false);
+    let mut renderer = Offscreen::new(w, h)?;
+    let mut rgba = Vec::new();
+    renderer.render(&scene, &mut rgba)?;
+    let img = image::RgbaImage::from_raw(w, h, rgba).context("bad frame")?;
+    let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 82).encode_image(&rgb)?;
+    Ok(jpeg)
+}
+
+/// Like the preview's sources, but waits for the exact frame instead of showing the latest one.
+struct ExactSources<'a> {
+    inner: super::frames::Bound<'a>,
+    server: &'a FrameServer,
+}
+
+impl scene::Sources for ExactSources<'_> {
+    fn video(&self, clip: crate::model::Id, asset: crate::model::Id, src_time: f64, _playing: bool) -> Option<Arc<super::Frame>> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let frame = self.inner.video(clip, asset, src_time, true);
+            if self.server.has_frame(clip, src_time) || Instant::now() > deadline {
+                return self.inner.video(clip, asset, src_time, true).or(frame);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn image(&self, asset: crate::model::Id) -> Option<Arc<super::Frame>> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Some(f) = self.inner.image(asset) {
+                return Some(f);
+            }
+            self.server.settle();
+            if self.server.image_failed(asset) || Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn text(&self, layer: &crate::clip::TextLayer, px_per_unit: f32) -> Option<Arc<super::Frame>> {
+        self.inner.text(layer, px_per_unit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clip::{Motion, MotionKind, Rgba, ShapeKind, ShapeLayer, TextLayer};
+    use crate::model::{Aspect, Canvas, Resolution};
+
+    fn probe_json(path: &Path) -> serde_json::Value {
+        let out = ffmpeg::ffprobe().unwrap().args(["-print_format", "json", "-show_format", "-show_streams"]).arg(path).output().unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    #[test]
+    fn exports_video_text_shapes_and_mixed_audio() {
+        let dir = std::env::temp_dir().join(format!("studio-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        let ok = ffmpeg::ffmpeg()
+            .unwrap()
+            .args(["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=3", "-f", "lavfi", "-i", "sine=frequency=440:duration=3"])
+            .args(["-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", "-y"])
+            .arg(&src)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let mut p = Project::new("t", Canvas { aspect: Aspect::Portrait, resolution: Resolution::Hd, fps: 30 });
+        let a = p.add_asset(&src, &crate::media::probe(&src).unwrap());
+        let v = p.add_media_clip(a, None, 0.0).unwrap();
+        p.clip_mut(v).unwrap().look.corner_radius = 30.0;
+        p.set_speed(v, 2.0).unwrap();
+        let t = p.add_text_clip(None, 0.2, crate::edit::DEFAULT_STILL, TextLayer { text: "নতুন Studio".into(), ..Default::default() }).unwrap();
+        p.clip_mut(t).unwrap().intro = Some(Motion { kind: MotionKind::Pop, duration: 0.4 });
+        p.add_shape_clip(Some(p.tracks[1].id), 0.0, crate::edit::DEFAULT_STILL, ShapeLayer::new(ShapeKind::Rectangle, 200.0, 80.0, Rgba::hex(0x7C6DFF), None)).unwrap();
+
+        let out = dir.join("out.mp4");
+        let cancel = AtomicBool::new(false);
+        let seen = std::sync::Mutex::new(0u64);
+        export(&p, &out, Quality::Small, &cancel, &|pr| {
+            if let Progress::Rendering { done, .. } = pr {
+                *seen.lock().unwrap() = done;
+            }
+        })
+        .unwrap();
+        let info = probe_json(&out);
+        let streams = info["streams"].as_array().unwrap();
+        let video = streams.iter().find(|s| s["codec_type"] == "video").unwrap();
+        assert_eq!((video["width"].as_u64(), video["height"].as_u64()), (Some(720), Some(1280)));
+        assert!(streams.iter().any(|s| s["codec_type"] == "audio"));
+        let duration: f64 = info["format"]["duration"].as_str().unwrap().parse().unwrap();
+        // The 3 s source at 2× lasts 1.5 s; the text clip runs to 5.2 s.
+        assert!((duration - 5.2).abs() < 0.15, "duration {duration}");
+        assert_eq!(*seen.lock().unwrap(), (5.2f64 * 30.0).ceil() as u64);
+        assert!(!dir.join("out.mp4.part").exists());
+
+        // Cancelling removes the partial file.
+        cancel.store(true, Ordering::Relaxed);
+        let out2 = dir.join("cancelled.mp4");
+        assert!(export(&p, &out2, Quality::Small, &cancel, &|_| {}).is_err());
+        assert!(!out2.exists() && !dir.join("cancelled.mp4.part").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// RMS level (dB) of a file's audio between `from` and `to` seconds.
+    fn rms_db(path: &Path, from: f64, to: f64) -> f64 {
+        let out = ffmpeg::ffmpeg().unwrap().args(["-ss", &ffmpeg::secs(from), "-t", &ffmpeg::secs(to - from), "-i"]).arg(path).args(["-vn", "-af", "astats", "-f", "null", "-"]).args(["-loglevel", "info"]).output().unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        log.lines().filter_map(|l| l.split("RMS level dB:").nth(1)).last().and_then(|v| v.trim().parse().ok()).expect("astats output")
+    }
+
+    #[test]
+    fn long_1080p_export_with_short_separated_audio_finishes_and_plays_it_once() {
+        let dir = std::env::temp_dir().join(format!("studio-export-long-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.mp4");
+        let ok = ffmpeg::ffmpeg()
+            .unwrap()
+            .args(["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30:duration=2", "-f", "lavfi", "-i", "sine=frequency=330:duration=2"])
+            .args(["-pix_fmt", "yuv420p", "-c:a", "aac", "-ac", "2", "-shortest", "-y"])
+            .arg(&src)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let mut p = Project::new("t", Canvas::default());
+        let a = p.add_asset(&src, &crate::media::probe(&src).unwrap());
+        let v = p.add_media_clip(a, None, 0.0).unwrap();
+        p.separate_audio(v).unwrap();
+        // Text runs on to 10 s, long after the sound ends at 2 s.
+        p.add_text_clip(None, 0.0, 10.0, TextLayer::default()).unwrap();
+
+        let out = dir.join("out.mp4");
+        let started = Instant::now();
+        export(&p, &out, Quality::Small, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert!(started.elapsed().as_secs() < 90, "export took {:?}", started.elapsed());
+        let info = probe_json(&out);
+        for s in info["streams"].as_array().unwrap() {
+            let d: f64 = s["duration"].as_str().unwrap().parse().unwrap();
+            assert!((d - 10.0).abs() < 0.1, "{} stream lasts {d}", s["codec_type"]);
+        }
+        let (exported, source) = (rms_db(&out, 0.3, 1.7), rms_db(&src, 0.3, 1.7));
+        assert!((exported - source).abs() < 1.5, "the separated sound plays once: {exported:.1} dB vs {source:.1} dB");
+        assert!(rms_db(&out, 3.0, 9.0) < -80.0, "silence after the sound ends");
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// Developer tool: `STUDIO_EXPORT=project.aivp STUDIO_EXPORT_OUT=out.mp4 cargo test -p studio export_project_file -- --ignored`
+#[cfg(test)]
+#[test]
+#[ignore]
+fn export_project_file() {
+    let project = Project::load(Path::new(&std::env::var("STUDIO_EXPORT").expect("STUDIO_EXPORT"))).unwrap();
+    let out = PathBuf::from(std::env::var("STUDIO_EXPORT_OUT").expect("STUDIO_EXPORT_OUT"));
+    let start = Instant::now();
+    export(&project, &out, Quality::Standard, &AtomicBool::new(false), &|_| {}).unwrap();
+    println!("exported {:.1}s of video in {:.1}s", project.duration(), start.elapsed().as_secs_f64());
+}
