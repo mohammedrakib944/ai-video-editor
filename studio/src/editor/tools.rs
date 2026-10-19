@@ -101,6 +101,15 @@ pub fn schemas() -> Vec<Value> {
         ),
         tool("add_media_clip", "Put a library item on the timeline. Videos/images go on a video track, audio on an audio track. Returns the clip id.", json!({ "media_id": int("Id from get_project media"), "start": num("Timeline seconds"), "track_id": int("Optional track") }), &["media_id", "start"]),
         tool(
+            "analyze_audio_beats",
+            "Find where the beats/hits are in an audio or video clip's sound, as timeline seconds. Use this before animating anything \
+over music or narration: sync zooms, cuts and text entrances to the returned times instead of guessing — that's what makes an edit \
+feel professional instead of random. Finds clear percussive hits, not a tempo/BPM analysis; silence or music without clear hits \
+returns few or no beats.",
+            json!({ "clip_id": int("A clip on the timeline (from get_project) that has sound") }),
+            &["clip_id"],
+        ),
+        tool(
             "add_text",
             "Add a text layer (titles, callouts, captions). Returns the clip id.",
             merged(&[text_props(), style_props()], json!({ "start": num("Timeline seconds"), "duration": num("Seconds (default 4)"), "track_id": int("Optional video track") })),
@@ -589,6 +598,22 @@ impl Editor {
                 self.selection = vec![clip];
                 Ok(format!("Added clip {clip}"))
             })(),
+            "analyze_audio_beats" => {
+                let lookup = req_id(&a, "clip_id").and_then(|clip_id| beat_source(&self.doc.project, clip_id));
+                match lookup {
+                    Ok((path, seek, length, clip)) => {
+                        return Task::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || crate::media::detect_beats(&path, seek, length).map_err(|e| e.to_string()))
+                                    .await
+                                    .unwrap_or_else(|e| Err(e.to_string()))
+                            },
+                            move |r| Message::ToolBeats(call.clone(), r.map(|beats| beats.into_iter().map(|b| clip.timeline_time(seek + b)).collect())),
+                        );
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             "add_text" => (|| {
                 let start = req_f(&a, "start")?;
                 let track = id(&a, "track_id");
@@ -1100,4 +1125,96 @@ impl Editor {
 
 fn r3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
+}
+
+/// What `analyze_audio_beats` needs from a clip: the asset file, the portion of it the clip
+/// actually uses (`seek..seek+length`, in source-file seconds), and the clip itself (to map
+/// beat times back to the timeline afterwards).
+fn beat_source(project: &Project, clip_id: Id) -> anyhow::Result<(PathBuf, f64, f64, Clip)> {
+    let clip = project.clip(clip_id).context("That clip no longer exists")?;
+    if !project.clip_has_sound(clip) {
+        bail!("That clip has no sound to analyze");
+    }
+    let (asset, src_in, speed) = match &clip.content {
+        Content::Media { asset, src_in, speed } => (*asset, *src_in, *speed),
+        _ => bail!("That clip has no sound to analyze"),
+    };
+    let path = project.asset(asset).context("That clip's media is missing")?.path.clone();
+    Ok((path, src_in, clip.duration * speed, clip.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::ProbeInfo;
+    use crate::model::{Canvas, MediaKind};
+
+    fn project_with_clip() -> (Project, Id) {
+        let mut p = Project::new("t", Canvas::default());
+        let info = ProbeInfo { kind: MediaKind::Audio, duration: 20.0, width: 0, height: 0, fps: 0.0, has_audio: true };
+        let asset = p.add_asset(&PathBuf::from("music.wav"), &info);
+        let clip = p.add_media_clip(asset, None, 5.0).unwrap();
+        // A clip starting at 5s, trimmed 3s into the source, playing back at double speed.
+        let c = p.clip_mut(clip).unwrap();
+        c.content = Content::Media { asset, src_in: 3.0, speed: 2.0 };
+        c.duration = 4.0;
+        (p, clip)
+    }
+
+    #[test]
+    fn beat_source_reports_the_used_portion_and_can_map_times_back() {
+        let (p, clip) = project_with_clip();
+        let (path, seek, length, c) = beat_source(&p, clip).unwrap();
+        assert_eq!(path, PathBuf::from("music.wav"));
+        assert_eq!((seek, length), (3.0, 8.0), "4s of timeline at 2x speed is 8s of source, starting at src_in");
+        // A beat 1s into the used source (at source time seek+1=4.0) lands at timeline 5.5s:
+        // the clip starts at 5.0, and 1s of source at 2x speed is 0.5s of timeline.
+        assert_eq!(c.timeline_time(seek + 1.0), 5.5);
+    }
+
+    #[test]
+    fn beat_source_refuses_a_clip_without_sound() {
+        let mut p = Project::new("t", Canvas::default());
+        let text = p.add_text_clip(None, 0.0, 5.0, crate::clip::TextLayer::default()).unwrap();
+        assert!(beat_source(&p, text).is_err());
+        assert!(beat_source(&p, 99999).is_err(), "a clip id that doesn't exist");
+    }
+
+    /// `analyze_audio_beats`'s two halves (`beat_source`'s mapping and `detect_beats`'s decoding)
+    /// tested together, on real audio, the way the tool actually uses them — the async
+    /// `Task::perform`/MCP plumbing around them isn't (nothing else in this file tests that layer
+    /// either; see `handle_tool`'s `import_media` for the same shape).
+    #[test]
+    fn analyze_audio_beats_lines_up_with_real_clicks_through_trim_and_speed() {
+        let dir = std::env::temp_dir().join(format!("studio-tool-beats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clicks.wav");
+        let status = crate::ffmpeg::ffmpeg()
+            .unwrap()
+            .args(["-f", "lavfi", "-i", "aevalsrc=exprs=lt(mod(t\\,0.5)\\,0.01)*sin(2*PI*1000*t):s=8000:d=4", "-y"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let mut p = Project::new("t", Canvas::default());
+        let info = ProbeInfo { kind: MediaKind::Audio, duration: 4.0, width: 0, height: 0, fps: 0.0, has_audio: true };
+        let asset = p.add_asset(&path, &info);
+        let clip = p.add_media_clip(asset, None, 10.0).unwrap();
+        // Skips the clicks at 0.0 and 0.5s; plays the rest at half speed starting at timeline 10s.
+        let c = p.clip_mut(clip).unwrap();
+        c.content = Content::Media { asset, src_in: 1.0, speed: 2.0 };
+        c.duration = 1.0; // source 1.0..3.0 → clicks at 1.0, 1.5, 2.0, 2.5
+
+        let (resolved, seek, length, c) = beat_source(&p, clip).unwrap();
+        let beats = crate::media::detect_beats(&resolved, seek, length).unwrap();
+        let timeline: Vec<f64> = beats.into_iter().map(|b| c.timeline_time(seek + b)).collect();
+        // Source clicks 1.0/1.5/2.0/2.5, half speed from timeline 10s: 10.0/10.25/10.5/10.75.
+        let expected = [10.0, 10.25, 10.5, 10.75];
+        assert_eq!(timeline.len(), expected.len(), "beats: {timeline:?}");
+        for (t, e) in timeline.iter().zip(expected) {
+            assert!((t - e).abs() < 0.05, "{t} should be near {e}");
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

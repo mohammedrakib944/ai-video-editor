@@ -51,7 +51,7 @@ GNU toolchain + MinGW-w64 (WinLibs). Windows packaging:
 `STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|settings` (open the Connect AI dialog, the assistant panel,
 the Effects tab or Settings), `STUDIO_SNAPSHOT_ZOOM=2` (preview zoom), `STUDIO_SNAPSHOT_CHAT=reply.md` (a sample
 conversation with that Markdown reply, no AI needed), `STUDIO_SNAPSHOT_REOPEN=1` (switch to the
-assistant tab last), `STUDIO_SNAPSHOT_SEEK=seconds` (move the playhead), `STUDIO_SNAPSHOT_TEXT=start,end` (select those characters in
+assistant tab last), `STUDIO_SNAPSHOT_SEEK=seconds` (move the playhead), `STUDIO_SNAPSHOT_TEXT=start,end` (select those characters in, or `STUDIO_SNAPSHOT_TYPE=text` to type at the end of,
 the text box of a text clip selected with `STUDIO_SNAPSHOT_SELECT`). Set `APPDATA` to a scratch folder for test instances so they don't touch the
 user's settings or recent projects.
 Wired through `Message::Snapshot` / `DevSelect` in `editor/mod.rs`, all `cfg(debug_assertions)`.
@@ -115,8 +115,12 @@ leak events into the next reply), runs in a `platform::ProcessGroup` (Windows jo
 group, so Stop ends everything it started), and tags its MCP requests with `X-Aive-Run`; the editor
 refuses tool calls whose run isn't the reply in progress (`Agent::accepts`). Every reply ends in
 exactly one `TurnDone`, and the UI closes it through `end_chat_turn`; `ai_connect.rs` is the Connect AI dialog and title-bar chip;
-the chosen provider persists in `settings.rs`. ChatGPT is shown as "Coming next" (undecided:
-Codex CLI vs API key).
+the chosen provider persists in `settings.rs`. ChatGPT runs OpenAI's Codex CLI (`codex exec --json`, one
+process per reply, `exec resume <thread>` to continue; settings as `-c key='value'` TOML literal strings so
+nothing needs double quotes through `cmd /C`; the run tag goes in the MCP URL as `?run=`). `codex_status`
+checks install + `codex login status`; `codex_sign_in` runs `codex login` (browser). Tests use fake
+`claude`/`codex` scripts — never the user's accounts. The Codex flags come from the docs, not a live run:
+verify them (`codex exec --help`) when Codex is available.
 
 **Settings dialog.** `settings_dialog.rs` edits `settings::Prefs` (preview quality with Auto, UI
 scale via `App::scale_factor`, snapping/mute defaults, default still length, autosave interval,
@@ -140,6 +144,10 @@ removes `WAYLAND_DISPLAY` to run under XWayland so drag and drop works — winit
 - `container(..).clip(true)` only narrows the viewport its children get; their backgrounds and borders still
   draw outside it. Use `widgets::clipped` (a real clip layer that also hides the mouse outside) when content can
   move past its bounds (the track headers scroll that way).
+- Keep the widget tree's shape stable: iced matches widget state (scroll offsets, text cursors) by
+  position, so wrapping the window in a `stack` only while something is shown rebuilds every panel and
+  resets their scrolling. `App::view` always stacks the same layers (`space()` when empty); do the same
+  for new overlays.
 - FFmpeg filter-script files must outlive the FFmpeg process that reads them. Use
   `ffmpeg::filter_script_option()` (FFmpeg 7 `-/filter_complex` vs 6.x `-filter_complex_script`).
 - Export writes through a cleanup guard so a cancelled/failed export leaves no partial file.

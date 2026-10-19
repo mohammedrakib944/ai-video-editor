@@ -152,7 +152,7 @@ impl Editor {
             let hero = column![
                 container(icon(code::SPARKLES, 18).color(ON_ACCENT)).center(40).style(style::logo),
                 text("What should we make?").font(INTER_SEMIBOLD).size(T_TITLE),
-                text("Press R at a start point and again at an end point to mark a range, then describe the motion you want there.").size(T_SMALL).color(TEXT_3).align_x(Alignment::Center),
+                text("Click Range and drag across the timeline to point at a part, then describe the motion you want there.").size(T_SMALL).color(TEXT_3).align_x(Alignment::Center),
             ]
             .spacing(S2)
             .align_x(Alignment::Center);
@@ -247,7 +247,7 @@ impl Editor {
                     row![
                         tinted(code::SQUARE_DASHED, 12, ACCENT_HOVER),
                         text(format!("{} – {}", super::fmt_ruler(a), super::fmt_ruler(b))).font(INTER_MEDIUM).size(T_CAPTION),
-                        button(icon(code::X, 11)).padding(0).style(style::ghost).on_press(Message::SetRange(None)),
+                        button(icon(code::X, 11)).padding(0).style(style::ghost).on_press(Message::RangeDone),
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
@@ -285,6 +285,7 @@ impl Editor {
                         .id(INPUT_ID)
                         .placeholder("Describe what you want…")
                         .on_action(Message::ChatEdit)
+                        .key_binding(widgets::editor_keys)
                         .font(font)
                         .size(T_BODY)
                         .padding([9, 11])

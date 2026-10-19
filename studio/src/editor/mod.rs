@@ -12,6 +12,7 @@ pub mod timeline;
 
 use std::cell::Cell;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iced::keyboard::{self, Key, key};
@@ -136,11 +137,12 @@ pub enum Message {
     MoveClipToNewTrack { clip: Id, start: f64 },
     Trim { clip: Id, edge: Edge, t: f64 },
     SplitAtPlayhead,
-    MarkRange,
-    /// Finish the Range tool (the ✓ after A and B).
+    /// The Range tool button (or R): turns range mode on, or finishes it when it's on.
+    RangeTool,
+    /// Range mode: a press on the timeline starts a new range (and selects the clip pressed on).
+    RangePress { clip: Option<Id> },
+    /// Done (✓): the range has served its purpose; it goes away and range mode ends.
     RangeDone,
-    MarkIn,
-    MarkOut,
     AddZoomAtPlayhead,
     ZoomTiming { clip: Id, zoom: Id, at: f64, duration: f64 },
     /// Scroll the track list by this many pixels (positive = down).
@@ -164,6 +166,8 @@ pub enum Message {
     DevChat(String, String),
     /// Debug snapshots: select characters `start..end` in the inspector's text box.
     DevSelectText(usize, usize),
+    /// Debug snapshots: type into the inspector's text box at the end of the text.
+    DevType(String),
     DeleteSelection,
     DuplicateSelection,
     /// Bring the selected pictures to the front (true) or send them to the back.
@@ -181,6 +185,10 @@ pub enum Message {
     /// An effect dropped on the preview or the timeline.
     DropEffect { effect: library::Effect, target: DropTarget },
     MarkerColor(Rgba),
+    /// Star or unstar an effect in the Effects tab.
+    ToggleFavoriteEffect(library::Effect),
+    /// Open or close a group of the Effects tab.
+    ToggleEffectGroup(&'static str),
     /// Add a timeline marker at the playhead (spanning the range, if one is marked).
     AddMarker,
     SelectMarker(Option<Id>),
@@ -224,6 +232,8 @@ pub enum Message {
     OpenAiConnect,
     ToolImported(crate::mcp::Call, Vec<(PathBuf, Result<ProbeInfo, String>)>, bool),
     ToolSound(crate::mcp::Call, &'static str, Result<(PathBuf, ProbeInfo), String>),
+    /// `analyze_audio_beats` finished: timeline-second beat times, already mapped from the clip's source time.
+    ToolBeats(crate::mcp::Call, Result<Vec<f64>, String>),
     Track(Id, TrackAction),
     RenameInput(String),
     RenameCommit,
@@ -253,10 +263,8 @@ pub struct Editor {
     panes: pane_grid::State<Pane>,
     library_tab: LibraryTab,
     pub side_tab: SideTab,
-    /// Range start marked with the playhead, waiting for the end.
-    range_anchor: Option<f64>,
-    /// The Range tool's last step: A and B are set and can still be adjusted; Done (✓) finishes.
-    range_review: bool,
+    /// The Range tool is on: dragging on the timeline selects a range (until Done).
+    range_mode: bool,
     /// Track list scroll offset in pixels.
     vscroll: f32,
     playing: Option<(Instant, f64)>,
@@ -282,6 +290,9 @@ pub struct Editor {
     selected_marker: Option<Id>,
     /// Inspector sections the user collapsed (by title), and the inspector search text.
     pub collapsed: std::collections::BTreeSet<String>,
+    /// Starred effects (by `Effect::key`) and the Effects-tab groups that are open.
+    pub favorite_effects: Vec<String>,
+    pub effects_open: std::collections::BTreeSet<String>,
     inspector_query: String,
     pub cursor: Point,
     renaming: Option<(Id, String)>,
@@ -290,6 +301,11 @@ pub struct Editor {
     frames: FrameServer,
     export: Option<export_dialog::ExportDialog>,
     audio: Option<crate::playback::AudioPlayer>,
+    /// Mixing and spawning FFmpeg for a play/seek runs in the background so the picture starts
+    /// at once; this is where its result lands, tagged with the `audio_request` it answers.
+    audio_pending: Arc<Mutex<Option<(u64, Result<Option<crate::playback::Prepared>, String>)>>>,
+    /// Bumped on every play/seek; a pending result tagged with an older id is stale and discarded.
+    audio_request: u64,
     /// Fingerprint of the sound the running audio player was started with.
     audio_revision: u64,
     /// Why the last playback had no sound, already shown once (so seeking doesn't repeat it).
@@ -354,8 +370,7 @@ impl Editor {
             panes: pane_grid::State::with_configuration(config),
             library_tab: LibraryTab::Media,
             side_tab: SideTab::Inspector,
-            range_anchor: None,
-            range_review: false,
+            range_mode: false,
             vscroll: 0.0,
             playing: None,
             snapping: true,
@@ -375,6 +390,8 @@ impl Editor {
             marker_color: Rgba::hex(library::MARKER_COLORS[0]),
             selected_marker: None,
             collapsed: Default::default(),
+            favorite_effects: Vec::new(),
+            effects_open: Default::default(),
             inspector_query: String::new(),
             cursor: Point::ORIGIN,
             renaming: None,
@@ -383,6 +400,8 @@ impl Editor {
             frames: FrameServer::default(),
             export: None,
             audio: None,
+            audio_pending: Arc::new(Mutex::new(None)),
+            audio_request: 0,
             audio_revision: 0,
             audio_problem: None,
             muted: false,
@@ -475,11 +494,7 @@ impl Editor {
 
     /// Turns the assistant on or off when the user connects or disconnects an AI.
     pub fn set_ai(&mut self, provider: Option<crate::settings::AiProvider>) {
-        self.agent.enabled = provider.is_some();
-        self.agent.recheck();
-        if provider.is_none() {
-            self.agent.reset();
-        }
+        self.agent.set_provider(provider);
     }
 
     pub fn project(&self) -> &Project {
@@ -567,19 +582,45 @@ impl Editor {
         self.follow_playhead();
     }
 
-    /// (Re)starts playback from the playhead, with audio if there is any.
+    /// (Re)starts playback from the playhead. The picture starts at once, on the wall clock;
+    /// mixing and spawning FFmpeg for the sound happens in the background (it can take a
+    /// noticeable moment) and plugs in via `audio_pending` once ready, same as sound that's
+    /// simply slow to start (`AudioPlayer::stalled`/`join_at`).
     fn start_playback(&mut self) {
         self.sound_preview = None;
         self.playing = Some((Instant::now(), self.playhead));
         self.audio = None;
-        self.audio = match crate::playback::AudioPlayer::start(&self.doc.project, self.playhead, self.muted) {
-            Ok(a) => a,
-            Err(e) => {
-                self.report_audio_problem(e.to_string());
-                None
-            }
-        };
         self.audio_revision = audio_fingerprint(&self.doc.project);
+        self.audio_request += 1;
+        let id = self.audio_request;
+        let project = self.doc.project.clone();
+        let (from, muted) = (self.playhead, self.muted);
+        let slot = self.audio_pending.clone();
+        std::thread::spawn(move || {
+            let result = crate::playback::AudioPlayer::prepare(&project, from, muted).map_err(|e| e.to_string());
+            let mut g = slot.lock().unwrap();
+            // A newer request may have already landed (finished out of order): never clobber it.
+            if g.as_ref().is_none_or(|(existing, _)| id >= *existing) {
+                *g = Some((id, result));
+            }
+        });
+    }
+
+    /// Applies a background `start_playback` result once ready, ignoring one a later
+    /// play/pause/seek has already superseded (its `Prepared` cleans itself up when dropped).
+    fn poll_audio(&mut self) {
+        let Some((id, result)) = self.audio_pending.lock().unwrap().take() else { return };
+        if id != self.audio_request {
+            return;
+        }
+        match result {
+            Ok(Some(prepared)) => match crate::playback::AudioPlayer::finish(prepared) {
+                Ok(audio) => self.audio = Some(audio),
+                Err(e) => self.report_audio_problem(e.to_string()),
+            },
+            Ok(None) => {}
+            Err(e) => self.report_audio_problem(e),
+        }
     }
 
     /// Says why playback has no sound, once while the same problem lasts.
@@ -701,6 +742,7 @@ impl Editor {
                 self.frames.settle();
                 self.frames.collect_idle();
                 if let Some((started, from)) = self.playing {
+                    self.poll_audio();
                     // Auto quality: step down when more than a fifth of the frames came late.
                     if self.prefs.preview_quality == crate::settings::PreviewQuality::Auto && self.lag_check.elapsed() > Duration::from_secs(1) {
                         let (asked, late) = self.frames.take_lag();
@@ -960,55 +1002,32 @@ impl Editor {
                     });
                 }
             }
-            // The Range tool's three steps: A at the playhead, then B, then Done (✓).
-            Message::MarkRange => {
-                if self.reviewing_range() {
+            // The Range tool: turn it on, drag on the timeline to select, adjust the edges, Done.
+            Message::RangeTool => {
+                if self.range_mode {
                     return self.update(Message::RangeDone);
                 }
-                let t = self.playhead;
-                match self.range_anchor.take() {
-                    Some(a) if (t - a).abs() > 0.05 => {
-                        self.set_range(a.min(t), a.max(t));
-                        self.notify("Range set. Drag its flags to adjust, then click Done", false);
-                    }
-                    Some(a) => {
-                        self.range_anchor = Some(a);
-                        self.notify("Move the playhead to where the range should end", false);
-                    }
-                    None => {
-                        self.range = None;
-                        self.range_anchor = Some(t);
-                        self.notify("Range start (A) set — move the playhead and press R again", false);
-                    }
+                self.range_mode = true;
+                self.notify("Drag on the timeline to select a range", false);
+                self.lanes_cache.clear();
+            }
+            Message::RangePress { clip } => {
+                // A new range starts; it appears once the mouse moves.
+                self.range_mode = true;
+                self.range = None;
+                if let Some(clip) = clip {
+                    self.selection = vec![clip];
+                    self.selected_marker = None;
+                    self.zoom_edit = None;
                 }
                 self.lanes_cache.clear();
             }
             Message::RangeDone => {
-                if self.reviewing_range() {
-                    self.range_review = false;
+                if self.range_mode || self.range.is_some() {
+                    self.range_mode = false;
+                    self.range = None;
                     self.lanes_cache.clear();
                 }
-            }
-            Message::MarkIn => {
-                let t = self.playhead;
-                match self.range {
-                    Some((_, b)) if b > t + 0.05 => self.set_range(t, b),
-                    _ => {
-                        self.range = None;
-                        self.range_anchor = Some(t);
-                    }
-                }
-                self.lanes_cache.clear();
-            }
-            Message::MarkOut => {
-                let t = self.playhead;
-                let a = self.range_anchor.take().or(self.range.map(|r| r.0)).unwrap_or(0.0);
-                if t > a + 0.05 {
-                    self.set_range(a, t);
-                } else {
-                    self.notify("The end of the range must come after its start", true);
-                }
-                self.lanes_cache.clear();
             }
             Message::AddZoomAtPlayhead => self.add_zoom_at_playhead(),
             Message::RangeVolume(clip, v) => {
@@ -1031,6 +1050,14 @@ impl Editor {
                 }
                 self.side_tab = SideTab::Inspector;
                 self.lanes_cache.clear();
+            }
+            Message::DevType(typed) => {
+                use iced::widget::text_editor::{Action, Edit as Typed, Motion};
+                let Some(id) = self.text_draft.as_ref().map(|(id, _)| *id) else { return Task::none() };
+                let _ = self.update(Message::TextDraft(id, Action::Move(Motion::DocumentEnd)));
+                for c in typed.chars() {
+                    let _ = self.update(Message::TextDraft(id, Action::Edit(Typed::Insert(c))));
+                }
             }
             Message::DevSelectText(a, b) => {
                 use iced::widget::text_editor::{Action, Motion};
@@ -1167,6 +1194,20 @@ impl Editor {
                 (self.effect_press, self.effect_dnd) = (None, None);
                 return self.apply_effect(effect, Some(target));
             }
+            Message::ToggleFavoriteEffect(effect) => {
+                let key = effect.key();
+                match self.favorite_effects.iter().position(|k| *k == key) {
+                    Some(i) => {
+                        self.favorite_effects.remove(i);
+                    }
+                    None => self.favorite_effects.push(key),
+                }
+            }
+            Message::ToggleEffectGroup(title) => {
+                if !self.effects_open.remove(title) {
+                    self.effects_open.insert(title.to_string());
+                }
+            }
             Message::MarkerColor(c) => {
                 self.marker_color = c;
                 // Recolor a selected marker, too.
@@ -1244,9 +1285,10 @@ impl Editor {
             }
             Message::SetRange(r) => {
                 self.range = r;
-                self.range_anchor = None;
-                // A range dragged out on the ruler (or adjusted) gets the same Done step.
-                self.range_review = r.is_some();
+                // A range drawn with Shift on the ruler turns the Range tool on too, so Done shows.
+                if r.is_some() {
+                    self.range_mode = true;
+                }
                 self.lanes_cache.clear();
             }
             Message::Edit(id, edit) => {
@@ -1462,6 +1504,16 @@ impl Editor {
             }
             Message::ToolImported(call, results, add) => return self.finish_tool_import(call, results, add),
             Message::ToolSound(call, sound, r) => return self.finish_tool_sound(call, sound, r),
+            Message::ToolBeats(call, r) => {
+                call.answer(r.map(|beats| {
+                    let times = serde_json::to_string(&beats).unwrap_or_default();
+                    crate::mcp::text(if beats.is_empty() {
+                        "No clear beats found (silence, or music/narration without sharp hits). Pace the edit by eye instead.".to_string()
+                    } else {
+                        format!("Beats, timeline seconds: {times}")
+                    })
+                }));
+            }
             Message::CropEdit(target) => {
                 self.crop_edit = target;
                 if let Some(clip) = target {
@@ -1527,12 +1579,11 @@ impl Editor {
                     self.lanes_cache.clear();
                     return Task::none();
                 }
-                if self.range_anchor.take().is_some() {
-                    return Task::none();
+                if self.range_mode {
+                    return self.update(Message::RangeDone);
                 }
                 if self.renaming.take().is_none() {
                     self.range = None;
-                    self.range_review = false;
                     self.selected_marker = None;
                     self.selection.clear();
                     self.lanes_cache.clear();
@@ -1728,9 +1779,10 @@ impl Editor {
         if clips.is_empty() {
             items.push(MenuItem::new(code::TYPE, "Add text at playhead", Message::AddText).shortcut("T"));
             items.push(MenuItem::new(code::FLAG, if self.range.is_some() { "Add marker over range" } else { "Add marker at playhead" }, Message::AddMarker).shortcut("Shift+M"));
-            items.push(MenuItem::new(code::SQUARE_DASHED, if self.range_anchor.is_some() { "Set range end (B)" } else { "Set range start (A)" }, Message::MarkRange).shortcut("R"));
-            if self.range.is_some() {
-                items.push(MenuItem::new(code::X, "Clear range", Message::SetRange(None)));
+            if self.range_mode {
+                items.push(MenuItem::new(code::CHECK, "Done with the range", Message::RangeDone).shortcut("Enter"));
+            } else {
+                items.push(MenuItem::new(code::SQUARE_DASHED, "Select a range", Message::RangeTool).shortcut("R"));
             }
             return widgets::menu(items, 240.0);
         }
@@ -1851,8 +1903,69 @@ impl Editor {
             Effect::Transition(kind) => self.update(Message::ApplyTransition(kind)),
             Effect::Intro(kind) => self.update(Message::ApplyMotion { intro: true, kind }),
             Effect::Outro(kind) => self.update(Message::ApplyMotion { intro: false, kind }),
+            Effect::Frame(style) => {
+                self.apply_frame_style(&targets, style);
+                Task::none()
+            }
+            Effect::Zoom => {
+                // Dropped on the timeline: the zoom starts there. On the preview: at the playhead,
+                // aimed at the drop point.
+                let [clip] = targets[..] else {
+                    self.notify("Zooms go on one video or image at a time", false);
+                    return Task::none();
+                };
+                self.selection = vec![clip];
+                if let Some(DropTarget::Timeline { t, .. }) = target {
+                    self.playhead = t;
+                }
+                let before = self.doc.project.clip(clip).map(|c| c.zooms.len()).unwrap_or(0);
+                self.add_zoom_at_playhead();
+                if let (Some(DropTarget::Canvas { at: (x, y), .. }), Some(c)) = (target, self.doc.project.clip(clip)) {
+                    if c.zooms.len() > before {
+                        if let Some(z) = c.zooms.iter().max_by_key(|z| z.id) {
+                            let zid = z.id;
+                            return self.update(Message::Edit(clip, Edit::ZoomFocus(zid, x, y)));
+                        }
+                    }
+                }
+                Task::none()
+            }
             Effect::Blur | Effect::Highlight(_) => Task::none(),
         }
+    }
+
+    /// Rounded corners, a border or a shadow on the selected pictures, as one undo step.
+    /// Text has none of these; it's skipped (with a word if that's all there was).
+    fn apply_frame_style(&mut self, targets: &[Id], style: library::FrameStyle) {
+        use library::FrameStyle;
+        let p = &self.doc.project;
+        let ids: Vec<Id> = targets.iter().copied().filter(|&id| p.clip(id).is_some_and(|c| p.clip_has_picture(c) && !matches!(c.content, crate::clip::Content::Text(_) | crate::clip::Content::Blur(_)))).collect();
+        if ids.is_empty() {
+            self.notify("Frame styles go on videos, images and shapes", false);
+            return;
+        }
+        let name = match style {
+            FrameStyle::Corners => "Rounded corners",
+            FrameStyle::Border => "Border",
+            FrameStyle::Shadow => "Shadow",
+        };
+        self.edit(name, |p| {
+            for &id in &ids {
+                p.ensure_unlocked(id)?;
+                let l = &mut p.clip_mut(id)?.look;
+                match style {
+                    FrameStyle::Corners => l.corner_radius = if l.corner_radius > 0.0 { l.corner_radius } else { 28.0 },
+                    FrameStyle::Border => {
+                        if l.border_width <= 0.0 {
+                            l.border_width = 4.0;
+                            l.border_color = crate::clip::Rgba::WHITE;
+                        }
+                    }
+                    FrameStyle::Shadow => l.shadow.enabled = true,
+                }
+            }
+            Ok(())
+        });
     }
 
     /// Selects a clip for on-canvas editing and moves the playhead onto it if needed.
@@ -1868,23 +1981,9 @@ impl Editor {
         self.lanes_cache.clear();
     }
 
-    /// The marked range, or A to the playhead while the end is still being chosen.
-    fn shown_range(&self) -> Option<(f64, f64)> {
-        match self.range_anchor {
-            Some(a) => Some((a.min(self.playhead), a.max(self.playhead))),
-            None => self.range,
-        }
-    }
-
     fn set_range(&mut self, a: f64, b: f64) {
         self.range = Some((a, b));
-        self.range_anchor = None;
-        self.range_review = true;
-    }
-
-    /// A and B are set and the Range tool is waiting for Done.
-    fn reviewing_range(&self) -> bool {
-        self.range_review && self.range.is_some() && self.range_anchor.is_none()
+        self.range_mode = true;
     }
 
     /// Camtasia-style: a zoom starting at the playhead on the clip under it. Right after
@@ -2199,22 +2298,13 @@ impl Editor {
     }
 
     fn timeline_header(&self) -> Element<'_, Message> {
-        let range_label = match (self.range_anchor, self.range) {
-            (Some(_), _) => "Set B",
-            _ => "Range",
-        };
-        // After A and B: Done finishes the range, ✕ clears it.
-        let range_tool: Element<'_, Message> = if self.reviewing_range() {
+        // Range mode: Done replaces the tool; it clears the range when its job is done.
+        let range_tool: Element<'_, Message> = if self.range_mode {
             let done = button(row![icon(code::CHECK, 13), text("Done").font(INTER_SEMIBOLD).size(T_SMALL)].spacing(6).align_y(Alignment::Center)).padding([5, 10]).style(style::primary).on_press(Message::RangeDone);
-            row![
-                widgets::tip(done, "Finish the range (drag its flags on the ruler to adjust it first)", Some("Enter"), tip_pos()),
-                widgets::tip(widgets::icon_button(code::X, Some(Message::SetRange(None))), "Clear the range", Some("Esc"), tip_pos()),
-            ]
-            .spacing(2)
-            .align_y(Alignment::Center)
-            .into()
+            let tip = if self.range.is_some() { "Drag the edges to adjust. Done clears the range" } else { "Drag on the timeline to select a range" };
+            widgets::tip(done, tip, Some("Enter"), tip_pos())
         } else {
-            widgets::tip(labeled_tool(code::SQUARE_DASHED, range_label, self.range_anchor.is_some() || self.range.is_some(), Message::MarkRange), "Mark A, move the playhead, mark B, then Done", Some("R  ·  I / O"), tip_pos())
+            widgets::tip(labeled_tool(code::SQUARE_DASHED, "Range", false, Message::RangeTool), "Select a part of the timeline: drag across it", Some("R"), tip_pos())
         };
         let tools = row![
             widgets::tip(labeled_tool(code::SCISSORS, "Split", false, Message::SplitAtPlayhead), "Split at the playhead", Some("S"), tip_pos()),
@@ -2245,7 +2335,7 @@ impl Editor {
             let add = DropDownless::add_track_button(project);
             let ruler = row![
                 container(add).width(HEADER_W).height(RULER_H).padding([0, 8]).center_y(RULER_H),
-                iced::widget::canvas(Ruler { markers: &project.markers, selected_marker: self.selected_marker, view: self.view, playhead: self.playhead, range: self.range, anchor: self.range_anchor }).width(Fill).height(RULER_H),
+                iced::widget::canvas(Ruler { markers: &project.markers, selected_marker: self.selected_marker, view: self.view, playhead: self.playhead, range: self.range, range_mode: self.range_mode }).width(Fill).height(RULER_H),
             ];
             let lanes = Lanes {
                 project,
@@ -2255,7 +2345,8 @@ impl Editor {
                 view: self.view,
                 snapping: self.snapping,
                 zoom_edit: self.zoom_edit,
-                range: self.shown_range(),
+                range: self.range,
+                range_mode: self.range_mode,
                 dnd: self.dnd,
                 dnd_effect: self.effect_dnd,
                 missing: &self.missing,
@@ -2378,10 +2469,9 @@ pub fn blocked_by_dialog(m: &Message) -> bool {
             | Message::DuplicateSelection
             | Message::Arrange(_)
             | Message::SplitAtPlayhead
-            | Message::MarkRange
+            | Message::RangeTool
+            | Message::RangePress { .. }
             | Message::RangeDone
-            | Message::MarkIn
-            | Message::MarkOut
             | Message::AddZoomAtPlayhead
             | Message::AddText
             | Message::Undo
@@ -2518,9 +2608,7 @@ fn editor_event(event: Event, status: event::Status, _window: window::Id) -> Opt
                 Key::Character("i") if cmd => Some(Message::Import),
                 Key::Character("b") => Some(Message::SplitAtPlayhead),
                 Key::Character("s") if !cmd => Some(Message::SplitAtPlayhead),
-                Key::Character("r") if !cmd => Some(Message::MarkRange),
-                Key::Character("i") if !cmd => Some(Message::MarkIn),
-                Key::Character("o") if !cmd => Some(Message::MarkOut),
+                Key::Character("r") if !cmd => Some(Message::RangeTool),
                 Key::Character("n") if !cmd => Some(Message::ToggleSnapping),
                 Key::Character("t") if !cmd => Some(Message::AddText),
                 Key::Character("m" | "M") if modifiers.shift() && !cmd => Some(Message::AddMarker),
@@ -2626,35 +2714,38 @@ mod tests {
     }
 
     #[test]
-    fn the_range_tool_marks_a_then_b_then_done() {
-        let (mut ed, _) = editor_with_text("x");
-        ed.playhead = 1.0;
-        let _ = ed.update(Message::MarkRange);
-        assert_eq!((ed.range_anchor, ed.range), (Some(1.0), None), "first press: A");
-        assert!(!ed.reviewing_range());
-        ed.playhead = 3.0;
-        let _ = ed.update(Message::MarkRange);
-        assert_eq!(ed.range, Some((1.0, 3.0)), "second press: B");
-        assert!(ed.reviewing_range(), "then the Done button shows");
-        // Adjusting a flag keeps it open; Done (or a third press) closes it and keeps the range.
-        let _ = ed.update(Message::SetRange(Some((1.0, 3.5))));
-        assert!(ed.reviewing_range());
-        let _ = ed.update(Message::MarkRange);
-        assert!(!ed.reviewing_range());
-        assert_eq!(ed.range, Some((1.0, 3.5)));
-        // A range dragged on the ruler gets Done too; Esc clears it.
-        let _ = ed.update(Message::SetRange(Some((4.0, 5.0))));
-        assert!(ed.reviewing_range());
+    fn the_range_tool_selects_by_dragging_and_done_clears_it() {
+        let (mut ed, clip) = editor_with_text("x");
+        ed.selection.clear();
+        // Range on: the timeline header shows Done.
+        let _ = ed.update(Message::RangeTool);
+        assert!(ed.range_mode && ed.range.is_none());
+        // Press on a clip and drag: the clip gets selected, the range follows the drag.
+        let _ = ed.update(Message::RangePress { clip: Some(clip) });
+        assert_eq!(ed.selection, [clip]);
+        let _ = ed.update(Message::SetRange(Some((1.0, 3.0))));
+        assert_eq!(ed.range, Some((1.0, 3.0)));
+        // Adjusting an edge, or drawing again, replaces it.
+        let _ = ed.update(Message::SetRange(Some((0.5, 3.0))));
+        let _ = ed.update(Message::RangePress { clip: None });
+        assert_eq!((ed.range, ed.selection.as_slice()), (None, [clip].as_slice()), "a press on empty space keeps the selection");
+        let _ = ed.update(Message::SetRange(Some((4.0, 4.5))));
+        // Done: the range is gone and the tool is off.
         let _ = ed.update(Message::RangeDone);
-        assert!(!ed.reviewing_range() && ed.range == Some((4.0, 5.0)));
-        let _ = ed.update(Message::SetRange(Some((4.0, 5.0))));
+        assert!(!ed.range_mode && ed.range.is_none());
+        // R toggles: on, then on again means Done. Esc also finishes.
+        let _ = ed.update(Message::RangeTool);
+        let _ = ed.update(Message::SetRange(Some((1.0, 2.0))));
+        let _ = ed.update(Message::RangeTool);
+        assert!(!ed.range_mode && ed.range.is_none());
+        let _ = ed.update(Message::RangeTool);
+        let _ = ed.update(Message::SetRange(Some((1.0, 2.0))));
         let _ = ed.update(Message::Escape);
-        assert!(ed.range.is_none() && !ed.reviewing_range());
-        // Pressing B at the same spot as A doesn't make an empty range.
-        ed.playhead = 2.0;
-        let _ = ed.update(Message::MarkRange);
-        let _ = ed.update(Message::MarkRange);
-        assert_eq!((ed.range_anchor, ed.range), (Some(2.0), None));
+        assert!(!ed.range_mode && ed.range.is_none());
+        assert_eq!(ed.selection, [clip], "Esc ending the range doesn't also drop the selection");
+        // Shift+drag on the ruler (a range without the tool) turns the tool on, so Done shows.
+        let _ = ed.update(Message::SetRange(Some((2.0, 3.0))));
+        assert!(ed.range_mode);
     }
 
     #[test]
@@ -2718,5 +2809,76 @@ mod tests {
         }
         assert_eq!(draft(&ed).selection().as_deref(), Some("অফার"));
         assert_eq!(inspector::selected_chars(draft(&ed)), Some((5, 9)));
+    }
+
+    #[test]
+    fn favorites_and_groups_of_the_effects_tab() {
+        use library::{Effect, catalog};
+        let (mut ed, _) = editor_with_text("x");
+        // Every effect has its own key (favorites are saved by it).
+        let keys: Vec<String> = catalog().iter().flat_map(|g| g.items.iter().map(|i| i.2.key())).collect();
+        let unique: std::collections::BTreeSet<&String> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len());
+        // Starring adds in order, starring again removes.
+        let (pop, fade) = (Effect::Outro(crate::clip::MotionKind::Pop), Effect::Intro(crate::clip::MotionKind::Fade));
+        let _ = ed.update(Message::ToggleFavoriteEffect(pop));
+        let _ = ed.update(Message::ToggleFavoriteEffect(fade));
+        assert_eq!(ed.favorite_effects, [pop.key(), fade.key()]);
+        let _ = ed.update(Message::ToggleFavoriteEffect(pop));
+        assert_eq!(ed.favorite_effects, [fade.key()]);
+        assert_eq!(pop.label(), "Animate out · Pop");
+        // Groups start closed and open on click.
+        assert!(ed.effects_open.is_empty());
+        let _ = ed.update(Message::ToggleEffectGroup("Animate out"));
+        assert!(ed.effects_open.contains("Animate out"));
+        let _ = ed.update(Message::ToggleEffectGroup("Animate out"));
+        assert!(ed.effects_open.is_empty());
+    }
+
+    #[test]
+    fn frame_effects_and_zooms_from_the_effects_tab() {
+        use library::{Effect, FrameStyle};
+        let (mut ed, text) = editor_with_text("Title");
+        let info = crate::media::ProbeInfo { kind: crate::model::MediaKind::Image, duration: 0.0, width: 800, height: 600, fps: 0.0, has_audio: false };
+        let asset = ed.doc.project.add_asset(&std::env::current_exe().unwrap(), &info);
+        let image = ed.doc.project.add_media_clip(asset, None, 0.0).unwrap();
+        let look = |ed: &Editor| ed.doc.project.clip(image).unwrap().look.clone();
+
+        // Click with the image and the text selected: the frame goes on the image only, as one step.
+        ed.selection = vec![image, text];
+        let _ = ed.apply_effect(Effect::Frame(FrameStyle::Corners), None);
+        let _ = ed.apply_effect(Effect::Frame(FrameStyle::Border), None);
+        let _ = ed.apply_effect(Effect::Frame(FrameStyle::Shadow), None);
+        let l = look(&ed);
+        assert!(l.corner_radius > 0.0 && l.border_width > 0.0 && l.shadow.enabled);
+        assert_eq!(ed.doc.project.clip(text).unwrap().look, crate::clip::Look::default(), "text has no frame");
+        // Applying corners again keeps the radius the user set.
+        let _ = ed.update(Message::Edit(image, inspector::Edit::Radius(60.0)));
+        let _ = ed.apply_effect(Effect::Frame(FrameStyle::Corners), None);
+        assert_eq!(look(&ed).corner_radius, 60.0);
+        // The inspector's remove buttons take each one off.
+        let _ = ed.update(Message::Edit(image, inspector::Edit::Shadow(false)));
+        assert!(!look(&ed).shadow.enabled);
+        // Only text selected: nothing changes.
+        ed.selection = vec![text];
+        let before = ed.doc.project.clone();
+        let _ = ed.apply_effect(Effect::Frame(FrameStyle::Shadow), None);
+        assert_eq!(ed.doc.project, before);
+
+        // A zoom dropped on the preview aims at the drop point.
+        ed.playhead = 1.0;
+        let _ = ed.apply_effect(Effect::Zoom, Some(DropTarget::Canvas { clip: Some(image), at: (0.25, 0.75) }));
+        let z = ed.doc.project.clip(image).unwrap().zooms[0];
+        assert!((z.focus_x - 0.25).abs() < 1e-6 && (z.focus_y - 0.75).abs() < 1e-6, "{z:?}");
+        // Dropped on the timeline after it: a second zoom starts where it was dropped.
+        let c = ed.doc.project.clip(image).unwrap().clone();
+        let t = c.start + z.at + z.duration + 0.6;
+        assert!(t < c.end());
+        let _ = ed.apply_effect(Effect::Zoom, Some(DropTarget::Timeline { clip: Some(image), track: None, t }));
+        let zooms = &ed.doc.project.clip(image).unwrap().zooms;
+        assert!(zooms.len() == 2 && zooms.iter().any(|z| (z.at - (t - c.start)).abs() < 1e-6), "{zooms:?}");
+        // Dropped on that zoom: it opens it instead of stacking another.
+        let _ = ed.apply_effect(Effect::Zoom, Some(DropTarget::Timeline { clip: Some(image), track: None, t }));
+        assert_eq!(ed.doc.project.clip(image).unwrap().zooms.len(), 2);
     }
 }

@@ -212,3 +212,104 @@ pub fn waveform(path: &Path, per_second: u32) -> anyhow::Result<Vec<f32>> {
         .collect();
     Ok(peaks)
 }
+
+/// Times (seconds after `seek`) of percussive hits and beats in `seek..seek+length` of the audio
+/// at `path`: for syncing motion (zooms, cuts, text entrances) to music instead of guessing.
+/// Energy-based onset detection (no FFT, no extra dependency) — finds clear hits in typical
+/// music and sound effects; not a tempo/BPM analysis.
+pub fn detect_beats(path: &Path, seek: f64, length: f64) -> anyhow::Result<Vec<f64>> {
+    const RATE: u32 = 8000;
+    // 10 ms frames: fine enough to place a hit, coarse enough that one hit isn't several.
+    const FRAME: usize = 80;
+    // Two hits closer than this read as one.
+    const MIN_GAP_SECS: f64 = 0.15;
+    // Decode a bit before `seek` too: a beat right at the start of the requested range still
+    // needs a quieter frame before it to stand out against, or it's indistinguishable from the
+    // decode just starting loud.
+    const LEAD_SECS: f64 = 0.5;
+    let lead = LEAD_SECS.min(seek);
+
+    let mut child = ffmpeg::ffmpeg()?
+        .args(["-ss", &ffmpeg::secs(seek - lead), "-t", &ffmpeg::secs(length + lead), "-i"])
+        .arg(path)
+        .args(["-vn", "-ac", "1", "-ar", &RATE.to_string(), "-f", "s16le", "pipe:1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start ffmpeg")?;
+    let mut stdout = child.stdout.take().unwrap();
+    let mut bytes = Vec::new();
+    stdout.read_to_end(&mut bytes)?;
+    let _ = child.wait();
+
+    let energy: Vec<f32> = bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect::<Vec<_>>()
+        .chunks(FRAME)
+        .map(|f| ((f.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / f.len() as f64).sqrt() / 32768.0) as f32)
+        .collect();
+    if energy.len() < 3 {
+        return Ok(Vec::new());
+    }
+    // Onset strength: how much louder a frame is than the one before it.
+    let flux: Vec<f32> = std::iter::once(0.0).chain(energy.windows(2).map(|w| (w[1] - w[0]).max(0.0))).collect();
+    let mean = flux.iter().sum::<f32>() / flux.len() as f32;
+    let variance = flux.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / flux.len() as f32;
+    let threshold = mean + 1.5 * variance.sqrt();
+
+    let min_gap = ((MIN_GAP_SECS * RATE as f64 / FRAME as f64) as usize).max(1);
+    let mut beats = Vec::new();
+    let mut last = None::<usize>;
+    for i in 1..flux.len() - 1 {
+        let is_peak = flux[i] > threshold && flux[i] >= flux[i - 1] && flux[i] >= flux[i + 1];
+        if is_peak && last.is_none_or(|l| i - l >= min_gap) {
+            last = Some(i);
+            // Spacing (and the threshold/mean) still accounts for a peak found in the lead-in,
+            // but only hits inside the actually requested range are reported.
+            let t = i as f64 * FRAME as f64 / RATE as f64 - lead;
+            if t >= 0.0 {
+                beats.push(t);
+            }
+        }
+    }
+    Ok(beats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_beats_finds_periodic_clicks() {
+        let dir = std::env::temp_dir().join(format!("studio-beats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clicks.wav");
+        let status = ffmpeg::ffmpeg()
+            .unwrap()
+            .args(["-f", "lavfi", "-i", "aevalsrc=exprs=lt(mod(t\\,0.5)\\,0.01)*sin(2*PI*1000*t):s=8000:d=4", "-y"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let beats = detect_beats(&path, 0.0, 4.0).unwrap();
+        // A click every 0.5s over 4s: about 8 onsets.
+        assert!(beats.len() >= 6 && beats.len() <= 9, "expected ~8 beats, got {beats:?}");
+        for pair in beats.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!((gap - 0.5).abs() < 0.08, "gap {gap} should be close to 0.5s");
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn detect_beats_is_quiet_on_silence() {
+        let dir = std::env::temp_dir().join(format!("studio-silence-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("silence.wav");
+        let status = ffmpeg::ffmpeg().unwrap().args(["-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono:d=2", "-y"]).arg(&path).status().unwrap();
+        assert!(status.success());
+        let beats = detect_beats(&path, 0.0, 2.0).unwrap();
+        assert!(beats.is_empty(), "silence shouldn't register any beats, got {beats:?}");
+    }
+}

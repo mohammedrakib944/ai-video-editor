@@ -12,7 +12,7 @@ use iced::futures::SinkExt;
 use serde_json::{Value, json};
 
 pub const SERVER_KEY: &str = "ai-video-editor";
-/// Header the built-in assistant sends with every request, naming its run.
+/// Header the built-in assistant sends with every request, naming its run (or `?run=` in the URL).
 pub const RUN_HEADER: &str = "X-Aive-Run";
 const DEFAULT_PORT: u16 = 47822;
 const CALL_TIMEOUT: Duration = Duration::from_secs(180);
@@ -103,7 +103,13 @@ fn respond(req: tiny_http::Request, status: u16, body: Option<String>) {
 fn handle_http(tx: Sender<Call>, mut req: tiny_http::Request) {
     // Only local pages may talk to us (protects against DNS rebinding from websites).
     let origin = req.headers().iter().find(|h| h.field.equiv("Origin")).map(|h| h.value.as_str().to_string());
-    let run = req.headers().iter().find(|h| h.field.equiv(RUN_HEADER)).map(|h| h.value.as_str().to_string());
+    // The built-in assistant names its run in a header (Claude Code) or in the URL (`/mcp?run=…`, Codex).
+    let run = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv(RUN_HEADER))
+        .map(|h| h.value.as_str().to_string())
+        .or_else(|| req.url().split_once("?run=").map(|(_, r)| r.split('&').next().unwrap_or(r).to_string()));
     if let Some(o) = origin {
         let local = o.starts_with("http://127.0.0.1") || o.starts_with("http://localhost") || o == "null";
         if !local {

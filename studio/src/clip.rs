@@ -754,6 +754,14 @@ impl Clip {
             _ => 0.0,
         }
     }
+
+    /// Timeline time at which source-file time `s` plays: the inverse of `source_time`.
+    pub fn timeline_time(&self, s: f64) -> f64 {
+        match self.content {
+            Content::Media { src_in, speed, .. } => self.start + (s - src_in) / speed,
+            _ => self.start,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -794,6 +802,20 @@ mod tests {
         assert_eq!(sample(&keys, 1.0), Some(5.0));
         assert_eq!(sample(&keys, 3.0), Some(10.0));
         assert_eq!(sample(&[], 1.0), None);
+    }
+
+    #[test]
+    fn timeline_time_is_the_inverse_of_source_time() {
+        let c = Clip::new(1, 1, 10.0, 5.0, Content::Media { asset: 1, src_in: 2.0, speed: 2.0 });
+        // At timeline 10s (the clip's start) the source is at src_in; 1s of timeline is 2s of
+        // source at 2x speed.
+        assert_eq!(c.source_time(10.0), 2.0);
+        assert_eq!(c.source_time(11.0), 4.0);
+        assert_eq!(c.timeline_time(2.0), 10.0);
+        assert_eq!(c.timeline_time(4.0), 11.0);
+        for t in [10.0, 10.5, 12.3] {
+            assert!((c.timeline_time(c.source_time(t)) - t).abs() < 1e-9, "round trip at t={t}");
+        }
     }
 
     #[test]

@@ -16,8 +16,6 @@ use crate::ui::{style, widgets};
 #[derive(Debug, Clone)]
 pub enum Edit {
     Name(String),
-    X(f64),
-    Y(f64),
     Position(f64, f64),
     Scale(f64),
     Rotation(f64),
@@ -49,8 +47,6 @@ pub enum Edit {
     Align(Align),
     TextBox(bool),
     ShapeKind(crate::clip::ShapeKind),
-    ShapeWidth(f64),
-    ShapeHeight(f64),
     ShapeFill(Rgba),
     ShapeGradient(bool),
     ShapeFillTo(Rgba),
@@ -73,11 +69,9 @@ pub enum Edit {
     CropTop(f64),
     CropRight(f64),
     CropBottom(f64),
-    /// Blur clips: strength (0..100), oval or box, and the box size in canvas units.
+    /// Blur clips: strength (0..100), oval or box (the box is moved and sized on the preview).
     BlurStrength(f64),
     BlurEllipse(bool),
-    BlurWidth(f64),
-    BlurHeight(f64),
     /// A shape resized on the canvas: width and height (canvas units) and its new center.
     ShapeBox(f64, f64, f64, f64),
     /// Restyles characters `start..end` of a text clip.
@@ -89,7 +83,7 @@ impl Edit {
     pub fn describe(&self) -> (&'static str, &'static str) {
         match self {
             Edit::Name(_) => ("name", "Rename clip"),
-            Edit::X(_) | Edit::Y(_) | Edit::Position(..) => ("position", "Move"),
+            Edit::Position(..) => ("position", "Move"),
             Edit::Scale(_) => ("scale", "Scale"),
             Edit::Rotation(_) => ("rotation", "Rotate"),
             Edit::Opacity(_) => ("opacity", "Opacity"),
@@ -107,13 +101,13 @@ impl Edit {
             Edit::SpanStyle(..) => ("text-span", "Style words"),
             Edit::Font(_) | Edit::FontSize(_) | Edit::Weight(_) | Edit::TextColor(_) | Edit::Align(_) | Edit::TextBox(_) => ("text-style", "Text style"),
             Edit::Intro(_) | Edit::Outro(_) | Edit::IntroDuration(_) | Edit::OutroDuration(_) => ("motion", "Animation"),
-            Edit::ShapeKind(_) | Edit::ShapeWidth(_) | Edit::ShapeHeight(_) | Edit::ShapeThickness(_) | Edit::ShapeBox(..) => ("shape", "Shape"),
+            Edit::ShapeKind(_) | Edit::ShapeThickness(_) | Edit::ShapeBox(..) => ("shape", "Shape"),
             Edit::ShapeFill(_) | Edit::ShapeGradient(_) | Edit::ShapeFillTo(_) | Edit::ShapeRadial(_) | Edit::ShapeAngle(_) => ("shape-fill", "Shape fill"),
             Edit::Transition(_) | Edit::TransitionDuration(_) => ("transition", "Transition"),
             Edit::RemoveZoom(_) => ("remove-zoom", "Remove zoom"),
             Edit::ZoomScale(..) | Edit::ZoomFocusX(..) | Edit::ZoomFocusY(..) | Edit::ZoomFocus(..) => ("zoom", "Zoom"),
             Edit::Crop(_) | Edit::CropLeft(_) | Edit::CropTop(_) | Edit::CropRight(_) | Edit::CropBottom(_) => ("crop", "Crop"),
-            Edit::BlurStrength(_) | Edit::BlurEllipse(_) | Edit::BlurWidth(_) | Edit::BlurHeight(_) => ("blur", "Blur"),
+            Edit::BlurStrength(_) | Edit::BlurEllipse(_) => ("blur", "Blur"),
         }
     }
 
@@ -124,8 +118,6 @@ impl Edit {
         let g = &mut c.grade;
         match self.clone() {
             Edit::Name(s) => c.name = (!s.trim().is_empty()).then(|| s.trim().to_string()),
-            Edit::X(v) => t.x = v,
-            Edit::Y(v) => t.y = v,
             Edit::Position(x, y) => {
                 t.x = x;
                 t.y = y;
@@ -187,8 +179,6 @@ impl Edit {
                     match edit {
                         Edit::BlurStrength(v) => b.strength = v.clamp(0.0, 100.0),
                         Edit::BlurEllipse(on) => b.ellipse = on,
-                        Edit::BlurWidth(v) => b.width = v.clamp(4.0, 4000.0),
-                        Edit::BlurHeight(v) => b.height = v.clamp(4.0, 4000.0),
                         Edit::ShapeBox(w, h, x, y) => {
                             b.width = w.clamp(4.0, 4000.0);
                             b.height = h.clamp(4.0, 4000.0);
@@ -202,8 +192,6 @@ impl Edit {
                 if let Content::Shape(s) = &mut c.content {
                     match edit {
                         Edit::ShapeKind(k) => s.kind = k,
-                        Edit::ShapeWidth(v) => s.width = v,
-                        Edit::ShapeHeight(v) => s.height = v,
                         Edit::ShapeFill(col) => s.fill = col,
                         Edit::ShapeGradient(on) => s.fill_to = on.then(|| s.fill_to.unwrap_or(Rgba::hex(0x2EF2A2))),
                         Edit::ShapeFillTo(col) => s.fill_to = Some(col),
@@ -277,27 +265,6 @@ impl std::fmt::Display for TransitionChoice {
     }
 }
 
-const TRANSITIONS: [TransitionChoice; 7] = [
-    TransitionChoice(None),
-    TransitionChoice(Some(TransitionKind::Crossfade)),
-    TransitionChoice(Some(TransitionKind::SlideLeft)),
-    TransitionChoice(Some(TransitionKind::SlideUp)),
-    TransitionChoice(Some(TransitionKind::Push)),
-    TransitionChoice(Some(TransitionKind::ZoomThrough)),
-    TransitionChoice(Some(TransitionKind::Wipe)),
-];
-
-const MOTIONS: [MotionChoice; 8] = [
-    MotionChoice(None),
-    MotionChoice(Some(MotionKind::Fade)),
-    MotionChoice(Some(MotionKind::SlideUp)),
-    MotionChoice(Some(MotionKind::SlideDown)),
-    MotionChoice(Some(MotionKind::SlideLeft)),
-    MotionChoice(Some(MotionKind::SlideRight)),
-    MotionChoice(Some(MotionKind::Pop)),
-    MotionChoice(Some(MotionKind::ZoomIn)),
-];
-
 pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<'a, Message> {
     let (zoom_edit, range, hex) = (ctx.zoom_edit, ctx.range, ctx.hex);
     let id = clip.id;
@@ -369,6 +336,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
                 iced::widget::text_editor(content)
                     .placeholder("Type your text…")
                     .on_action(move |a| Message::TextDraft(id, a))
+                    .key_binding(widgets::editor_keys)
                     .highlight_with::<SpanHighlighter>(span_marks(t), span_format)
                     .padding([8, 10])
                     .size(T_BODY)
@@ -417,8 +385,6 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             .menu_style(style::select_menu);
         let mut body = column![
             row![text("Shape").size(T_SMALL).color(TEXT_2).width(84), kind_pick].align_y(Alignment::Center),
-            slider_row("Width", s.width, 10.0..=2400.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::ShapeWidth(v))),
-            slider_row("Height", s.height, 10.0..=2400.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::ShapeHeight(v))),
         ]
         .spacing(S3);
         if matches!(s.kind, crate::clip::ShapeKind::Ring | crate::clip::ShapeKind::Frame) {
@@ -439,18 +405,17 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
         col = add(col, &mut shown, ctx.section(code::SHAPES, "Shape", body.into()));
     }
 
+    // Everything below adjusts what the clip already has. Effects are added from the Effects
+    // tab; position and size are set on the preview.
     if is_visual {
         let tr = &clip.transform;
-        let mut transform = column![
-            slider_row("Position X", tr.x * 100.0, -50.0..=150.0, 0.1, |v| format!("{v:.0}%"), move |v| e(Edit::X(v / 100.0))),
-            slider_row("Position Y", tr.y * 100.0, -50.0..=150.0, 0.1, |v| format!("{v:.0}%"), move |v| e(Edit::Y(v / 100.0))),
-            slider_row("Scale", tr.scale * 100.0, 5.0..=400.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::Scale(v / 100.0))),
+        let mut layer = column![
             slider_row("Rotation", tr.rotation, -180.0..=180.0, 0.5, |v| format!("{v:.0}°"), move |v| e(Edit::Rotation(v))),
             slider_row("Opacity", tr.opacity * 100.0, 0.0..=100.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::Opacity(v / 100.0))),
         ]
         .spacing(S3);
         if matches!(clip.content, Content::Media { .. }) {
-            transform = transform.push(
+            layer = layer.push(
                 row![
                     text("Framing").size(T_SMALL).color(TEXT_2).width(84),
                     widgets::segmented(&[Fit::Contain, Fit::Cover], tr.fit, |f| if *f == Fit::Contain { "Fit".into() } else { "Fill".into() }, move |f| e(Edit::Fit(f))),
@@ -458,29 +423,36 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
                 .align_y(Alignment::Center),
             );
         }
-        col = add(col, &mut shown, ctx.section_reset(code::MOVE, "Transform", e(Edit::ResetTransform), transform.into()));
+        col = add(col, &mut shown, ctx.section(code::MOVE, "Layer", layer.into()));
         if matches!(clip.content, Content::Media { .. }) {
             col = add(col, &mut shown, crop_section(clip, ctx));
         }
 
+        // Frame style: only the parts added from Effects → Frame, each with its remove button.
         if !matches!(clip.content, Content::Text(_)) {
             let l = &clip.look;
-            let mut frame = column![
-                slider_row("Corners", l.corner_radius, 0.0..=200.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::Radius(v))),
-                slider_row("Border", l.border_width, 0.0..=40.0, 0.5, |v| format!("{v:.1}"), move |v| e(Edit::BorderWidth(v))),
-            ]
-            .spacing(S3);
-            if l.border_width > 0.0 {
-                frame = frame.push(color_row("Border color", l.border_color, (id, "border", hex), move |c| e(Edit::BorderColor(c))));
+            let mut frame = column![].spacing(S3);
+            if l.corner_radius > 0.0 {
+                frame = frame
+                    .push(applied("Rounded corners", e(Edit::Radius(0.0))))
+                    .push(slider_row("Radius", l.corner_radius, 1.0..=200.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::Radius(v))));
             }
-            frame = frame.push(toggle_row("Drop shadow", l.shadow.enabled, move |on| e(Edit::Shadow(on))));
+            if l.border_width > 0.0 {
+                frame = frame
+                    .push(applied("Border", e(Edit::BorderWidth(0.0))))
+                    .push(slider_row("Width", l.border_width, 0.5..=40.0, 0.5, |v| format!("{v:.1}"), move |v| e(Edit::BorderWidth(v))))
+                    .push(color_row("Color", l.border_color, (id, "border", hex), move |c| e(Edit::BorderColor(c))));
+            }
             if l.shadow.enabled {
                 frame = frame
+                    .push(applied("Shadow", e(Edit::Shadow(false))))
                     .push(slider_row("Blur", l.shadow.blur, 0.0..=200.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::ShadowBlur(v))))
                     .push(slider_row("Distance", l.shadow.offset_y, -100.0..=100.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::ShadowOffset(v))))
                     .push(slider_row("Strength", l.shadow.opacity * 100.0, 0.0..=100.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::ShadowOpacity(v / 100.0))));
             }
-            col = add(col, &mut shown, ctx.section(code::FRAME, "Frame style", frame.into()));
+            if l.corner_radius > 0.0 || l.border_width > 0.0 || l.shadow.enabled {
+                col = add(col, &mut shown, ctx.section(code::FRAME, "Frame style", frame.into()));
+            }
         }
 
         let g = &clip.grade;
@@ -498,39 +470,33 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             .into(),
         ));
 
-        let motion_pick = |current: Option<MotionKind>, f: fn(Option<MotionKind>) -> Edit| {
-            pick_list(&MOTIONS[..], Some(MotionChoice(current)), move |m: MotionChoice| e(f(m.0)))
-                .padding([6, 9])
-                .text_size(T_BODY)
-                .width(Fill)
-                .style(style::select)
-                .menu_style(style::select_menu)
-        };
+        // Animation and transition: only the ones on the clip (pick another in Effects to change it).
         let max_motion = (clip.duration / 2.0).max(0.1);
-        let mut anim = column![row![text("In").size(T_SMALL).color(TEXT_2).width(84), motion_pick(clip.intro.map(|m| m.kind), Edit::Intro)].align_y(Alignment::Center)].spacing(S3);
+        let mut anim = column![].spacing(S3);
         if let Some(m) = clip.intro {
-            anim = anim.push(slider_row("Duration", m.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::IntroDuration(v))));
+            anim = anim
+                .push(applied(format!("In · {}", MotionChoice(Some(m.kind))), e(Edit::Intro(None))))
+                .push(slider_row("Duration", m.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::IntroDuration(v))));
         }
-        anim = anim.push(row![text("Out").size(T_SMALL).color(TEXT_2).width(84), motion_pick(clip.outro.map(|m| m.kind), Edit::Outro)].align_y(Alignment::Center));
         if let Some(m) = clip.outro {
-            anim = anim.push(slider_row("Duration", m.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::OutroDuration(v))));
+            anim = anim
+                .push(applied(format!("Out · {}", MotionChoice(Some(m.kind))), e(Edit::Outro(None))))
+                .push(slider_row("Duration", m.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::OutroDuration(v))));
         }
-        col = add(col, &mut shown, ctx.section(code::SPARKLES, "Animation", anim.into()));
-
-        let transition_pick = pick_list(&TRANSITIONS[..], Some(TransitionChoice(clip.transition.map(|t| t.kind))), move |t: TransitionChoice| e(Edit::Transition(t.0)))
-            .padding([6, 9])
-            .text_size(T_BODY)
-            .width(Fill)
-            .style(style::select)
-            .menu_style(style::select_menu);
-        let mut trans = column![row![text("Style").size(T_SMALL).color(TEXT_2).width(84), transition_pick].align_y(Alignment::Center)].spacing(S3);
+        if clip.intro.is_some() || clip.outro.is_some() {
+            col = add(col, &mut shown, ctx.section(code::SPARKLES, "Animation", anim.into()));
+        }
         if let Some(t) = clip.transition {
-            trans = trans.push(slider_row("Duration", t.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::TransitionDuration(v))));
+            let trans = column![
+                applied(TransitionChoice(Some(t.kind)).to_string(), e(Edit::Transition(None))),
+                slider_row("Duration", t.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::TransitionDuration(v))),
+            ]
+            .spacing(S3);
+            col = add(col, &mut shown, ctx.section(code::BLEND, "Transition in", trans.into()));
         }
-        col = add(col, &mut shown, ctx.section(code::BLEND, "Transition in", trans.into()));
     }
 
-    if is_video || (kind == Some(MediaKind::Image) && is_visual) {
+    if !clip.zooms.is_empty() && (is_video || (kind == Some(MediaKind::Image) && is_visual)) {
         let mut zooms = column![].spacing(S3);
         for (i, z) in clip.zooms.iter().enumerate() {
             let zid = z.id;
@@ -543,7 +509,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
                             text(format!("Zoom {}", i + 1)).font(INTER_SEMIBOLD).size(T_SMALL),
                             text(format!("{:.1}s – {:.1}s", z.at, z.at + z.duration)).size(T_CAPTION).color(TEXT_3),
                             space().width(Fill),
-                            widgets::icon_button(code::TRASH_2, Some(e(Edit::RemoveZoom(zid)))).width(24).height(24),
+                            widgets::tip(widgets::icon_button(code::TRASH_2, Some(e(Edit::RemoveZoom(zid)))).width(24).height(24), "Remove", None, iced::widget::tooltip::Position::Left),
                         ]
                         .spacing(6)
                         .align_y(Alignment::Center),
@@ -570,7 +536,6 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
                 }),
             );
         }
-        zooms = zooms.push(widgets::secondary_button(Some(code::PLUS), "Add zoom at playhead", Some(Message::AddZoomAtPlayhead)).width(Fill));
         col = add(col, &mut shown, ctx.section(code::ZOOM_IN, "Zoom & pan", zooms.into()));
     }
 
@@ -685,19 +650,10 @@ fn blur_clip<'a>(clip: &'a Clip, b: &crate::clip::BlurLayer, ctx: &Ctx<'a>, col:
             widgets::segmented(&[false, true], b.ellipse, |el| if *el { "Oval".into() } else { "Box".into() }, move |el| e(Edit::BlurEllipse(el))),
         ]
         .align_y(Alignment::Center),
-        slider_row("Width", b.width, 10.0..=2400.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::BlurWidth(v))),
-        slider_row("Height", b.height, 10.0..=2400.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::BlurHeight(v))),
-        text("Blurs the video and images under it, only inside the box and only while it's on the timeline. Drag it on the preview; trim it on the timeline.").size(T_CAPTION).color(TEXT_3),
+        text("Blurs the video and images under it, only inside the box and only while it's on the timeline. Move and size it on the preview; trim it on the timeline.").size(T_CAPTION).color(TEXT_3),
     ]
     .spacing(S3);
-    let col = add(col, shown, ctx.section(code::DROPLETS, "Blur", body.into()));
-    let tr = &clip.transform;
-    let place = column![
-        slider_row("Position X", tr.x * 100.0, -50.0..=150.0, 0.1, |v| format!("{v:.0}%"), move |v| e(Edit::X(v / 100.0))),
-        slider_row("Position Y", tr.y * 100.0, -50.0..=150.0, 0.1, |v| format!("{v:.0}%"), move |v| e(Edit::Y(v / 100.0))),
-    ]
-    .spacing(S3);
-    add(col, shown, ctx.section(code::MOVE, "Transform", place.into()))
+    add(col, shown, ctx.section(code::DROPLETS, "Blur", body.into()))
 }
 
 /// What the inspector shows besides the clip: edit modes, the range, typed colors,
@@ -717,8 +673,8 @@ pub struct Ctx<'a> {
 fn keywords(title: &str) -> &'static str {
     match title {
         "Text" => "font size weight bold color align background box type words",
-        "Shape" => "width height size fill gradient color radial linear direction thickness ring",
-        "Transform" => "position x y move scale size rotation rotate angle opacity transparency framing fit fill",
+        "Shape" => "fill gradient color radial linear direction thickness ring kind",
+        "Layer" => "rotation rotate angle opacity transparency framing fit fill transform",
         "Frame style" => "corners rounded radius border outline stroke drop shadow blur distance strength",
         "Color" => "brightness contrast saturation warmth temperature grade",
         "Crop" => "cut trim edges left right top bottom",
@@ -947,6 +903,18 @@ impl iced::advanced::text::Highlighter for SpanHighlighter {
     fn current_line(&self) -> usize {
         self.line
     }
+}
+
+/// An effect on the clip: its name, and a button that takes it off.
+fn applied<'a>(name: impl text::IntoFragment<'a>, remove: Message) -> Element<'a, Message> {
+    row![
+        container(space().width(6).height(6)).style(style::swatch(ACCENT, 3.0)),
+        text(name).font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_1).width(Fill),
+        widgets::tip(widgets::icon_button(code::X, Some(remove)).width(24).height(24), "Remove", None, iced::widget::tooltip::Position::Left),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn toggle_row<'a>(name: &'a str, on: bool, on_toggle: impl Fn(bool) -> Message + 'a) -> Element<'a, Message> {

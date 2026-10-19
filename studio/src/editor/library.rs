@@ -118,7 +118,15 @@ impl Editor {
             .padding(5),
         ];
         let name_font = if a.name.is_ascii() { INTER_MEDIUM } else { HIND };
-        let card = container(column![thumb, text(&a.name).font(name_font).size(T_CAPTION).wrapping(text::Wrapping::None)].spacing(6))
+        // Long file names are shortened in the middle to fit the card (the start and the
+        // extension stay readable); the full name shows on hover.
+        let name: &'a str = &a.name;
+        let fitted = iced::widget::responsive(move |size| {
+            let fits = ((size.width / NAME_CHAR_W).floor() as usize).max(6);
+            container(text(fit_name(name, fits)).font(name_font).size(T_CAPTION).wrapping(text::Wrapping::None)).width(Fill).clip(true).into()
+        });
+        let name_row = widgets::tip(container(fitted).width(Fill).height(16), name, None, iced::widget::tooltip::Position::Bottom);
+        let card = container(column![thumb, name_row].spacing(6))
             .padding(5)
             .width(Fill)
             .style(move |t| {
@@ -153,13 +161,22 @@ impl Editor {
     fn effects_tab(&self) -> Element<'_, Message> {
         let has_selection = !self.selection.is_empty();
         // Click applies to the selection; drag drops onto any clip (timeline or preview).
-        let card = |glyph: char, label: &'static str, effect: Effect| -> Element<'_, Message> {
+        // The star in the corner keeps an effect in Favorites.
+        let card = |glyph: char, label: &'static str, caption: Option<&'static str>, effect: Effect| -> Element<'_, Message> {
             let hovered = self.effect_hover == Some(effect);
-            let body = container(column![container(icon(glyph, 18).color(ACCENT_HOVER)).center_x(Fill).height(30).align_y(Alignment::Center), text(label).font(INTER_MEDIUM).size(T_SMALL)].spacing(4).align_x(Alignment::Center))
-                .width(Fill)
-                .padding([10, 6])
-                .style(move |t| effect_card(t, hovered));
-            mouse_area(body)
+            let favorite = self.favorite_effects.iter().any(|k| *k == effect.key());
+            let mut info = column![container(icon(glyph, 18).color(ACCENT_HOVER)).center_x(Fill).height(30).align_y(Alignment::Center), text(label).font(INTER_MEDIUM).size(T_SMALL)].spacing(4).align_x(Alignment::Center);
+            if let Some(c) = caption {
+                info = info.push(text(c).size(T_CAPTION).color(TEXT_3));
+            }
+            let body = container(info).width(Fill).padding([10, 6]).style(move |t| effect_card(t, hovered));
+            let star = button(icon(code::STAR, 11).color(if favorite { ACCENT } else if hovered { TEXT_3 } else { TEXT_4 }))
+                .padding(4)
+                .style(style::ghost)
+                .on_press(Message::ToggleFavoriteEffect(effect));
+            let star = widgets::tip(star, if favorite { "Remove from favorites" } else { "Add to favorites" }, None, iced::widget::tooltip::Position::Top);
+            let card = stack![body, container(star).align_right(Fill).padding(2)];
+            mouse_area(card)
                 .on_press(Message::EffectPress(effect))
                 .on_release(Message::EffectClick(effect))
                 .on_enter(Message::EffectHover(Some(effect)))
@@ -167,35 +184,63 @@ impl Editor {
                 .interaction(mouse::Interaction::Grab)
                 .into()
         };
-        let transitions = [
-            (code::BLEND, "Crossfade", TransitionKind::Crossfade),
-            (code::ARROW_LEFT_RIGHT, "Slide", TransitionKind::SlideLeft),
-            (code::CHEVRON_UP, "Slide up", TransitionKind::SlideUp),
-            (code::ZOOM_IN, "Zoom through", TransitionKind::ZoomThrough),
-            (code::COLUMNS_3, "Wipe", TransitionKind::Wipe),
-            (code::MOVE, "Push", TransitionKind::Push),
-        ];
-        let motions = [
-            (code::SUN, "Fade", MotionKind::Fade),
-            (code::CHEVRON_UP, "Slide up", MotionKind::SlideUp),
-            (code::CHEVRON_DOWN, "Slide down", MotionKind::SlideDown),
-            (code::CHEVRON_LEFT, "Slide left", MotionKind::SlideLeft),
-            (code::CHEVRON_RIGHT, "Slide right", MotionKind::SlideRight),
-            (code::SPARKLE, "Pop", MotionKind::Pop),
-            (code::FOCUS, "Zoom in", MotionKind::ZoomIn),
-        ];
         fn grid(items: Vec<Element<'_, Message>>) -> iced::widget::Grid<'_, Message> {
             iced::widget::grid(items).fluid(110).spacing(6).height(iced::widget::grid::Sizing::EvenlyDistribute(Length::Shrink))
         }
         let hint = if has_selection { "Click to apply to the selected clips, or drag onto any clip." } else { "Drag onto a clip on the timeline or the preview." };
-        let highlights = [
-            (code::RECTANGLE_HORIZONTAL, "Box", Highlight::Box),
-            (code::CIRCLE, "Circle", Highlight::Circle),
-            (code::HIGHLIGHTER, "Highlight", Highlight::Marker),
-            (code::MINUS, "Underline", Highlight::Underline),
-        ];
-        // The color new markers get (each one can be recolored in the inspector later).
-        let swatches = row(MARKER_COLORS.iter().map(|&hex| {
+        let mut col = column![text(hint).size(T_CAPTION).color(TEXT_3)].spacing(S3);
+
+        // Favorites: always open, on top.
+        let groups = catalog();
+        let favorites: Vec<Element<'_, Message>> = self
+            .favorite_effects
+            .iter()
+            .filter_map(|key| groups.iter().find_map(|g| g.items.iter().find(|i| i.2.key() == *key).map(|i| card(i.0, i.1, Some(g.title), i.2))))
+            .collect();
+        let fav_head = row![tinted(code::STAR, 12, ACCENT), widgets::section("Favorites")].spacing(6).align_y(Alignment::Center);
+        let fav_body: Element<'_, Message> = if favorites.is_empty() {
+            container(text("Star an effect to keep it here.").size(T_CAPTION).color(TEXT_4)).padding([10, 12]).width(Fill).style(style::inset).into()
+        } else {
+            grid(favorites).into()
+        };
+        col = col.push(column![fav_head, fav_body].spacing(S2));
+
+        // Every other group starts collapsed; its title opens it.
+        for g in &groups {
+            let open = self.effects_open.contains(g.title);
+            let head = button(
+                row![
+                    icon(if open { code::CHEVRON_DOWN } else { code::CHEVRON_RIGHT }, 12).color(TEXT_3),
+                    text(g.title).font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_2),
+                    space().width(Fill),
+                    text(g.items.len()).size(T_CAPTION).color(TEXT_4),
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center),
+            )
+            .width(Fill)
+            .padding([8, 10])
+            .style(style::ghost)
+            .on_press(Message::ToggleEffectGroup(g.title));
+            let mut group = column![head].spacing(S2);
+            if open {
+                if g.title == MARKERS {
+                    group = group.push(self.marker_swatches());
+                }
+                group = group.push(grid(g.items.iter().map(|&(glyph, label, effect)| card(glyph, label, None, effect)).collect()));
+                if g.title == MARKERS {
+                    let timeline_marker = widgets::secondary_button(Some(code::FLAG), "Add timeline marker", Some(Message::AddMarker)).width(Fill);
+                    group = group.push(widgets::tip(timeline_marker, "A colored flag on the ruler (or a span over the marked range)", Some("Shift+M"), iced::widget::tooltip::Position::Top));
+                }
+            }
+            col = col.push(container(group).width(Fill).style(style::inset));
+        }
+        widgets::scroll(col.padding([8, 10])).height(Fill).into()
+    }
+
+    /// The color new markers get (each one can be recolored in the inspector later).
+    fn marker_swatches(&self) -> Element<'_, Message> {
+        row(MARKER_COLORS.iter().map(|&hex| {
             let c = Rgba::hex(hex);
             let selected = c.to_hex() == self.marker_color.to_hex();
             button(space().width(18).height(18))
@@ -212,28 +257,8 @@ impl Editor {
                 .on_press(Message::MarkerColor(c))
                 .into()
         }))
-        .spacing(6);
-        let timeline_marker = widgets::secondary_button(Some(code::FLAG), "Add timeline marker", Some(Message::AddMarker)).width(Fill);
-        widgets::scroll(
-            column![
-                text(hint).size(T_CAPTION).color(TEXT_3),
-                widgets::section("Markers"),
-                swatches,
-                grid(highlights.iter().map(|&(g, l, k)| card(g, l, Effect::Highlight(k))).collect()),
-                widgets::tip(timeline_marker, "A colored flag on the ruler (or a span over the marked range)", Some("Shift+M"), iced::widget::tooltip::Position::Top),
-                widgets::section("Hide"),
-                grid(vec![card(code::DROPLETS, "Blur area", Effect::Blur)]),
-                widgets::section("Transition in"),
-                grid(transitions.iter().map(|&(g, l, k)| card(g, l, Effect::Transition(k))).collect()),
-                widgets::section("Animate in"),
-                grid(motions.iter().map(|&(g, l, k)| card(g, l, Effect::Intro(k))).collect()),
-                widgets::section("Animate out"),
-                grid(motions.iter().map(|&(g, l, k)| card(g, l, Effect::Outro(k))).collect()),
-            ]
-            .spacing(S3)
-            .padding([8, 10]),
-        )
-        .height(Fill)
+        .spacing(6)
+        .padding([0, 10])
         .into()
     }
 
@@ -276,16 +301,95 @@ pub enum Effect {
     Outro(MotionKind),
     Blur,
     Highlight(Highlight),
+    /// Rounded corners, a border or a drop shadow on a picture.
+    Frame(FrameStyle),
+    /// A zoom (or a pan, right after another zoom) on a video or image.
+    Zoom,
+}
+
+/// The frame styles a picture can get from the Effects tab (adjusted in the inspector).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameStyle {
+    Corners,
+    Border,
+    Shadow,
+}
+
+/// The marker group of the Effects tab (it also has the color swatches).
+pub const MARKERS: &str = "Markers";
+
+/// One group of the Effects tab: its title and its effects (icon, name, effect).
+pub struct EffectGroup {
+    pub title: &'static str,
+    pub items: Vec<(char, &'static str, Effect)>,
+}
+
+/// Everything the Effects tab offers, in order.
+pub fn catalog() -> Vec<EffectGroup> {
+    let motions = [
+        (code::SUN, "Fade", MotionKind::Fade),
+        (code::CHEVRON_UP, "Slide up", MotionKind::SlideUp),
+        (code::CHEVRON_DOWN, "Slide down", MotionKind::SlideDown),
+        (code::CHEVRON_LEFT, "Slide left", MotionKind::SlideLeft),
+        (code::CHEVRON_RIGHT, "Slide right", MotionKind::SlideRight),
+        (code::SPARKLE, "Pop", MotionKind::Pop),
+        (code::FOCUS, "Zoom in", MotionKind::ZoomIn),
+    ];
+    vec![
+        EffectGroup {
+            title: MARKERS,
+            items: vec![
+                (code::RECTANGLE_HORIZONTAL, "Box", Effect::Highlight(Highlight::Box)),
+                (code::CIRCLE, "Circle", Effect::Highlight(Highlight::Circle)),
+                (code::HIGHLIGHTER, "Highlight", Effect::Highlight(Highlight::Marker)),
+                (code::MINUS, "Underline", Effect::Highlight(Highlight::Underline)),
+            ],
+        },
+        EffectGroup { title: "Hide", items: vec![(code::DROPLETS, "Blur area", Effect::Blur)] },
+        EffectGroup {
+            title: "Frame",
+            items: vec![
+                (code::SQUARE_DASHED, "Corners", Effect::Frame(FrameStyle::Corners)),
+                (code::FRAME, "Border", Effect::Frame(FrameStyle::Border)),
+                (code::LAYERS, "Shadow", Effect::Frame(FrameStyle::Shadow)),
+            ],
+        },
+        EffectGroup { title: "Zoom & pan", items: vec![(code::ZOOM_IN, "Zoom", Effect::Zoom)] },
+        EffectGroup {
+            title: "Transition in",
+            items: vec![
+                (code::BLEND, "Crossfade", Effect::Transition(TransitionKind::Crossfade)),
+                (code::ARROW_LEFT_RIGHT, "Slide", Effect::Transition(TransitionKind::SlideLeft)),
+                (code::CHEVRON_UP, "Slide up", Effect::Transition(TransitionKind::SlideUp)),
+                (code::ZOOM_IN, "Zoom through", Effect::Transition(TransitionKind::ZoomThrough)),
+                (code::COLUMNS_3, "Wipe", Effect::Transition(TransitionKind::Wipe)),
+                (code::MOVE, "Push", Effect::Transition(TransitionKind::Push)),
+            ],
+        },
+        EffectGroup { title: "Animate in", items: motions.iter().map(|&(g, l, k)| (g, l, Effect::Intro(k))).collect() },
+        EffectGroup { title: "Animate out", items: motions.iter().map(|&(g, l, k)| (g, l, Effect::Outro(k))).collect() },
+    ]
 }
 
 impl Effect {
-    pub fn label(self) -> &'static str {
+    /// "Animate out · Pop": the group and the effect, for the drag label and messages.
+    pub fn label(self) -> String {
+        catalog()
+            .iter()
+            .find_map(|g| g.items.iter().find(|i| i.2 == self).map(|i| if g.items.len() == 1 || g.title == MARKERS { i.1.to_string() } else { format!("{} · {}", g.title, i.1) }))
+            .unwrap_or_default()
+    }
+
+    /// A stable name for saving favorites.
+    pub fn key(self) -> String {
         match self {
-            Effect::Transition(_) => "Transition",
-            Effect::Intro(_) => "Animate in",
-            Effect::Outro(_) => "Animate out",
-            Effect::Blur => "Blur area",
-            Effect::Highlight(h) => h.label(),
+            Effect::Transition(k) => format!("transition:{k:?}"),
+            Effect::Intro(k) => format!("in:{k:?}"),
+            Effect::Outro(k) => format!("out:{k:?}"),
+            Effect::Blur => "blur".into(),
+            Effect::Highlight(h) => format!("marker:{h:?}"),
+            Effect::Frame(f) => format!("frame:{f:?}"),
+            Effect::Zoom => "zoom".into(),
         }
     }
 }
@@ -301,15 +405,6 @@ pub enum Highlight {
 }
 
 impl Highlight {
-    pub fn label(self) -> &'static str {
-        match self {
-            Highlight::Box => "Box",
-            Highlight::Circle => "Circle",
-            Highlight::Marker => "Highlight",
-            Highlight::Underline => "Underline",
-        }
-    }
-
     /// The shape, its corner radius, and its clip name.
     pub fn build(self, color: Rgba) -> (crate::clip::ShapeLayer, f64, &'static str) {
         use crate::clip::{ShapeKind, ShapeLayer};
@@ -337,6 +432,21 @@ impl Highlight {
 
 /// Colors offered for markers (on the video and on the timeline).
 pub const MARKER_COLORS: [u32; 8] = [0xFFD43B, 0xD6FF00, 0x2EF2A2, 0x4C8DFF, 0x8B7CF6, 0xFF6363, 0xFFA94D, 0xFFFFFF];
+
+/// Widest average character of a caption-size name (digits and capitals included), in pixels.
+const NAME_CHAR_W: f32 = 6.7;
+
+/// `name` shortened to `max` characters with "…" in the middle, keeping its extension.
+fn fit_name(name: &str, max: usize) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= max {
+        return name.to_string();
+    }
+    let ext = name.rfind('.').map(|i| name[i..].chars().count()).filter(|&n| n <= 6).unwrap_or(0);
+    let tail = (ext + 4).min(max / 2);
+    let head = max.saturating_sub(tail + 1).max(1);
+    format!("{}…{}", chars[..head].iter().collect::<String>(), chars[chars.len() - tail..].iter().collect::<String>())
+}
 
 /// "VIDEOS  3": a media group's title and how many files it holds.
 fn media_group_header<'a>(title: &str, count: usize) -> Element<'a, Message> {
@@ -467,3 +577,20 @@ impl iced::widget::canvas::Program<Message> for ShapeIcon {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::fit_name;
+
+    #[test]
+    fn long_names_are_shortened_in_the_middle() {
+        assert_eq!(fit_name("logo.png", 20), "logo.png");
+        let short = fit_name("8847400-hd_1920_1080_25fps.mp4", 20);
+        assert_eq!(short.chars().count(), 20);
+        assert!(short.starts_with("8847400-hd_") && short.ends_with("fps.mp4") && short.contains('…'), "{short}");
+        let bangla = fit_name("পণ্যের ডেমো ভিডিও চূড়ান্ত সংস্করণ.mp4", 14);
+        assert_eq!(bangla.chars().count(), 14);
+        assert!(bangla.ends_with(".mp4"));
+        assert_eq!(fit_name("abcdefghijklmnop", 6).chars().count(), 6);
+    }
+}

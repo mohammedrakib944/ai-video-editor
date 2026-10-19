@@ -240,3 +240,53 @@ mod clipped_impl {
         }
     }
 }
+
+/// Keys for multi-line text boxes: the defaults, plus deleting a word at a time like
+/// single-line inputs do (Ctrl+Backspace / Ctrl+Delete; Option on macOS).
+pub fn editor_keys<M>(key: iced::widget::text_editor::KeyPress) -> Option<iced::widget::text_editor::Binding<M>> {
+    use iced::keyboard::{Key, key::Named};
+    use iced::widget::text_editor::{Binding, Motion};
+    if key.modifiers.jump() {
+        match key.key {
+            Key::Named(Named::Backspace) => return Some(Binding::Sequence(vec![Binding::Select(Motion::WordLeft), Binding::Backspace])),
+            Key::Named(Named::Delete) => return Some(Binding::Sequence(vec![Binding::Select(Motion::WordRight), Binding::Delete])),
+            _ => {}
+        }
+    }
+    Binding::from_key_press(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use iced::keyboard::{Key, Modifiers, key};
+    use iced::widget::text_editor::{Action, Binding, Content, Edit, KeyPress, Motion};
+
+    fn press(named: key::Named, modifiers: Modifiers) -> Option<Binding<()>> {
+        super::editor_keys(KeyPress { key: Key::Named(named), modified_key: Key::Named(named), physical_key: iced::keyboard::key::Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified), modifiers, text: None, status: iced::widget::text_editor::Status::Focused { is_hovered: false } })
+    }
+
+    /// Runs a binding the way the text box does, action by action.
+    fn apply(content: &mut Content, b: Binding<()>) {
+        match b {
+            Binding::Sequence(list) => list.into_iter().for_each(|b| apply(content, b)),
+            Binding::Select(m) => content.perform(Action::Select(m)),
+            Binding::Backspace => content.perform(Action::Edit(Edit::Backspace)),
+            Binding::Delete => content.perform(Action::Edit(Edit::Delete)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_backspace_and_ctrl_delete_remove_a_word() {
+        let jump = if cfg!(target_os = "macos") { Modifiers::ALT } else { Modifiers::CTRL };
+        let mut c = Content::with_text("Launch your store today");
+        c.perform(Action::Move(Motion::DocumentEnd));
+        apply(&mut c, press(key::Named::Backspace, jump).unwrap());
+        assert_eq!(c.text(), "Launch your store ");
+        c.perform(Action::Move(Motion::DocumentStart));
+        apply(&mut c, press(key::Named::Delete, jump).unwrap());
+        assert_eq!(c.text().trim_start(), "your store ");
+        // A plain Backspace still removes one character.
+        assert!(matches!(press(key::Named::Backspace, Modifiers::empty()), Some(Binding::Backspace)));
+    }
+}

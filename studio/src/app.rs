@@ -50,6 +50,8 @@ pub enum Message {
     Ai(crate::ai_connect::Message),
     OpenAi,
     AiChecked(crate::settings::AiProvider, Result<String, String>),
+    /// The ChatGPT sign-in in the browser finished (or failed).
+    AiSignedIn(Result<(), String>),
     /// Media dropped on the start screen: make a project from it.
     StartDrop(PathBuf),
     OpenSettings,
@@ -67,8 +69,11 @@ pub struct App {
     zoom_menu: bool,
     ai_dialog: bool,
     settings_dialog: bool,
-    ai_checking: bool,
-    ai_detail: Option<Result<String, String>>,
+    /// The AI being checked in the Connect AI dialog.
+    ai_checking: Option<crate::settings::AiProvider>,
+    /// Waiting for the ChatGPT sign-in in the browser.
+    ai_signing_in: bool,
+    ai_detail: Option<(crate::settings::AiProvider, Result<String, String>)>,
     error: Option<String>,
     window_size: iced::Size,
 }
@@ -79,7 +84,7 @@ impl App {
             eprintln!("assistant server: {e}");
         }
         let error = (!crate::ffmpeg::is_available()).then(|| format!("FFmpeg was not found, so media can't be imported or previewed. {}", crate::ffmpeg::missing_hint()));
-        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, ai_dialog: false, settings_dialog: false, ai_checking: false, ai_detail: None, error, window_size: iced::Size::ZERO };
+        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, ai_dialog: false, settings_dialog: false, ai_checking: None, ai_signing_in: false, ai_detail: None, error, window_size: iced::Size::ZERO };
         let path = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file());
         let task = match path {
             Some(p) => Task::done(Message::OpenPicked(Some(p))),
@@ -171,9 +176,17 @@ impl App {
             Message::Ai(msg) => match msg {
                 crate::ai_connect::Message::Close => self.ai_dialog = false,
                 crate::ai_connect::Message::Connect(provider) => {
-                    self.ai_checking = true;
+                    self.ai_checking = Some(provider);
                     self.ai_detail = None;
-                    return Task::perform(async move { tokio::task::spawn_blocking(crate::assistant::claude_version).await.unwrap_or_else(|e| Err(e.to_string())) }, move |r| Message::AiChecked(provider, r));
+                    let check = match provider {
+                        crate::settings::AiProvider::ClaudeCode => crate::assistant::claude_version,
+                        crate::settings::AiProvider::Codex => crate::assistant::codex_status,
+                    };
+                    return Task::perform(async move { tokio::task::spawn_blocking(check).await.unwrap_or_else(|e| Err(e.to_string())) }, move |r| Message::AiChecked(provider, r));
+                }
+                crate::ai_connect::Message::SignIn => {
+                    self.ai_signing_in = true;
+                    return Task::perform(async { tokio::task::spawn_blocking(crate::assistant::codex_sign_in).await.unwrap_or_else(|e| Err(e.to_string())) }, Message::AiSignedIn);
                 }
                 crate::ai_connect::Message::Disconnect => {
                     self.settings.ai = None;
@@ -184,6 +197,8 @@ impl App {
                     }
                 }
                 crate::ai_connect::Message::CopyUrl => return iced::clipboard::write(crate::mcp::url()),
+                crate::ai_connect::Message::CopySetup => return iced::clipboard::write(crate::ai_connect::setup_snippet(&crate::mcp::url())),
+                crate::ai_connect::Message::CopyInstall => return iced::clipboard::write(crate::assistant::CODEX_INSTALL.to_string()),
             },
             Message::StartDrop(path) => {
                 if !crate::media::is_media_path(&path) {
@@ -198,8 +213,19 @@ impl App {
                 let open = self.create_project();
                 return open.chain(Task::done(Message::Editor(editor::Message::ImportPicked(vec![path]))));
             }
+            // Signed in: check again, which connects it.
+            Message::AiSignedIn(Ok(())) => {
+                self.ai_signing_in = false;
+                return self.update(Message::Ai(crate::ai_connect::Message::Connect(crate::settings::AiProvider::Codex)));
+            }
+            Message::AiSignedIn(Err(e)) => {
+                self.ai_signing_in = false;
+                self.ai_detail = Some((crate::settings::AiProvider::Codex, Err(e)));
+            }
             Message::AiChecked(provider, result) => {
-                self.ai_checking = false;
+                if self.ai_checking == Some(provider) {
+                    self.ai_checking = None;
+                }
                 if result.is_ok() {
                     self.settings.ai = Some(provider);
                     self.settings.save();
@@ -207,7 +233,7 @@ impl App {
                         e.set_ai(Some(provider));
                     }
                 }
-                self.ai_detail = Some(result);
+                self.ai_detail = Some((provider, result));
             }
             Message::Editor(msg) => {
                 if let Screen::Editor(e) = &mut self.screen {
@@ -324,6 +350,8 @@ impl App {
     fn persist(&mut self) {
         if let Screen::Editor(e) = &mut self.screen {
             self.settings.inspector_collapsed = e.collapsed.clone();
+            self.settings.favorite_effects = e.favorite_effects.clone();
+            self.settings.effects_open = e.effects_open.clone();
             self.settings.layout = e.layout();
             if let (true, Some(path)) = (e.doc.is_dirty(), e.path.clone()) {
                 if e.doc.project.save(&path).is_ok() {
@@ -365,6 +393,8 @@ impl App {
         editor.set_ai(self.settings.ai);
         editor.apply_prefs(&self.settings.prefs, true);
         editor.collapsed = self.settings.inspector_collapsed.clone();
+        editor.favorite_effects = self.settings.favorite_effects.clone();
+        editor.effects_open = self.settings.effects_open.clone();
         let _ = editor.update(editor::Message::WindowSize(self.window_size));
         let task = editor.boot().map(Message::Editor);
         let task = task.chain(window::latest().and_then(window::size).map(Message::WindowSize));
@@ -441,38 +471,41 @@ impl App {
                     .style(style::badge(DANGER)),
             );
         }
-        let mut window_content: Element<'_, Message> = content.into();
+        // The window is always the same stack of layers, empty when unused: changing the shape
+        // of the widget tree (say, wrapping it in a stack only while something is dragged) makes
+        // iced rebuild every panel, which loses their scroll positions and text cursors.
+        let mut dragged_layer: Element<'_, Message> = space().into();
         if let Screen::Editor(e) = &self.screen {
             // What's being dragged: media from the library, or an effect.
             let dragged = match (e.dnd.and_then(|id| e.project().asset(id)), e.effect_dnd) {
-                (Some(asset), _) => Some((code::FILM, asset.name.as_str())),
+                (Some(asset), _) => Some((code::FILM, asset.name.clone())),
                 (None, Some(effect)) => Some((code::SPARKLES, effect.label())),
                 _ => None,
             };
             if let Some((glyph, label)) = dragged {
                 let ghost = container(row![icon(glyph, 13), text(label).size(T_SMALL)].spacing(6).align_y(Alignment::Center)).padding([6, 10]).style(style::popover);
                 let inset = if chrome::draws_frame(self.maximized) { chrome::SHADOW_INSET + 1.0 } else { 0.0 };
-                window_content = iced::widget::stack![
-                    window_content,
-                    iced::widget::pin(iced::widget::opaque(ghost)).x(e.cursor.x - inset + 12.0).y(e.cursor.y - inset + 10.0),
-                ]
-                .into();
+                dragged_layer = iced::widget::pin(iced::widget::opaque(ghost)).x(e.cursor.x - inset + 12.0).y(e.cursor.y - inset + 10.0).into();
             }
         }
-        if self.settings_dialog {
-            let dialog = crate::settings_dialog::view(&self.settings.prefs, crate::settings::projects_dir()).map(Message::Settings);
-            window_content = iced::widget::stack![window_content, dialog].into();
-        }
-        if self.ai_dialog {
-            let dialog = crate::ai_connect::view(crate::ai_connect::State {
+        let settings_layer: Element<'_, Message> = if self.settings_dialog {
+            crate::settings_dialog::view(&self.settings.prefs, crate::settings::projects_dir()).map(Message::Settings)
+        } else {
+            space().into()
+        };
+        let ai_layer: Element<'_, Message> = if self.ai_dialog {
+            crate::ai_connect::view(crate::ai_connect::State {
                 connected: self.settings.ai,
                 checking: self.ai_checking,
-                detail: self.ai_detail.as_ref(),
+                signing_in: self.ai_signing_in,
+                detail: self.ai_detail.as_ref().map(|(p, r)| (*p, r)),
                 mcp_url: crate::mcp::url(),
             })
-            .map(Message::Ai);
-            window_content = iced::widget::stack![window_content, dialog].into();
-        }
+            .map(Message::Ai)
+        } else {
+            space().into()
+        };
+        let window_content: Element<'_, Message> = iced::widget::stack![content, dragged_layer, settings_layer, ai_layer].into();
         chrome::frame(window_content, self.maximized, Message::Window)
     }
 
@@ -638,6 +671,11 @@ fn snapshot_task() -> Task<Message> {
     };
     // `STUDIO_SNAPSHOT_REOPEN=1` switches to the assistant tab last (after a selection opened the inspector).
     // `STUDIO_SNAPSHOT_TEXT=start,end` selects those characters in the text box of the selected text clip.
+    // `STUDIO_SNAPSHOT_TYPE=text` types that at the end of the selected text clip's text box.
+    let typing = match std::env::var("STUDIO_SNAPSHOT_TYPE") {
+        Ok(t) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.25)), move |_| Message::Editor(editor::Message::DevType(t.clone()))),
+        Err(_) => Task::none(),
+    };
     let text_select = match std::env::var("STUDIO_SNAPSHOT_TEXT").ok().map(|v| v.split(',').filter_map(|s| s.parse::<usize>().ok()).collect::<Vec<_>>()) {
         Some(v) if v.len() == 2 => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 0.2)), move |_| Message::Editor(editor::Message::DevSelectText(v[0], v[1]))),
         _ => Task::none(),
@@ -651,7 +689,7 @@ fn snapshot_task() -> Task<Message> {
         Some(t) => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.5)), move |_| Message::Editor(editor::Message::Seek(t))),
         None => Task::none(),
     };
-    Task::batch([open, scroll_first, hscroll, select, text_select, zoom, chat, reopen, seek, shot])
+    Task::batch([open, scroll_first, hscroll, select, typing, text_select, zoom, chat, reopen, seek, shot])
 }
 
 fn window_task(action: WindowAction) -> Task<Message> {

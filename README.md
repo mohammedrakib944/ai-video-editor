@@ -66,8 +66,16 @@ Notes for Linux:
 2. In the app, click **Connect AI** in the title bar → **Connect** next to Claude Code.
    The chip then shows **Claude Code** with a lime dot.
 
-The app finds Claude Code in `~/.local/bin`, on `PATH`, or (Windows) in `%APPDATA%\npm`.
-Nothing is sent to any AI until you connect one.
+**Or use ChatGPT** (your ChatGPT plan, through OpenAI's Codex app):
+
+1. Install Node.js, then Codex: `npm install -g @openai/codex`.
+2. Click **Connect AI** → **Connect** next to ChatGPT, then **Sign in with ChatGPT**: the sign-in page
+   opens in your browser, and the dialog updates by itself when you're done.
+
+The app finds Claude Code and Codex in `~/.local/bin`, `~/.codex/bin`, on `PATH`, or (Windows) in
+`%APPDATA%\npm`. Nothing is sent to any AI until you connect one. Other MCP apps on the same computer
+(Claude Desktop, Cursor, VS Code…) can edit the open project too: the dialog shows the server address,
+and **Copy setup** copies the JSON they accept.
 
 ### Run options
 
@@ -112,10 +120,11 @@ Projects save automatically a couple of seconds after each change.
   audio** (the sound moves to its own audio track), mute, zoom, crop, **bring to front / send to back**,
   range volume and delete. On the preview, a selected element keeps the drag even where another
   element lies over it.
-- **Split at the playhead** (`S`), **mark a range** with the playhead (`R` for A, then B — the
-  range follows the playhead until you set B; or `I`/`O`). Then a **✓ Done** button appears: drag the
-  A/B flags on the ruler to adjust the range, and click Done (or press `Enter` or `R`) to finish; ✕ clears it.
-  Shift+drag on the ruler draws a range too.
+- **Split at the playhead** (`S`). **Select a range** for one job (range volume, a marker over it, or
+  telling the assistant where): click **Range** (`R`), then press on the timeline and drag across the part
+  you want; the clip you press on gets selected. Drag the range's edges to adjust it, or drag again for
+  a new one. Click **✓ Done** (`Enter`, `R` or `Esc`) when the job is done: the range goes away.
+  Shift+drag on the ruler selects a range without the button.
 - **Markers**: colored flags on the ruler (`Shift+M`, or the **Marker** button) — a span when a
   range is marked. Click one to jump to it and rename or recolor it in the inspector; drag to move.
 - **Zoom & pan, Camtasia-style**: put the playhead where the zoom should start and press `Z`.
@@ -126,18 +135,23 @@ Projects save automatically a couple of seconds after each change.
   markers resize from every side (Shift on a corner keeps the proportions). Handles work past the
   canvas edge. **Zoom the preview** from the toolbar (Fit, 25–400%), `Ctrl+0` / `Ctrl+1`, or
   Ctrl + wheel; the wheel or the middle button pans a zoomed preview. This never changes the video size.
-- **Inspector** (search box on top; click a section title to collapse it): position, scale,
-  rotation, opacity, framing; **crop** (sliders, or drag the edges on the canvas); rounded corners,
-  border, drop shadow; color (brightness, contrast, saturation, warmth); speed; volume and fades; **range volume** (change or mute just the marked range of a clip — each changed
-  part keeps its own slider); text (Inter, Poppins, Hind Siliguri for
-  Bangla) — **select words in the text box** to give just them their own color, weight, font, size,
-  marker highlight or underline (styles stay on their words while you keep typing); shapes (rectangle, ellipse, triangle, star, hexagon, ring, frame with linear/radial gradients
-  at any angle); animations in/out; transitions.
-- **Library tabs**: Media (grouped into videos, images and audio), Text (headline, subtitle, Bangla headline, shape presets), Effects
-  (markers — box, circle, highlight, underline in a color you pick — and **blur**: they go on the
-  timeline at the playhead for 3 s, or over the marked range, and you move and resize them on the
-  preview; a blur only blurs the video under its box, only while it's on the timeline; plus
-  transitions and animations: click to apply to the selection, or drag onto any clip), Sounds (9 original effects — whoosh, pop, click, riser…).
+- **Effects add, the Inspector adjusts.** The **Effects** tab is where things are added: markers (box,
+  circle, highlight, underline in a color you pick), **blur** areas, frame styles (corners, border,
+  shadow), zoom & pan, transitions and animations in/out. Click an effect to apply it to the selected
+  clips, or drag it onto any clip on the timeline or the preview. Groups start collapsed; the ☆ on a
+  card keeps it in **Favorites**, always open at the top. Markers and blurs go on the timeline at the
+  playhead for 3 s (or over the selected range); a blur only blurs the video under its box.
+- **Inspector** (search box on top; click a section title to collapse it) shows only what the
+  selected clip has: rotation, opacity and framing (position and size are set on the preview);
+  **crop** (sliders, or drag the edges on the canvas); the frame styles, animations, transition and
+  zooms it got from Effects, each with its settings and a ✕ to remove it; color (brightness, contrast,
+  saturation, warmth); speed; volume and fades; **range volume** (change or mute just the selected range
+  of a clip — each changed part keeps its own slider); text (Inter, Poppins, Hind Siliguri for Bangla) —
+  **select words in the text box** to give just them their own color, weight, font, size, marker
+  highlight or underline (styles stay on their words while you keep typing); shapes (rectangle,
+  ellipse, triangle, star, hexagon, ring, frame with linear/radial gradients at any angle).
+- **Library tabs**: Media (grouped into videos, images and audio), Text (headline, subtitle, Bangla
+  headline, shape presets), Effects (above), Sounds (9 original effects — whoosh, pop, click, riser…).
 - **Assistant**: describe what you want; it sees the playhead, the selected clip and the marked
   range. Write on several lines freely: Enter starts a new line and only the Send button sends. Replies show
   formatted (headings, lists, code with a copy button, links) with a Copy button for the whole reply. Tool calls show
@@ -159,7 +173,7 @@ Projects save automatically a couple of seconds after each change.
 |---|---|
 | Space | Play / pause |
 | S or B (Ctrl+B) | Split at the playhead |
-| R · I · O | Mark range (A, then B, then Done) · set start · set end |
+| R | Range tool on · Done (clears the range) |
 | Z | Add a zoom (or pan) at the playhead |
 | T | Add text at the playhead |
 | Delete / Backspace | Delete the selected clips (or the zoom being edited, or the selected marker) |
@@ -172,6 +186,7 @@ Projects save automatically a couple of seconds after each change.
 | Shift+M | Add a marker (over the marked range, if any) |
 | Ctrl+0 · Ctrl+1 · Ctrl+wheel | Fit the preview · 100% · zoom the preview |
 | Ctrl+Z · Ctrl+Shift+Z or Ctrl+Y | Undo · redo |
+| Ctrl+Backspace · Ctrl+Delete | In text boxes: delete the word before · after the cursor |
 | Ctrl+N · Ctrl+O · Ctrl+S · Ctrl+Shift+S | New · open · save · save as |
 | Ctrl+I · Ctrl+E · Ctrl+K · Ctrl+, | Import · export · assistant · settings |
 | Esc | Close a dialog, cancel a rename, leave zoom/crop editing, clear the selection |

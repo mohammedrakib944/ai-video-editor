@@ -39,12 +39,15 @@ impl Default for Layout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AiProvider {
     ClaudeCode,
+    /// ChatGPT, through OpenAI's Codex CLI signed in with the user's ChatGPT account.
+    Codex,
 }
 
 impl AiProvider {
     pub fn name(self) -> &'static str {
         match self {
             AiProvider::ClaudeCode => "Claude Code",
+            AiProvider::Codex => "ChatGPT",
         }
     }
 }
@@ -60,6 +63,12 @@ pub struct Settings {
     /// Inspector sections the user collapsed.
     #[serde(default)]
     pub inspector_collapsed: std::collections::BTreeSet<String>,
+    /// Effects the user starred (by `Effect::key`), in the order they were starred.
+    #[serde(default)]
+    pub favorite_effects: Vec<String>,
+    /// Effects-tab groups the user opened (they all start collapsed).
+    #[serde(default)]
+    pub effects_open: std::collections::BTreeSet<String>,
     /// Choices from the Settings dialog.
     #[serde(default)]
     pub prefs: Prefs,
@@ -136,7 +145,9 @@ pub struct Prefs {
     pub still_seconds: f64,
     /// Seconds after a change before the project saves itself.
     pub autosave_seconds: u64,
-    /// The preview starts muted.
+    /// The preview starts muted (off by default: the preview plays its sound). Saved under a new
+    /// key when sound-on became the rule, so earlier "muted" choices reset once.
+    #[serde(rename = "preview_starts_muted")]
     pub start_muted: bool,
     pub export_quality: crate::render::export::Quality,
     /// Where new projects go (None = Videos/AI Video Editor).
@@ -259,6 +270,13 @@ mod tests {
         let resized: Settings = serde_json::from_str(r#"{ "recent": [], "layout": { "top_bottom": 0.6, "library": 0.2, "preview_inspector": 0.74, "timeline_auto": false } }"#).unwrap();
         assert!(resized.layout.timeline_auto, "a timeline sized before the smaller default starts compact again");
         assert_eq!(s.prefs.preview_quality, PreviewQuality::Auto);
+        // The preview plays its sound by default; an old "start muted" choice resets once.
+        assert!(!Prefs::default().start_muted);
+        let muted: Settings = serde_json::from_str(r#"{ "recent": [], "prefs": { "start_muted": true } }"#).unwrap();
+        assert!(!muted.prefs.start_muted);
+        let chosen = Settings { prefs: Prefs { start_muted: true, ..Prefs::default() }, ..s };
+        let again: Settings = serde_json::from_str(&serde_json::to_string(&chosen).unwrap()).unwrap();
+        assert!(again.prefs.start_muted, "choosing it again in Settings sticks");
     }
 
     #[test]

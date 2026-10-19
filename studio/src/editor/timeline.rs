@@ -132,8 +132,8 @@ pub struct Ruler<'a> {
     pub selected_marker: Option<Id>,
     pub playhead: f64,
     pub range: Option<(f64, f64)>,
-    /// Range start marked, waiting for its end: the range then follows the playhead.
-    pub anchor: Option<f64>,
+    /// The Range tool is on: a press on the ruler starts a new range instead of scrubbing.
+    pub range_mode: bool,
 }
 
 impl Ruler<'_> {
@@ -147,14 +147,6 @@ impl Ruler<'_> {
             (p.x - x).abs() <= 6.0 || (m.duration > 0.0 && p.x >= x && p.x <= self.view.x(m.at + m.duration) && p.y >= RULER_H - 8.0)
         })
     }
-
-    /// The range to show: the marked one, or A to the playhead while B is still to come.
-    fn shown(&self) -> Option<(f64, f64)> {
-        match self.anchor {
-            Some(a) => Some((a.min(self.playhead), a.max(self.playhead))),
-            None => self.range,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -162,7 +154,7 @@ enum RulerDrag {
     Scrub,
     /// Dragging one end of the range; `fixed` is the other end.
     RangeEdge { fixed: f64 },
-    /// Shift+drag: drawing a new range from `from`.
+    /// Drawing a new range from `from` (Range tool on, or Shift+drag).
     RangeNew { from: f64 },
     /// Moving a marker; `grab` is how far after its start it was picked up.
     Marker { id: Id, grab: f64, moved: bool },
@@ -193,17 +185,17 @@ impl canvas::Program<Message> for Ruler<'_> {
                     state.drag = Some(RulerDrag::Marker { id: m.id, grab: t - m.at, moved: false });
                     return Some(Action::publish(Message::SelectMarker(Some(m.id))).and_capture());
                 }
-                if state.modifiers.shift() {
-                    state.drag = Some(RulerDrag::RangeNew { from: t });
-                    return Some(Action::publish(Message::SetRange(None)).and_capture());
-                }
-                // The flags of a marked range can be dragged to adjust it.
-                if let (None, Some((a, b))) = (self.anchor, self.range) {
+                // The edges of the range can be dragged to adjust it.
+                if let Some((a, b)) = self.range {
                     let (da, db) = ((self.view.x(a) - p.x).abs(), (self.view.x(b) - p.x).abs());
                     if da.min(db) <= FLAG_GRAB {
                         state.drag = Some(RulerDrag::RangeEdge { fixed: if da <= db { b } else { a } });
                         return Some(Action::capture());
                     }
+                }
+                if self.range_mode || state.modifiers.shift() {
+                    state.drag = Some(RulerDrag::RangeNew { from: t });
+                    return Some(Action::publish(Message::RangePress { clip: None }).and_capture());
                 }
                 state.drag = Some(RulerDrag::Scrub);
                 Some(Action::publish(Message::Seek(t)).and_capture())
@@ -249,18 +241,11 @@ impl canvas::Program<Message> for Ruler<'_> {
         let size = bounds.size();
         f.fill_rectangle(Point::ORIGIN, size, SURFACE_1);
         f.fill_rectangle(Point::new(0.0, size.height - 1.0), Size::new(size.width, 1.0), LINE);
-        if let Some((a, b)) = self.shown() {
+        if let Some((a, b)) = self.range {
             let (x0, x1) = (self.view.x(a), self.view.x(b));
-            let pending = self.anchor.is_some();
-            f.fill_rectangle(Point::new(x0, 0.0), Size::new(x1 - x0, size.height), Color { a: if pending { 0.10 } else { 0.18 }, ..ACCENT });
-            match self.anchor {
-                // While marking, A stays put and B rides on the playhead.
-                Some(anchor) => flag(&mut f, self.view.x(anchor), "A"),
-                None => {
-                    for (x, label) in [(x0, "A"), (x1, "B")] {
-                        flag(&mut f, x, label);
-                    }
-                }
+            f.fill_rectangle(Point::new(x0, 0.0), Size::new(x1 - x0, size.height), Color { a: 0.18, ..ACCENT });
+            for x in [x0, x1] {
+                edge_handle(&mut f, x);
             }
         }
         let steps = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0];
@@ -332,11 +317,11 @@ fn marker_glyph(f: &mut Frame, view: View, m: &crate::model::Marker, selected: b
 }
 
 /// A small lettered flag hanging from the top of the ruler.
-fn flag(f: &mut Frame, x: f32, label: &str) {
+/// One edge of the range on the ruler: a line with a small grip to drag it by.
+fn edge_handle(f: &mut Frame, x: f32) {
     f.fill_rectangle(Point::new(x - 0.5, 0.0), Size::new(1.0, RULER_H), ACCENT);
-    let tag = Path::rounded_rectangle(Point::new(x - 7.0, 1.0), Size::new(14.0, 13.0), 3.0.into());
-    f.fill(&tag, ACCENT);
-    f.fill_text(Text { content: label.into(), position: Point::new(x, 7.5), color: ON_ACCENT, size: 9.5.into(), font: INTER_BOLD, align_x: alignment::Horizontal::Center.into(), align_y: alignment::Vertical::Center, ..Text::default() });
+    let grip = Path::rounded_rectangle(Point::new(x - 3.0, 2.0), Size::new(6.0, 14.0), 3.0.into());
+    f.fill(&grip, ACCENT);
 }
 
 fn wheel(delta: ScrollDelta) -> (f32, f32) {
@@ -374,6 +359,8 @@ pub struct Lanes<'a> {
     pub overflow: bool,
     /// How far the track list is scrolled up, in pixels.
     pub vscroll: f32,
+    /// The Range tool is on: pressing and dragging on the lanes draws the range.
+    pub range_mode: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -385,6 +372,8 @@ enum Drag {
     /// Moving a zoom along its clip; `at` is clip-relative.
     ZoomMove { clip: Id, zoom: Id, grab: f64, at: f64, press: Point, moved: bool },
     ZoomTrim { clip: Id, zoom: Id, edge: Edge, at: f64, duration: f64 },
+    /// Range tool: drawing a range, or dragging one of its edges; `fixed` is the other end.
+    Range { fixed: f64 },
 }
 
 #[derive(Default)]
@@ -485,6 +474,19 @@ impl Lanes<'_> {
             .unwrap_or((t, None))
     }
 
+    /// Snaps a range edge to clip edges, the playhead and markers (not to the range itself).
+    fn snap_range(&self, t: f64) -> (f64, Option<f64>) {
+        let lanes = Lanes { range: None, ..*self };
+        lanes.snap(t, None)
+    }
+
+    /// The other end of the range, if `x` is on one of its edges.
+    fn range_edge_at(&self, x: f32) -> Option<f64> {
+        let (a, b) = self.range?;
+        let (da, db) = ((self.view.x(a) - x).abs(), (self.view.x(b) - x).abs());
+        (da.min(db) <= FLAG_GRAB).then_some(if da <= db { b } else { a })
+    }
+
     /// Snaps a moving clip by whichever of its edges is closer to a snap point.
     fn snap_span(&self, start: f64, duration: f64, exclude: Id) -> (f64, Option<f64>) {
         let (s, gs) = self.snap(start, Some(exclude));
@@ -534,6 +536,17 @@ impl canvas::Program<Message> for Lanes<'_> {
                     return None;
                 }
                 let t = self.view.t(p.x).max(0.0);
+                // Range tool: grab an edge of the range, or press and drag to draw a new one.
+                // The clip pressed on gets selected, so range edits know which clip they mean.
+                if self.range_mode {
+                    if let Some(fixed) = self.range_edge_at(p.x) {
+                        state.drag = Some(Drag::Range { fixed });
+                        return Some(Action::capture());
+                    }
+                    let (from, _) = self.snap_range(t);
+                    state.drag = Some(Drag::Range { fixed: from });
+                    return Some(Action::publish(Message::RangePress { clip: self.hit(p).map(|(c, _)| c.id) }).and_capture());
+                }
                 // Zoom bands sit on top of their clip and take clicks first.
                 if let Some((clip, z, zone)) = self.zoom_hit(p) {
                     state.drag = Some(match zone {
@@ -591,6 +604,14 @@ impl canvas::Program<Message> for Lanes<'_> {
                         *start = s;
                         state.guide = guide;
                     }
+                    Drag::Range { fixed } => {
+                        let (t, guide) = self.snap_range(self.view.t(p.x).max(0.0));
+                        state.guide = guide;
+                        if (t - *fixed).abs() < 0.05 {
+                            return Some(Action::request_redraw().and_capture());
+                        }
+                        return Some(Action::publish(Message::SetRange(Some((t.min(*fixed), t.max(*fixed))))).and_capture());
+                    }
                     Drag::Trim { clip, t, .. } => {
                         let (s, guide) = self.snap(self.view.t(p.x).max(0.0), Some(*clip));
                         *t = s;
@@ -646,6 +667,10 @@ impl canvas::Program<Message> for Lanes<'_> {
                     Drag::Move { clip, track, start, moved: true, .. } => Message::MoveClip { clip, track, start },
                     Drag::Move { .. } | Drag::Pan { .. } => return Some(Action::request_redraw().and_capture()),
                     Drag::Trim { clip, edge, t } => Message::Trim { clip, edge, t },
+                    Drag::Range { .. } => {
+                        state.guide = None;
+                        return Some(Action::request_redraw().and_capture());
+                    }
                     Drag::ZoomMove { moved: false, .. } => return Some(Action::request_redraw().and_capture()),
                     Drag::ZoomMove { clip, zoom, at, .. } => {
                         let duration = self.project.clip(clip)?.zooms.iter().find(|z| z.id == zoom)?.duration;
@@ -786,9 +811,13 @@ impl canvas::Program<Message> for Lanes<'_> {
             Some(Drag::Move { moved: true, .. }) | Some(Drag::Pan { .. }) => return mouse::Interaction::Grabbing,
             Some(Drag::Trim { .. } | Drag::ZoomTrim { .. }) => return mouse::Interaction::ResizingHorizontally,
             Some(Drag::ZoomMove { moved: true, .. }) => return mouse::Interaction::Grabbing,
+            Some(Drag::Range { .. }) => return mouse::Interaction::ResizingHorizontally,
             _ => {}
         }
         let Some(p) = cursor.position_in(bounds) else { return mouse::Interaction::default() };
+        if self.range_mode {
+            return if self.range_edge_at(p.x).is_some() { mouse::Interaction::ResizingHorizontally } else { mouse::Interaction::Crosshair };
+        }
         if let Some((_, _, zone)) = self.zoom_hit(p) {
             return if zone == Zone::Body { mouse::Interaction::Grab } else { mouse::Interaction::ResizingHorizontally };
         }
@@ -1109,7 +1138,7 @@ mod tests {
     fn drag_clip(project: &Project, clip: &Clip, to: Point) -> Option<Message> {
         let (media, missing, cache) = (MediaCache::default(), std::collections::HashSet::new(), Caches::default());
         let lanes = Lanes {
-            project, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: false, zoom_edit: None, range: None,
+            project, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: false, zoom_edit: None, range: None, range_mode: false,
             dnd: None, dnd_effect: None, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0,
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 300.0));
@@ -1141,5 +1170,52 @@ mod tests {
             Some(Message::MoveClip { track, .. }) => assert_eq!(track, first),
             other => panic!("expected a move to the top track, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use crate::clip::TextLayer;
+
+    /// Runs mouse events through the lanes and collects the messages they publish.
+    fn run(project: &Project, range: Option<(f64, f64)>, range_mode: bool, events: &[(mouse::Event, Point)]) -> Vec<Message> {
+        let (media, missing, cache) = (MediaCache::default(), std::collections::HashSet::new(), Caches::default());
+        let lanes = Lanes {
+            project, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: true, zoom_edit: None, range, range_mode,
+            dnd: None, dnd_effect: None, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0,
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 300.0));
+        let mut state = LanesState::default();
+        events
+            .iter()
+            .filter_map(|(e, at)| canvas::Program::update(&lanes, &mut state, &canvas::Event::Mouse(*e), bounds, mouse::Cursor::Available(*at)).and_then(|a| a.into_inner().0))
+            .collect()
+    }
+
+    fn drag(from: Point, to: Point) -> Vec<(mouse::Event, Point)> {
+        vec![(mouse::Event::ButtonPressed(mouse::Button::Left), from), (mouse::Event::CursorMoved { position: to }, to), (mouse::Event::ButtonReleased(mouse::Button::Left), to)]
+    }
+
+    #[test]
+    fn range_mode_draws_and_adjusts_the_range_by_dragging() {
+        let mut p = Project::new("t", Default::default());
+        let text = p.add_text_clip(None, 1.0, 4.0, TextLayer::default()).unwrap();
+        let (_, _, top, h) = rows(&p, 0.0).into_iter().find(|r| r.0 == p.clip(text).unwrap().track).unwrap();
+        let y = top + h / 2.0;
+        // Press on the clip at 2 s, drag to 3.5 s: the clip is picked and the range follows.
+        let msgs = run(&p, None, true, &drag(Point::new(200.0, y), Point::new(350.0, y)));
+        assert!(matches!(msgs[0], Message::RangePress { clip: Some(c), .. } if c == text), "{msgs:?}");
+        assert!(matches!(msgs[1], Message::SetRange(Some((a, b))) if (a - 2.0).abs() < 1e-6 && (b - 3.5).abs() < 1e-6), "{msgs:?}");
+        // Dragging leftwards works too, and snaps to the clip's start.
+        let msgs = run(&p, None, true, &drag(Point::new(300.0, y), Point::new(104.0, y)));
+        assert!(matches!(msgs[1], Message::SetRange(Some((a, b))) if a == 1.0 && (b - 3.0).abs() < 1e-6), "{msgs:?}");
+        // Grabbing an edge moves just that edge (no new range, the selection stays).
+        let msgs = run(&p, Some((2.0, 3.5)), true, &drag(Point::new(351.0, y), Point::new(420.0, y)));
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(matches!(msgs[0], Message::SetRange(Some((a, b))) if a == 2.0 && (b - 4.2).abs() < 1e-6), "{msgs:?}");
+        // Without the tool, the same drag moves the clip as before.
+        let msgs = run(&p, None, false, &drag(Point::new(200.0, y), Point::new(350.0, y)));
+        assert!(matches!(msgs.last(), Some(Message::MoveClip { .. })), "{msgs:?}");
     }
 }

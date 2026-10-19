@@ -61,6 +61,38 @@ impl Drop for AudioPlayer {
     }
 }
 
+/// Everything `AudioPlayer::start` builds before it opens the audio device: mixing the project,
+/// spawning FFmpeg and querying the device. `cpal::Stream` can't cross threads, so this is the
+/// part that's safe to prepare in the background; `finish` turns it into an `AudioPlayer` with
+/// just the (fast) device open left, on whichever thread will own the player.
+pub struct Prepared {
+    device: cpal::Device,
+    stream_config: cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
+    shared: Arc<Shared>,
+    /// Taken by `finish`; left `None` there so `Drop` knows not to clean up a player that's now
+    /// tracking the same process itself.
+    child: Option<Child>,
+    rate: u32,
+    channels: usize,
+    from: f64,
+    graph_file: std::path::PathBuf,
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        // Dropped without being finished (superseded by a newer play/pause/seek): clean up the
+        // FFmpeg process and reader thread the same way a started AudioPlayer would. A finished
+        // `Prepared` has already taken `child`, so this is a no-op for it.
+        if let Some(mut c) = self.child.take() {
+            self.shared.stop.store(true, Ordering::Relaxed);
+            let _ = c.kill();
+            let _ = c.wait();
+            let _ = std::fs::remove_file(&self.graph_file);
+        }
+    }
+}
+
 /// The project with everything before `t` cut away and the rest moved to start at 0.
 fn shifted(project: &Project, t: f64) -> Project {
     let mut p = project.clone();
@@ -117,7 +149,18 @@ fn open_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
 
 impl AudioPlayer {
     /// Starts playing the project's sound from `from`. `Ok(None)` when nothing there makes a sound.
+    /// Runs `prepare` and `finish` back to back; prefer calling them separately (`prepare` in the
+    /// background, `finish` on the thread that will own the player) when startup latency matters.
     pub fn start(project: &Project, from: f64, muted: bool) -> anyhow::Result<Option<AudioPlayer>> {
+        match Self::prepare(project, from, muted)? {
+            Some(p) => Ok(Some(Self::finish(p)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Mixes the project, spawns FFmpeg and queries the audio device — safe to run off the UI
+    /// thread. `Ok(None)` when nothing there makes a sound.
+    pub fn prepare(project: &Project, from: f64, muted: bool) -> anyhow::Result<Option<Prepared>> {
         let total = project.duration() - from;
         if total <= 0.0 {
             return Ok(None);
@@ -196,6 +239,18 @@ impl AudioPlayer {
             reader.finished.store(true, Ordering::Relaxed);
         })?;
 
+        let stream_config: cpal::StreamConfig = config.clone().into();
+        Ok(Some(Prepared { device, stream_config, sample_format: config.sample_format(), shared, child: Some(child), rate, channels, from, graph_file }))
+    }
+
+    /// Opens the audio device and starts the stream from a `Prepared`. Fast (no FFmpeg or device
+    /// enumeration left to do), but must run on the thread that will own the resulting player,
+    /// since `cpal::Stream` can't move between threads.
+    pub fn finish(mut p: Prepared) -> anyhow::Result<AudioPlayer> {
+        let child = p.child.take().expect("a Prepared is only finished once");
+        let shared = p.shared.clone();
+        let graph_file = p.graph_file.clone();
+        let (rate, channels, from) = (p.rate, p.channels, p.from);
         let out = shared.clone();
         let fill = move |data: &mut [f32]| {
             let mut q = out.samples.lock().unwrap();
@@ -221,20 +276,19 @@ impl AudioPlayer {
             }
             out.played.fetch_add((available / channels) as u64, Ordering::Relaxed);
         };
-        let stream_config: cpal::StreamConfig = config.clone().into();
         let lost = shared.clone();
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => open_stream::<f32>(&device, &stream_config, fill, lost)?,
-            cpal::SampleFormat::F64 => open_stream::<f64>(&device, &stream_config, fill, lost)?,
-            cpal::SampleFormat::I16 => open_stream::<i16>(&device, &stream_config, fill, lost)?,
-            cpal::SampleFormat::I32 => open_stream::<i32>(&device, &stream_config, fill, lost)?,
-            cpal::SampleFormat::U16 => open_stream::<u16>(&device, &stream_config, fill, lost)?,
-            cpal::SampleFormat::U8 => open_stream::<u8>(&device, &stream_config, fill, lost)?,
-            cpal::SampleFormat::I8 => open_stream::<i8>(&device, &stream_config, fill, lost)?,
+        let stream = match p.sample_format {
+            cpal::SampleFormat::F32 => open_stream::<f32>(&p.device, &p.stream_config, fill, lost)?,
+            cpal::SampleFormat::F64 => open_stream::<f64>(&p.device, &p.stream_config, fill, lost)?,
+            cpal::SampleFormat::I16 => open_stream::<i16>(&p.device, &p.stream_config, fill, lost)?,
+            cpal::SampleFormat::I32 => open_stream::<i32>(&p.device, &p.stream_config, fill, lost)?,
+            cpal::SampleFormat::U16 => open_stream::<u16>(&p.device, &p.stream_config, fill, lost)?,
+            cpal::SampleFormat::U8 => open_stream::<u8>(&p.device, &p.stream_config, fill, lost)?,
+            cpal::SampleFormat::I8 => open_stream::<i8>(&p.device, &p.stream_config, fill, lost)?,
             other => bail!("Unsupported audio sample format {other:?}"),
         };
         stream.play().context("could not start audio playback")?;
-        Ok(Some(AudioPlayer { _stream: stream, shared, child: Some(child), rate, from, opened: Instant::now(), graph_file }))
+        Ok(AudioPlayer { _stream: stream, shared, child: Some(child), rate, from, opened: Instant::now(), graph_file })
     }
 
     /// Timeline position by the audio clock, once sound has started in step with the picture.
