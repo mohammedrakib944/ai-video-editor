@@ -8,6 +8,7 @@ pub mod library;
 pub mod tools;
 pub mod media_cache;
 pub mod preview;
+pub mod skills_dialog;
 pub mod timeline;
 
 use std::cell::Cell;
@@ -56,17 +57,19 @@ pub enum LibraryTab {
     Media,
     Text,
     Transitions,
+    Animation,
     Sounds,
 }
 
 impl LibraryTab {
-    const ALL: [LibraryTab; 4] = [LibraryTab::Media, LibraryTab::Text, LibraryTab::Transitions, LibraryTab::Sounds];
+    const ALL: [LibraryTab; 5] = [LibraryTab::Media, LibraryTab::Text, LibraryTab::Transitions, LibraryTab::Animation, LibraryTab::Sounds];
 
     fn label(self) -> &'static str {
         match self {
             LibraryTab::Media => "Media",
             LibraryTab::Text => "Text",
             LibraryTab::Transitions => "Effects",
+            LibraryTab::Animation => "Animation",
             LibraryTab::Sounds => "Sounds",
         }
     }
@@ -115,6 +118,7 @@ pub enum Message {
     SideTab(SideTab),
     TogglePlay,
     ToggleMute,
+    ToggleSafeZones,
     ToggleSnapping,
     Import,
     ImportPicked(Vec<PathBuf>),
@@ -144,6 +148,10 @@ pub enum Message {
     /// Done (✓): the range has served its purpose; it goes away and range mode ends.
     RangeDone,
     AddZoomAtPlayhead,
+    /// A one-shot "button press" pulse on the selected clip, at the playhead.
+    AddPressAtPlayhead,
+    /// Staggers the selection's entrances a few frames apart, in selection order.
+    StaggerSelection,
     ZoomTiming { clip: Id, zoom: Id, at: f64, duration: f64 },
     /// Scroll the track list by this many pixels (positive = down).
     ScrollTracks(f32),
@@ -176,6 +184,10 @@ pub enum Message {
     SeparateAudio,
     /// Mute or unmute the sound of the selected clips.
     ToggleClipMute,
+    /// Copies the selected clip's color grade, to paste onto others later.
+    CopyColor,
+    /// Pastes the copied color grade onto every selected clip that has a picture.
+    PasteColor,
     SetRange(Option<(f64, f64)>),
     DropAsset { asset: Id, track: Option<Id>, t: f64 },
     /// An effect card was pressed (a drag may follow), released without dragging, or hovered.
@@ -202,6 +214,8 @@ pub enum Message {
     Tick(Instant),
     AddText,
     AddShape(library::ShapePreset),
+    AddCallout(library::CalloutPreset),
+    AddCounter,
     ApplyTransition(crate::clip::TransitionKind),
     ApplyMotion { intro: bool, kind: crate::clip::MotionKind },
     AddSound(&'static str),
@@ -223,6 +237,17 @@ pub enum Message {
     ChatSuggestion(String),
     ChatStop,
     ChatNew,
+    /// Opens or closes the skills manager.
+    OpenSkills,
+    CloseSkills,
+    /// Opens the add/edit form (an index to edit, or `None` to start a new skill).
+    SkillEditStart(Option<usize>),
+    SkillNameInput(String),
+    SkillBodyEdit(iced::widget::text_editor::Action),
+    SkillSave,
+    SkillEditCancel,
+    SkillDelete(usize),
+    SkillToggle(usize, bool),
     /// A link in an assistant reply was clicked.
     OpenLink(String),
     /// Copy text (a code block) to the clipboard.
@@ -237,6 +262,10 @@ pub enum Message {
     Track(Id, TrackAction),
     RenameInput(String),
     RenameCommit,
+    /// Start editing the project's name in the title bar.
+    RenameProjectStart,
+    RenameProjectInput(String),
+    RenameProjectCommit,
     Step(i32),
     GoStart,
     GoEnd,
@@ -248,12 +277,15 @@ pub enum Message {
     ExportBrowse,
     ExportBrowsed(Option<PathBuf>),
     ExportQuality(crate::render::export::Quality),
+    ExportPreset(crate::render::export::Preset),
+    ExportQueueAddPreset(crate::render::export::Preset),
+    ExportQueueRemove(usize),
     StartExport,
     ExportProgress(crate::render::export::Progress),
     CancelExport,
     ExportRetry,
-    RevealExport,
-    PlayExport,
+    RevealExport(usize),
+    PlayExport(usize),
     Noop,
 }
 
@@ -286,6 +318,8 @@ pub struct Editor {
     effect_hover: Option<library::Effect>,
     /// Color for new markers.
     marker_color: Rgba,
+    /// A clip's color grade, copied via its context menu, ready to paste onto another.
+    color_clipboard: Option<crate::clip::Grade>,
     /// The timeline marker shown in the inspector.
     selected_marker: Option<Id>,
     /// Inspector sections the user collapsed (by title), and the inspector search text.
@@ -293,9 +327,15 @@ pub struct Editor {
     /// Starred effects (by `Effect::key`) and the Effects-tab groups that are open.
     pub favorite_effects: Vec<String>,
     pub effects_open: std::collections::BTreeSet<String>,
+    /// The user's AI assistant skills (see `settings::Skill`), persisted the same way as the
+    /// fields above.
+    pub skills: Vec<crate::settings::Skill>,
+    skills_dialog: Option<skills_dialog::SkillsDialog>,
     inspector_query: String,
     pub cursor: Point,
     renaming: Option<(Id, String)>,
+    /// Draft name while editing the project's title in the title bar.
+    pub renaming_project: Option<String>,
     toast: Option<(String, bool, Instant)>,
     timeline_size: Cell<Size>,
     frames: FrameServer,
@@ -337,6 +377,8 @@ pub struct Editor {
     /// Preview zoom (None = fit) and how far the zoomed canvas is moved from the center.
     preview_zoom: Option<f32>,
     preview_pan: iced::Vector,
+    /// Live 9:16/1:1 crop guides over a 16:9 canvas, for one-shot multi-aspect re-exports.
+    show_safe_zones: bool,
     stage_size: Cell<Size>,
     /// Settings that shape the editor (preview quality, default lengths, …).
     prefs: crate::settings::Prefs,
@@ -388,13 +430,17 @@ impl Editor {
             effect_dnd: None,
             effect_hover: None,
             marker_color: Rgba::hex(library::MARKER_COLORS[0]),
+            color_clipboard: None,
             selected_marker: None,
             collapsed: Default::default(),
             favorite_effects: Vec::new(),
             effects_open: Default::default(),
+            skills: Vec::new(),
+            skills_dialog: None,
             inspector_query: String::new(),
             cursor: Point::ORIGIN,
             renaming: None,
+            renaming_project: None,
             toast: None,
             timeline_size: Cell::new(Size::new(1000.0, 300.0)),
             frames: FrameServer::default(),
@@ -423,6 +469,7 @@ impl Editor {
             window_size: Size::ZERO,
             preview_zoom: None,
             preview_pan: iced::Vector::ZERO,
+            show_safe_zones: false,
             stage_size: Cell::new(Size::new(960.0, 540.0)),
             prefs: Default::default(),
             auto_level: crate::settings::PreviewQuality::Auto,
@@ -730,6 +777,7 @@ impl Editor {
                     }
                 }
             }
+            Message::ToggleSafeZones => self.show_safe_zones = !self.show_safe_zones,
             Message::ToggleMute => {
                 self.muted = !self.muted;
                 self.mute_hint_shown = true;
@@ -1030,6 +1078,8 @@ impl Editor {
                 }
             }
             Message::AddZoomAtPlayhead => self.add_zoom_at_playhead(),
+            Message::AddPressAtPlayhead => self.add_press_at_playhead(),
+            Message::StaggerSelection => self.stagger_selection(),
             Message::RangeVolume(clip, v) => {
                 if let Some((a, b)) = self.range {
                     self.edit_merge("Range volume", Some(&format!("range-volume:{clip}")), |p| p.set_range_volume(clip, a, b, v));
@@ -1164,7 +1214,10 @@ impl Editor {
                 }
                 let ids = std::mem::take(&mut self.selection);
                 if !ids.is_empty() {
-                    self.edit(if ids.len() == 1 { "Delete clip" } else { "Delete clips" }, |p| p.delete_clips(&ids));
+                    let count = ids.len();
+                    if self.edit(if count == 1 { "Delete clip" } else { "Delete clips" }, |p| p.delete_clips(&ids)).is_some() {
+                        self.notify(if count == 1 { "Clip deleted — Ctrl+Z to undo" } else { "Clips deleted — Ctrl+Z to undo" }, false);
+                    }
                 }
             }
             Message::DuplicateSelection => {
@@ -1283,6 +1336,25 @@ impl Editor {
                     });
                 }
             }
+            Message::CopyColor => {
+                let p = &self.doc.project;
+                if let [id] = self.selection[..] {
+                    if let Some(c) = p.clip(id).filter(|c| p.clip_has_picture(c)) {
+                        self.color_clipboard = Some(c.grade);
+                        self.notify("Color copied", false);
+                    }
+                }
+            }
+            Message::PasteColor => {
+                let Some(grade) = self.color_clipboard else { return Task::none() };
+                let p = &self.doc.project;
+                let ids: Vec<Id> = self.selection.iter().copied().filter(|&id| p.clip(id).is_some_and(|c| p.clip_has_picture(c))).collect();
+                if ids.is_empty() {
+                    self.notify("Select a clip to paste the color onto", false);
+                } else {
+                    self.edit("Paste color", |p| ids.iter().try_for_each(|&id| p.set_grade(id, grade)));
+                }
+            }
             Message::SetRange(r) => {
                 self.range = r;
                 // A range drawn with Shift on the ruler turns the Range tool on too, so Done shows.
@@ -1298,6 +1370,14 @@ impl Editor {
                     p.ensure_unlocked(id)?;
                     if let Edit::Speed(s) = edit {
                         return p.set_speed(id, s);
+                    }
+                    if let Edit::Transition(k) = edit {
+                        let duration = p.clip(id).and_then(|c| c.transition).map(|t| t.duration).unwrap_or(0.6);
+                        return p.set_transition(id, k, duration);
+                    }
+                    if let Edit::TransitionDuration(d) = edit {
+                        let kind = p.clip(id).and_then(|c| c.transition).map(|t| t.kind);
+                        return p.set_transition(id, kind, d);
                     }
                     edit.apply(p.clip_mut(id)?);
                     Ok(())
@@ -1338,12 +1418,27 @@ impl Editor {
                     self.side_tab = SideTab::Inspector;
                 }
             }
+            Message::AddCallout(preset) => {
+                let at = self.playhead;
+                if let Some(id) = self.edit("Add callout", |p| p.add_callout_clip(None, at, 1.5, preset.build())) {
+                    self.selection = vec![id];
+                    self.side_tab = SideTab::Inspector;
+                }
+            }
+            Message::AddCounter => {
+                let at = self.playhead;
+                let still = self.prefs.still_seconds;
+                if let Some(id) = self.edit("Add counter", |p| p.add_counter_clip(None, at, still, crate::clip::CounterLayer::new(0.0, 100.0))) {
+                    self.selection = vec![id];
+                    self.side_tab = SideTab::Inspector;
+                }
+            }
             Message::ApplyTransition(kind) => {
                 let ids = self.selection.clone();
                 self.edit("Add transition", |p| {
                     for id in &ids {
-                        let c = p.clip_mut(*id)?;
-                        c.transition = Some(crate::clip::Transition { kind, duration: c.transition.map(|t| t.duration).unwrap_or(0.6).min(c.duration / 2.0) });
+                        let duration = p.clip(*id).and_then(|c| c.transition).map(|t| t.duration).unwrap_or(0.6);
+                        p.set_transition(*id, Some(kind), duration)?;
                     }
                     Ok(())
                 });
@@ -1353,8 +1448,10 @@ impl Editor {
                 self.edit(if intro { "Animate in" } else { "Animate out" }, |p| {
                     for id in &ids {
                         let c = p.clip_mut(*id)?;
+                        let default_duration = if intro { 0.6 } else { c.intro.map(|m| m.duration * 0.6).unwrap_or(0.6) };
                         let slot = if intro { &mut c.intro } else { &mut c.outro };
-                        *slot = Some(crate::clip::Motion { kind, duration: slot.map(|m| m.duration).unwrap_or(0.6).min(c.duration / 2.0) });
+                        let (duration, ease, delay) = (slot.map(|m| m.duration).unwrap_or(default_duration).min(c.duration / 2.0), slot.and_then(|m| m.ease), slot.map(|m| m.delay).unwrap_or(0.0));
+                        *slot = Some(crate::clip::Motion { kind, duration, ease, delay });
                     }
                     Ok(())
                 });
@@ -1441,7 +1538,7 @@ impl Editor {
                 let context = self.context_line();
                 let label = self.range.map(|(a, b)| format!("Range {} – {}", fmt_ruler(a), fmt_ruler(b)));
                 let cwd = self.path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf()).unwrap_or_else(crate::settings::home_dir);
-                match self.agent.send(&text, &context, &cwd) {
+                match self.agent.send(&text, &context, &cwd, &self.skills_text()) {
                     Ok(()) => {
                         self.chat.push(assistant_panel::ChatItem::User { text, context: label });
                         self.chat_input = iced::widget::text_editor::Content::new();
@@ -1467,6 +1564,56 @@ impl Editor {
             Message::ChatNew => {
                 self.agent.reset();
                 self.chat.clear();
+            }
+            Message::OpenSkills => self.skills_dialog = Some(skills_dialog::SkillsDialog { editing: None }),
+            Message::CloseSkills => self.skills_dialog = None,
+            Message::SkillEditStart(index) => {
+                let (name, body) = match index.and_then(|i| self.skills.get(i)) {
+                    Some(s) => (s.name.clone(), s.body.clone()),
+                    None => (String::new(), String::new()),
+                };
+                if let Some(d) = &mut self.skills_dialog {
+                    d.editing = Some(skills_dialog::Editing { index, name, body: iced::widget::text_editor::Content::with_text(&body) });
+                }
+                return iced::widget::operation::focus(skills_dialog::NAME_ID);
+            }
+            Message::SkillNameInput(s) => {
+                if let Some(d) = self.skills_dialog.as_mut().and_then(|d| d.editing.as_mut()) {
+                    d.name = s;
+                }
+            }
+            Message::SkillBodyEdit(action) => {
+                if let Some(d) = self.skills_dialog.as_mut().and_then(|d| d.editing.as_mut()) {
+                    d.body.perform(action);
+                }
+            }
+            Message::SkillSave => {
+                if let Some(editing) = self.skills_dialog.as_mut().and_then(|d| d.editing.take()) {
+                    let name = editing.name.trim().to_string();
+                    let body = editing.body.text().trim().to_string();
+                    if !name.is_empty() && !body.is_empty() {
+                        let skill = crate::settings::Skill { name, body, enabled: true };
+                        match editing.index {
+                            Some(i) if i < self.skills.len() => self.skills[i] = crate::settings::Skill { enabled: self.skills[i].enabled, ..skill },
+                            _ => self.skills.push(skill),
+                        }
+                    }
+                }
+            }
+            Message::SkillEditCancel => {
+                if let Some(d) = &mut self.skills_dialog {
+                    d.editing = None;
+                }
+            }
+            Message::SkillDelete(i) => {
+                if i < self.skills.len() {
+                    self.skills.remove(i);
+                }
+            }
+            Message::SkillToggle(i, on) => {
+                if let Some(s) = self.skills.get_mut(i) {
+                    s.enabled = on;
+                }
             }
             Message::OpenAiConnect => {}
             Message::ChatPoll => {
@@ -1553,6 +1700,16 @@ impl Editor {
                     self.edit("Rename track", |p| p.rename_track(id, &name));
                 }
             }
+            Message::RenameProjectStart => {
+                self.renaming_project = Some(self.doc.project.name.clone());
+                return iced::widget::operation::focus("project-rename");
+            }
+            Message::RenameProjectInput(s) => self.renaming_project = Some(s),
+            Message::RenameProjectCommit => {
+                if let Some(name) = self.renaming_project.take() {
+                    self.edit("Rename project", |p| p.rename(&name));
+                }
+            }
             Message::Step(frames) => {
                 let fps = self.doc.project.canvas.fps as f64;
                 let t = ((self.playhead * fps).round() + frames as f64) / fps;
@@ -1569,6 +1726,9 @@ impl Editor {
                     return Task::none();
                 }
                 if self.renaming.take().is_some() {
+                    return Task::none();
+                }
+                if self.renaming_project.take().is_some() {
                     return Task::none();
                 }
                 if self.zoom_edit.take().is_some() {
@@ -1638,9 +1798,34 @@ impl Editor {
                     e.quality = q;
                 }
             }
-            Message::StartExport => return self.start_export(),
+            Message::ExportPreset(p) => {
+                if let Some(e) = &mut self.export {
+                    e.preset = p;
+                }
+            }
+            Message::ExportQueueAddPreset(p) => {
+                if let Some(e) = &mut self.export {
+                    let path = e.suggest_path(p);
+                    e.queue.push(export_dialog::QueuedJob { preset: p, path });
+                }
+            }
+            Message::ExportQueueRemove(i) => {
+                if let Some(e) = &mut self.export {
+                    if i < e.queue.len() {
+                        e.queue.remove(i);
+                    }
+                }
+            }
+            Message::StartExport => {
+                if let Some(e) = &mut self.export {
+                    e.completed.clear();
+                    e.total_seconds = 0.0;
+                }
+                return self.start_export();
+            }
             Message::ExportProgress(p) => {
                 use crate::render::export::Progress;
+                let mut continue_batch = false;
                 if let Some(e) = &mut self.export {
                     match p {
                         Progress::Rendering { done, total, eta } => {
@@ -1648,10 +1833,25 @@ impl Editor {
                                 (*d, *t, *e2) = (done, total, eta);
                             }
                         }
-                        Progress::Finished { path, seconds } => e.phase = export_dialog::Phase::Done { path, seconds },
+                        Progress::Finished { path, seconds } => {
+                            e.completed.push((path, e.preset));
+                            e.total_seconds += seconds;
+                            if e.queue.is_empty() {
+                                let items = std::mem::take(&mut e.completed);
+                                e.phase = export_dialog::Phase::Done { items, seconds: e.total_seconds };
+                            } else {
+                                let next = e.queue.remove(0);
+                                e.path = next.path.display().to_string();
+                                e.preset = next.preset;
+                                continue_batch = true;
+                            }
+                        }
                         Progress::Failed(err) => e.phase = export_dialog::Phase::Failed(err),
                         Progress::Cancelled => e.phase = export_dialog::Phase::Setup,
                     }
+                }
+                if continue_batch {
+                    return self.start_export();
                 }
             }
             Message::CancelExport => {
@@ -1664,12 +1864,14 @@ impl Editor {
                     e.phase = export_dialog::Phase::Setup;
                 }
             }
-            Message::RevealExport | Message::PlayExport => {
-                if let Some(export_dialog::ExportDialog { phase: export_dialog::Phase::Done { path, .. }, .. }) = &self.export {
-                    if matches!(message, Message::RevealExport) {
-                        crate::platform::reveal(path);
-                    } else {
-                        crate::platform::open(path);
+            Message::RevealExport(i) | Message::PlayExport(i) => {
+                if let Some(export_dialog::ExportDialog { phase: export_dialog::Phase::Done { items, .. }, .. }) = &self.export {
+                    if let Some((path, _)) = items.get(i) {
+                        if matches!(message, Message::RevealExport(_)) {
+                            crate::platform::reveal(path);
+                        } else {
+                            crate::platform::open(path);
+                        }
                     }
                 }
             }
@@ -1687,9 +1889,11 @@ impl Editor {
             path.set_extension("mp4");
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        dialog.phase = export_dialog::Phase::Running { done: 0, total: 1, eta: None, cancel: cancel.clone() };
+        let job = dialog.completed.len() + 1;
+        let job_total = dialog.completed.len() + dialog.queue.len() + 1;
+        dialog.phase = export_dialog::Phase::Running { done: 0, total: 1, eta: None, job, job_total, cancel: cancel.clone() };
         let project = self.doc.project.clone();
-        let quality = dialog.quality;
+        let settings = dialog.settings();
         let stream = iced::stream::channel(64, async move |mut tx: iced::futures::channel::mpsc::Sender<Progress>| {
             let (stx, srx) = std::sync::mpsc::channel::<Progress>();
             std::thread::Builder::new()
@@ -1699,7 +1903,7 @@ impl Editor {
                     let progress = |p: Progress| {
                         let _ = stx.send(p);
                     };
-                    let result = export::export(&project, &path, quality, &cancel, &progress);
+                    let result = export::export(&project, &path, settings, &cancel, &progress);
                     let last = match result {
                         Ok(path) => Progress::Finished { path, seconds: started.elapsed().as_secs_f64() },
                         Err(e) if e.to_string() == "cancelled" => Progress::Cancelled,
@@ -1790,6 +1994,9 @@ impl Editor {
         let split = MenuItem::new(code::SCISSORS, "Split at playhead", Message::SplitAtPlayhead).shortcut("S");
         items.push(if under_playhead { split } else { split.disabled() });
         items.push(MenuItem::new(code::COPY, "Duplicate", Message::DuplicateSelection).shortcut("Ctrl+D"));
+        if clips.len() > 1 {
+            items.push(MenuItem::new(code::SPARKLES, "Stagger entrances", Message::StaggerSelection));
+        }
         let separable = clips.iter().any(|c| c.part == Part::Whole && p.clip_has_sound(c) && p.clip_has_picture(c));
         let sounding: Vec<_> = clips.iter().filter(|c| p.clip_has_sound(c)).collect();
         if separable || !sounding.is_empty() {
@@ -1822,9 +2029,15 @@ impl Editor {
                     items.push(MenuItem::Separator);
                 }
                 items.push(MenuItem::new(code::REFRESH_CW, "Reset position and size", Message::Edit(c.id, Edit::ResetTransform)));
+                let press = MenuItem::new(code::POINTER, "Add press pulse at playhead", Message::AddPressAtPlayhead).shortcut("P");
+                items.push(if t >= c.start && t < c.end() { press } else { press.disabled() });
                 items.push(MenuItem::new(code::CHEVRON_UP, "Bring to front", Message::Arrange(true)).shortcut("Ctrl+]"));
                 items.push(MenuItem::new(code::CHEVRON_DOWN, "Send to back", Message::Arrange(false)).shortcut("Ctrl+["));
+                items.push(MenuItem::new(code::DROPLET, "Copy color", Message::CopyColor));
             }
+        }
+        if self.color_clipboard.is_some() && clips.iter().any(|c| p.clip_has_picture(c)) {
+            items.push(MenuItem::new(code::PALETTE, "Paste color", Message::PasteColor));
         }
         items.push(MenuItem::Separator);
         items.push(MenuItem::new(code::TRASH_2, if clips.len() == 1 { "Delete" } else { "Delete clips" }, Message::DeleteSelection).shortcut("Del").danger());
@@ -1841,7 +2054,7 @@ impl Editor {
         // Markers and blurs are new clips, placed in time and on the picture: dropped on the
         // timeline they start there; otherwise they cover the marked range (or 3 s from the
         // playhead), centered where they were dropped on the preview.
-        if matches!(effect, Effect::Highlight(_) | Effect::Blur) {
+        if matches!(effect, Effect::Highlight(_) | Effect::Blur | Effect::Mask) {
             let (start, duration) = match (target, self.range) {
                 (Some(DropTarget::Timeline { t, .. }), _) => (t, 3.0),
                 (_, Some((a, b))) if b - a >= 0.1 => (a, b - a),
@@ -1866,6 +2079,7 @@ impl Editor {
                         c.name = Some(name.to_string());
                         id
                     }
+                    Effect::Mask => p.add_mask_clip(track, start, duration, crate::clip::MaskLayer::default())?,
                     _ => p.add_blur_clip(track, start, duration, crate::clip::BlurLayer::default())?,
                 };
                 if let Some((x, y)) = at {
@@ -1877,6 +2091,9 @@ impl Editor {
             if created.is_some() && effect == Effect::Blur {
                 self.notify("Blur added — drag its box over what to hide, and trim it on the timeline", false);
             }
+            if created.is_some() && effect == Effect::Mask {
+                self.notify("Mask added — drag its box over what to keep, and trim it on the timeline", false);
+            }
             if let Some(id) = created {
                 self.selection = vec![id];
                 self.side_tab = SideTab::Inspector;
@@ -1886,13 +2103,15 @@ impl Editor {
         let targets: Vec<Id> = match (target, dropped_on) {
             (Some(_), Some(clip)) => vec![clip],
             (Some(_), None) => {
-                self.notify("Drop it on a clip", false);
+                let msg = if matches!(effect, Effect::Transition(_)) { "Drop it where two clips meet" } else { "Drop it on a clip" };
+                self.notify(msg, false);
                 return Task::none();
             }
             (None, _) => self.selection.clone(),
         };
         if targets.is_empty() {
-            self.notify("Select a clip first, or drag the effect onto one", false);
+            let msg = if matches!(effect, Effect::Transition(_)) { "Select the second of two touching clips first, or drag the effect onto where they meet" } else { "Select a clip first, or drag the effect onto one" };
+            self.notify(msg, false);
             return Task::none();
         }
         if target.is_some() {
@@ -1900,7 +2119,13 @@ impl Editor {
             self.lanes_cache.clear();
         }
         match effect {
-            Effect::Transition(kind) => self.update(Message::ApplyTransition(kind)),
+            Effect::Transition(kind) => {
+                let task = self.update(Message::ApplyTransition(kind));
+                if target.is_some() && self.doc.project.clip(targets[0]).is_some_and(|c| c.transition.is_some()) {
+                    self.notify("Transition added — drag its handle (at the cut) to resize it", false);
+                }
+                task
+            }
             Effect::Intro(kind) => self.update(Message::ApplyMotion { intro: true, kind }),
             Effect::Outro(kind) => self.update(Message::ApplyMotion { intro: false, kind }),
             Effect::Frame(style) => {
@@ -1930,7 +2155,31 @@ impl Editor {
                 }
                 Task::none()
             }
-            Effect::Blur | Effect::Highlight(_) => Task::none(),
+            Effect::Camera(preset) => {
+                let [clip] = targets[..] else {
+                    self.notify("Camera moves go on one video or image at a time", false);
+                    return Task::none();
+                };
+                self.selection = vec![clip];
+                if let Some(DropTarget::Timeline { t, .. }) = target {
+                    self.playhead = t;
+                }
+                self.apply_camera_preset(clip, preset);
+                Task::none()
+            }
+            Effect::Blur | Effect::Mask | Effect::Highlight(_) => Task::none(),
+        }
+    }
+
+    /// Inserts a named camera move (push in / pull back) from the playhead to the end of the clip.
+    fn apply_camera_preset(&mut self, clip_id: Id, preset: library::CameraPreset) {
+        let at = self.playhead - self.doc.project.clip(clip_id).map(|c| c.start).unwrap_or(0.0);
+        let applied = match preset {
+            library::CameraPreset::PushIn => self.edit(preset.label(), |p| p.push_in(clip_id, at)),
+            library::CameraPreset::PullBack => self.edit(preset.label(), |p| p.pull_back(clip_id, at)),
+        };
+        if applied.is_some() {
+            self.notify(format!("{} added at the playhead", preset.label()), false);
         }
     }
 
@@ -1939,7 +2188,7 @@ impl Editor {
     fn apply_frame_style(&mut self, targets: &[Id], style: library::FrameStyle) {
         use library::FrameStyle;
         let p = &self.doc.project;
-        let ids: Vec<Id> = targets.iter().copied().filter(|&id| p.clip(id).is_some_and(|c| p.clip_has_picture(c) && !matches!(c.content, crate::clip::Content::Text(_) | crate::clip::Content::Blur(_)))).collect();
+        let ids: Vec<Id> = targets.iter().copied().filter(|&id| p.clip(id).is_some_and(|c| p.clip_has_picture(c) && !matches!(c.content, crate::clip::Content::Text(_) | crate::clip::Content::Blur(_) | crate::clip::Content::Mask(_)))).collect();
         if ids.is_empty() {
             self.notify("Frame styles go on videos, images and shapes", false);
             return;
@@ -2029,6 +2278,39 @@ impl Editor {
             let _ = self.update(Message::ZoomEdit(Some((clip_id, zid))));
             self.notify(if pan { "Pan added — drag the frame on the canvas to aim it" } else { "Zoom added — drag the frame on the canvas to aim it" }, false);
         }
+    }
+
+    /// A one-shot "button press" pulse on the clip under the playhead (selected clip preferred).
+    fn add_press_at_playhead(&mut self) {
+        let t = self.playhead;
+        let p = &self.doc.project;
+        let visual = |c: &crate::clip::Clip| p.clip_has_picture(c) && t >= c.start && t < c.end();
+        let selected = self.selection.iter().filter_map(|id| p.clip(*id)).find(|c| visual(c)).map(|c| c.id);
+        let topmost = p.tracks.iter().find_map(|tr| p.clips_on(tr.id).find(|c| visual(c)).map(|c| c.id));
+        let Some(clip_id) = selected.or(topmost) else {
+            self.notify("Move the playhead over a clip to add a press pulse", false);
+            return;
+        };
+        let local = t - p.clip(clip_id).unwrap().start;
+        self.edit("Add press pulse", |p| {
+            let id = p.alloc_id();
+            p.clip_mut(clip_id)?.presses.push(crate::clip::PressPulse { id, at: local, duration: crate::clip::PressPulse::DEFAULT_DURATION });
+            Ok(())
+        });
+        self.notify("Press pulse added at the playhead", false);
+    }
+
+    /// Staggers the current selection's entrances a few frames apart, in selection order.
+    fn stagger_selection(&mut self) {
+        let ids = self.selection.clone();
+        if ids.len() < 2 {
+            self.notify("Select more than one clip to stagger their entrances", false);
+            return;
+        }
+        const GAP_FRAMES: u32 = 3;
+        let fps = self.doc.project.canvas.fps;
+        self.edit("Stagger entrances", |p| p.stagger_group(&ids, GAP_FRAMES, fps));
+        self.notify("Entrances staggered", false);
     }
 
     /// Drops UI state that points at things an undo, redo or delete removed.
@@ -2172,6 +2454,9 @@ impl Editor {
         if let Some(dialog) = &self.export {
             layers.push(dialog.view(&self.doc.project));
         }
+        if let Some(dialog) = &self.skills_dialog {
+            layers.push(dialog.view(&self.skills));
+        }
         stack(layers).into()
     }
 
@@ -2186,8 +2471,12 @@ impl Editor {
             tab_icon(code::SPARKLES, "Assistant", self.side_tab == SideTab::Assistant, Message::SideTab(SideTab::Assistant)),
         ]
         .spacing(2);
-        let right: Element<'_, Message> = if self.side_tab == SideTab::Assistant && !self.chat.is_empty() {
-            widgets::tip(widgets::icon_button(code::FILE_PLUS, Some(Message::ChatNew)), "New conversation", None, tip_pos())
+        let right: Element<'_, Message> = if self.side_tab == SideTab::Assistant {
+            let mut row = row![widgets::tip(widgets::icon_button(code::WAND_SPARKLES, Some(Message::OpenSkills)), "Skills", None, tip_pos())].spacing(2);
+            if !self.chat.is_empty() {
+                row = row.push(widgets::tip(widgets::icon_button(code::FILE_PLUS, Some(Message::ChatNew)), "New conversation", None, tip_pos()));
+            }
+            row.into()
         } else {
             space().into()
         };
@@ -2224,7 +2513,7 @@ impl Editor {
             };
             let scene = std::sync::Arc::new(scene::evaluate(shown, self.playhead, (cw, ch), &self.frames.bind(project), self.playing.is_some()));
             // The overlay spans the whole stage, so handles keep working past the canvas edge.
-            let overlay = canvas_overlay::Overlay { project, scene: scene.clone(), selection: &self.selection, zoom_edit: editing, crop_edit: cropping, dragging: self.effect_dnd, origin, display: Size::new(w, h), zoomed: self.preview_zoom.is_some() };
+            let overlay = canvas_overlay::Overlay { project, scene: scene.clone(), selection: &self.selection, zoom_edit: editing, crop_edit: cropping, dragging: self.effect_dnd, origin, display: Size::new(w, h), zoomed: self.preview_zoom.is_some(), show_safe_zones: self.show_safe_zones };
             let canvas = iced::widget::shader(preview::Preview { scene, canvas: iced::Rectangle::new(Point::new(origin.x, origin.y), Size::new(w, h)) }).width(Fill).height(Fill);
             stack![canvas, iced::widget::canvas(overlay).width(Fill).height(Fill)].into()
         });
@@ -2240,6 +2529,7 @@ impl Editor {
         .spacing(6)
         .align_y(Alignment::Center);
         let tools = row![
+            widgets::tip(widgets::icon_toggle(code::SMARTPHONE, self.show_safe_zones, Message::ToggleSafeZones), if self.show_safe_zones { "Hide safe zones" } else { "Show 9:16 / 1:1 safe zones" }, None, tip_pos()),
             widgets::tip(widgets::icon_toggle(if self.muted { code::VOLUME_X } else { code::VOLUME_2 }, self.muted, Message::ToggleMute), if self.muted { "Unmute preview" } else { "Mute preview" }, Some("M"), tip_pos()),
         ]
         .spacing(8)
@@ -2267,6 +2557,12 @@ impl Editor {
                             hex: self.hex_draft.as_ref(),
                             collapsed: &self.collapsed,
                             query: &self.inspector_query,
+                            // The clip's own thumbnail, so Color grade tiles preview against what's
+                            // actually on the clip, not a generic stand-in image.
+                            thumb: match c.content {
+                                crate::clip::Content::Media { asset, .. } => self.media.get(asset).and_then(|m| m.cover.clone()),
+                                _ => None,
+                            },
                         };
                         column![container(inspector::search_bar(&self.inspector_query)).padding(iced::Padding { top: 8.0, right: 10.0, bottom: 4.0, left: 4.0 }), inspector::view(&self.doc.project, c, &ctx)].into()
                     }
@@ -2297,6 +2593,12 @@ impl Editor {
         parts.join("; ")
     }
 
+    /// The user's enabled skills, joined into one block for the assistant's system prompt
+    /// (empty if none are on).
+    fn skills_text(&self) -> String {
+        self.skills.iter().filter(|s| s.enabled).map(|s| format!("## {}\n{}", s.name, s.body)).collect::<Vec<_>>().join("\n\n")
+    }
+
     fn timeline_header(&self) -> Element<'_, Message> {
         // Range mode: Done replaces the tool; it clears the range when its job is done.
         let range_tool: Element<'_, Message> = if self.range_mode {
@@ -2323,7 +2625,17 @@ impl Editor {
             widgets::tip(widgets::icon_button(code::ZOOM_IN, Some(Message::ZoomBy(1.4))), "Zoom in", Some("+"), tip_pos()),
         ]
         .spacing(2);
-        header_row(row![text("Timeline").font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_2), container(tools).padding([0, 12])].align_y(Alignment::Center).into(), zoom.into())
+        // Lines up with where the ruler/lanes start past the track-header column (`HEADER_W`),
+        // minus the padding this header already has from the pane edge (6 outer + 12 here).
+        container(
+            row![text("Timeline").font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_2), space().width(timeline::HEADER_W - 18.0), tools, space().width(Fill), zoom]
+                .align_y(Alignment::Center)
+                .spacing(12),
+        )
+        .height(38)
+        .padding([0, 12])
+        .center_y(38)
+        .into()
     }
 
     fn timeline(&self) -> Element<'_, Message> {
@@ -2473,6 +2785,8 @@ pub fn blocked_by_dialog(m: &Message) -> bool {
             | Message::RangePress { .. }
             | Message::RangeDone
             | Message::AddZoomAtPlayhead
+            | Message::AddPressAtPlayhead
+            | Message::StaggerSelection
             | Message::AddText
             | Message::Undo
             | Message::Redo
@@ -2483,6 +2797,7 @@ pub fn blocked_by_dialog(m: &Message) -> bool {
             | Message::ImportPicked(_)
             | Message::AddMarker
             | Message::ToggleMute
+            | Message::ToggleSafeZones
             | Message::SeparateAudio
             | Message::ToggleClipMute
     )
@@ -2617,6 +2932,7 @@ fn editor_event(event: Event, status: event::Status, _window: window::Id) -> Opt
                 Key::Character("-") => Some(Message::ZoomBy(1.0 / 1.4)),
                 Key::Character("Z") | Key::Character("z") if modifiers.shift() => Some(Message::ZoomFit),
                 Key::Character("z") if !cmd => Some(Message::AddZoomAtPlayhead),
+                Key::Character("p") if !cmd => Some(Message::AddPressAtPlayhead),
                 _ => None,
             }
         }
@@ -2711,6 +3027,16 @@ mod tests {
 
     fn draft(ed: &Editor) -> &iced::widget::text_editor::Content {
         &ed.text_draft.as_ref().expect("the text box follows the selected text clip").1
+    }
+
+    #[test]
+    fn outro_defaults_to_60_percent_of_intro_duration() {
+        let (mut ed, clip) = editor_with_text("x");
+        let _ = ed.update(Message::ApplyMotion { intro: true, kind: crate::clip::MotionKind::Fade });
+        ed.doc.project.clip_mut(clip).unwrap().intro.as_mut().unwrap().duration = 1.0;
+        let _ = ed.update(Message::ApplyMotion { intro: false, kind: crate::clip::MotionKind::Fade });
+        let outro = ed.doc.project.clip(clip).unwrap().outro.unwrap();
+        assert!((outro.duration - 0.6).abs() < 1e-9, "outro should default to 60% of the intro duration, got {}", outro.duration);
     }
 
     #[test]
@@ -2880,5 +3206,65 @@ mod tests {
         // Dropped on that zoom: it opens it instead of stacking another.
         let _ = ed.apply_effect(Effect::Zoom, Some(DropTarget::Timeline { clip: Some(image), track: None, t }));
         assert_eq!(ed.doc.project.clip(image).unwrap().zooms.len(), 2);
+    }
+
+    #[test]
+    fn add_counter_inserts_a_default_clip_and_renders() {
+        let (mut ed, _) = editor_with_text("x");
+        ed.playhead = 0.0;
+        let _ = ed.update(Message::AddCounter);
+        let [id] = ed.selection[..] else { panic!("the new counter should be selected") };
+        let clip = ed.doc.project.clip(id).unwrap();
+        assert!(matches!(&clip.content, Content::Counter(c) if c.from == 0.0 && c.to == 100.0), "{:?}", clip.content);
+        let project = ed.doc.project.clone();
+        let scene = scene::evaluate(&project, 0.5, (1920, 1080), &ed.frames.bind(&project), false);
+        assert!(scene.layers.iter().any(|l| l.clip == id), "the counter renders a layer");
+    }
+
+    #[test]
+    fn camera_presets_insert_named_zooms_at_the_playhead() {
+        use library::{CameraPreset, Effect};
+        let (mut ed, _) = editor_with_text("x");
+        let info = crate::media::ProbeInfo { kind: crate::model::MediaKind::Image, duration: 0.0, width: 800, height: 600, fps: 0.0, has_audio: false };
+        let asset = ed.doc.project.add_asset(&std::env::current_exe().unwrap(), &info);
+        let image = ed.doc.project.add_media_clip(asset, None, 0.0).unwrap();
+
+        ed.selection = vec![image];
+        ed.playhead = 0.0;
+        let _ = ed.apply_effect(Effect::Camera(CameraPreset::PushIn), None);
+        let zooms = ed.doc.project.clip(image).unwrap().zooms.clone();
+        assert_eq!(zooms.len(), 1, "{zooms:?}");
+        assert!((zooms[0].scale - 1.15).abs() < 1e-6);
+        let clip_duration = ed.doc.project.clip(image).unwrap().duration;
+        assert!(zooms[0].at + zooms[0].duration > clip_duration, "the hold should reach to the end of the clip");
+
+        // A second clip for Pull back: two adjacent zooms, starting punched in and ending at 1.0×.
+        let image2 = ed.doc.project.add_media_clip(asset, None, 6.0).unwrap();
+        ed.selection = vec![image2];
+        ed.playhead = 6.0;
+        let _ = ed.apply_effect(Effect::Camera(CameraPreset::PullBack), None);
+        let zooms = ed.doc.project.clip(image2).unwrap().zooms.clone();
+        assert_eq!(zooms.len(), 2, "{zooms:?}");
+        assert!((zooms[0].scale - 1.3).abs() < 1e-6, "starts punched in");
+        assert!((zooms[1].scale - 1.0).abs() < 1e-6, "pulls back to normal");
+        assert!((zooms[1].at - (zooms[0].at + zooms[0].duration)).abs() < 1e-6, "the two zooms are back-to-back");
+    }
+
+    #[test]
+    fn color_grade_presets_apply_from_the_inspector() {
+        use crate::clip::GRADE_PRESETS;
+        // 30 presets plus "Original".
+        assert_eq!(GRADE_PRESETS.len(), 31);
+
+        let (mut ed, text) = editor_with_text("Title");
+        ed.selection = vec![text];
+        let teal = GRADE_PRESETS.iter().find(|p| p.name == "Teal & Orange").unwrap();
+        let _ = ed.update(Message::Edit(text, inspector::Edit::GradePreset(teal.grade)));
+        assert_eq!(ed.doc.project.clip(text).unwrap().grade, teal.grade);
+
+        // "Original" clears it back to the untouched default.
+        let original = GRADE_PRESETS.iter().find(|p| p.name == "Original").unwrap();
+        let _ = ed.update(Message::Edit(text, inspector::Edit::GradePreset(original.grade)));
+        assert_eq!(ed.doc.project.clip(text).unwrap().grade, crate::clip::Grade::default());
     }
 }

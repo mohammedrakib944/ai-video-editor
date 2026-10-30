@@ -64,6 +64,23 @@ fn style_props() -> serde_json::Map<String, Value> {
         "outro_duration": num("Seconds"),
         "transition": choice(TRANSITIONS, "Transition from the previous clip on the same track into this one"),
         "transition_duration": num("Seconds"),
+        "intro_ease": choice(EASES, "Entrance easing (default depends on the motion). \"back\" gives a slight springy overshoot — a bouncy entrance."),
+        "intro_delay": num("Seconds after the clip starts before the intro begins. Give a group of clips slightly larger delays (e.g. 0.05-0.1s apart) to stagger their entrances instead of landing them all at once."),
+        "outro_ease": choice(EASES, "Exit easing (default depends on the motion)."),
+        "idle_drift": boolean("A slow, continuous breathing scale (1.0-1.02) so a still moment never looks frozen. Good on a held shot with no other motion."),
+    });
+    v.as_object().unwrap().clone()
+}
+
+/// Styling for a counter's displayed number: the subset of `text_props()` that applies (no
+/// `text` — it's computed every frame — or `background`, which counters don't support).
+fn counter_style_props() -> serde_json::Map<String, Value> {
+    let v = json!({
+        "font": choice(&["Inter", "Poppins", "Hind Siliguri"], "Inter or Poppins for English, Hind Siliguri for Bangla"),
+        "weight": int("400 regular, 500 medium, 600 semibold, 700 bold"),
+        "size": num("Font size, canvas units"),
+        "color": string("#RRGGBB"),
+        "align": choice(&["left", "center", "right"], "Alignment"),
     });
     v.as_object().unwrap().clone()
 }
@@ -111,7 +128,7 @@ returns few or no beats.",
         ),
         tool(
             "add_text",
-            "Add a text layer (titles, callouts, captions). Returns the clip id.",
+            "Add a text layer (titles, captions, lower-thirds). Returns the clip id.",
             merged(&[text_props(), style_props()], json!({ "start": num("Timeline seconds"), "duration": num("Seconds (default 4)"), "track_id": int("Optional video track") })),
             &["text", "start"],
         ),
@@ -130,7 +147,58 @@ returns few or no beats.",
             })),
             &["start", "width", "height", "color"],
         ),
-        tool("update_clip", "Change any properties of a clip. Only the fields you pass change.", merged(&[style_props(), text_props()], json!({ "clip_id": int(""), "name": string("Label on the timeline"), "speed": num("Playback speed, 0.25–4 (video/audio)"), "crop_left": num("Video/image crop: fraction of the source frame cut from the left (0–0.95); the rest stays in place"), "crop_right": num("Fraction cut from the right"), "crop_top": num("Fraction cut from the top"), "crop_bottom": num("Fraction cut from the bottom") })), &["clip_id"]),
+        tool(
+            "add_glow_icon",
+            "Add a glowing icon accent (check, arrow, star, sparkle, zap) that pops in with a spring and can pulse — a tasteful \
+highlight for one genuinely important moment (a result landing, a step completing, a point being emphasized). Use sparingly: one or \
+two per video, short (around 1-1.5s), never as decoration on every cut. Returns the clip id.",
+            merged(&[style_props()], json!({
+                "start": num("Timeline seconds"), "duration": num("Seconds (default 1.3)"),
+                "icon": choice(&["check", "arrow", "star", "sparkle", "zap"], "Which glyph"),
+                "color": string("#RRGGBB — also tints the glow"),
+                "pulse": boolean("Keep gently breathing/pulsing while on screen (default off: just pops in and holds)"),
+                "track_id": int("Optional video track"),
+            })),
+            &["start", "icon", "color"],
+        ),
+        tool(
+            "add_counter",
+            "Add an animated number that counts up or down, eased, over `count_duration`, then holds at the final value — for \
+before/after metrics (revenue, users, a percentage). Never jumps to the final value in one frame. Returns the clip id.",
+            merged(&[style_props(), counter_style_props()], json!({
+                "start": num("Timeline seconds"), "duration": num("Seconds the clip is on screen (default 2)"),
+                "from": num("Starting number"), "to": num("Ending number"),
+                "count_duration": num("Seconds the count animation takes, eased (default 1); it holds at `to` for the rest of the clip"),
+                "decimals": int("Decimal places (default 0)"),
+                "prefix": string("e.g. \"$\""), "suffix": string("e.g. \"%\" or \"+ users\""),
+                "track_id": int("Optional video track"),
+            })),
+            &["start", "from", "to"],
+        ),
+        tool(
+            "add_camera_move",
+            "A one-click, slow continuous camera move on a video or image clip, from a time to the end of the clip — reads as a \
+deliberate camera move, not a highlight (use add_zoom to call attention to part of the frame instead). push_in: ramps in to a closer \
+framing and holds. pull_back: starts punched in and pulls back to reveal the whole frame.",
+            json!({ "clip_id": int(""), "move": choice(&["push_in", "pull_back"], ""), "start": num("Timeline seconds the move starts (default: clip start)") }),
+            &["clip_id", "move"],
+        ),
+        tool(
+            "add_press_pulse",
+            "A one-shot \"button press\" pulse on a clip at a moment: a quick scale dip and recovery, like a real click. Use right \
+when the user taps or clicks something in a screen recording. Returns the pulse id.",
+            json!({ "clip_id": int(""), "at": num("Timeline seconds"), "duration": num("Seconds, default ~0.13 (8 frames at 60fps)") }),
+            &["clip_id", "at"],
+        ),
+        tool("remove_press_pulse", "Remove a press pulse.", json!({ "clip_id": int(""), "pulse_id": int("") }), &["clip_id", "pulse_id"]),
+        tool(
+            "stagger_entrances",
+            "Offsets a group of clips' intro animations a few frames apart (in the order given) instead of landing them all on the \
+same instant — for a checklist, feature cards or bullet points entering together. Clips with no intro motion are left alone.",
+            json!({ "clip_ids": { "type": "array", "items": { "type": "integer" } }, "gap_frames": int("Frames between each clip's entrance (default 3)") }),
+            &["clip_ids"],
+        ),
+        tool("update_clip", "Change any properties of a clip. Only the fields you pass change.", merged(&[style_props(), text_props()], json!({ "clip_id": int(""), "name": string("Label on the timeline"), "speed": num("Playback speed, 0.25–4 (video/audio)"), "crop_left": num("Video/image crop: fraction of the source frame cut from the left (0–0.95); the rest stays in place"), "crop_right": num("Fraction cut from the right"), "crop_top": num("Fraction cut from the top"), "crop_bottom": num("Fraction cut from the bottom"), "icon": choice(&["check", "arrow", "star", "sparkle", "zap"], "Glow icon clips only: change the glyph"), "pulse": boolean("Glow icon clips only: breathe/pulse while on screen"), "from": num("Counter clips only: starting number"), "to": num("Counter clips only: ending number"), "count_duration": num("Counter clips only: seconds the count animation takes"), "decimals": int("Counter clips only: decimal places"), "prefix": string("Counter clips only"), "suffix": string("Counter clips only") })), &["clip_id"]),
         tool(
             "style_text",
             "Style some words of a text clip differently from the rest (an accent-colored keyword, a bolder or bigger word, a marker highlight, an underline). Pick the words with `words` (exact text, case-sensitive) or with start/end character positions. Only the fields you pass change; `clear` removes their styling.",
@@ -196,6 +264,13 @@ returns few or no beats.",
             &["start", "x", "y", "width", "height"],
         ),
         tool("update_blur", "Change a blur clip's box or strength. Only the fields you pass change. Change its timing with move_clip / trim_clip.", json!({ "clip_id": int(""), "x": num("Canvas fraction"), "y": num("Canvas fraction"), "width": num("Canvas fraction"), "height": num("Canvas fraction"), "strength": num("0–100"), "ellipse": boolean("") }), &["clip_id"]),
+        tool(
+            "add_mask",
+            "Isolate part of the picture for a time range (a face, a product, a speaker): a mask clip on a video track that shows only the video and images under it, only inside its box and only between start and end (everywhere else is hidden). Set invert to flip it into a cutout that hides the box instead. Move or trim it like any clip (move_clip, trim_clip); keyframe its X/Y (set_keyframes) to follow a moving subject; remove it with delete_clips. Returns the clip id.",
+            json!({ "start": num("Timeline seconds"), "end": num("Timeline seconds (default start + 3)"), "x": num("Box center, fraction of the canvas width"), "y": num("Box center, fraction of the canvas height"), "width": num("Fraction of the canvas width"), "height": num("Fraction of the canvas height"), "feather": num("Edge softness, 0–100, default 15"), "ellipse": boolean("Oval instead of a box, default true"), "invert": boolean("Hide the box instead of isolating it"), "track_id": int("Optional video track; it must be above the footage to mask (default: a free top track)") }),
+            &["start", "x", "y", "width", "height"],
+        ),
+        tool("update_mask", "Change a mask clip's box, feather or invert. Only the fields you pass change. Change its timing with move_clip / trim_clip.", json!({ "clip_id": int(""), "x": num("Canvas fraction"), "y": num("Canvas fraction"), "width": num("Canvas fraction"), "height": num("Canvas fraction"), "feather": num("0–100"), "ellipse": boolean(""), "invert": boolean("") }), &["clip_id"]),
         tool("separate_audio", "Put the sound of a video clip on an audio track of its own (same timing and volume); the video keeps playing silently. Returns the new audio clip id.", json!({ "clip_id": int("") }), &["clip_id"]),
         tool("add_marker", "Add a timeline marker: a colored flag at a time, or a span when duration > 0. Markers organize the edit (sections, notes); they don't show in the video. Returns the marker id.", json!({ "time": num("Timeline seconds"), "duration": num("Seconds, 0 for a point (default)"), "name": string("Label"), "color": string("#RRGGBB") }), &["time"]),
         tool("update_marker", "Change a timeline marker.", json!({ "marker_id": int(""), "time": num(""), "duration": num(""), "name": string(""), "color": string("#RRGGBB") }), &["marker_id"]),
@@ -313,6 +388,19 @@ fn ease(v: Option<&str>) -> Ease {
     }
 }
 
+/// Like `ease`, but for an explicit `intro_ease`/`outro_ease` field: an unrecognized value is a
+/// mistake worth reporting, not something to silently fall back from.
+fn ease_choice(v: &str) -> anyhow::Result<Ease> {
+    Ok(match v {
+        "linear" => Ease::Linear,
+        "smooth" => Ease::Smooth,
+        "ease_in" => Ease::EaseIn,
+        "ease_out" => Ease::EaseOut,
+        "back" => Ease::Back,
+        other => bail!("Unknown ease `{other}`"),
+    })
+}
+
 /// Applies the shared style/text fields from `a` to a clip.
 fn apply_props(c: &mut Clip, a: &Value) -> anyhow::Result<()> {
     let t = &mut c.transform;
@@ -373,16 +461,34 @@ fn apply_props(c: &mut Clip, a: &Value) -> anyhow::Result<()> {
     }
     let half = (c.duration / 2.0).max(0.05);
     if let Some(v) = s(a, "intro") {
-        c.intro = motion(v)?.map(|kind| Motion { kind, duration: c.intro.map(|m| m.duration).unwrap_or(0.6).min(half) });
+        c.intro = motion(v)?.map(|kind| Motion { kind, duration: c.intro.map(|m| m.duration).unwrap_or(0.6).min(half), ease: c.intro.and_then(|m| m.ease), delay: c.intro.map(|m| m.delay).unwrap_or(0.0) });
     }
     if let (Some(d), Some(m)) = (f(a, "intro_duration"), c.intro.as_mut()) {
         m.duration = d.clamp(0.05, half);
     }
+    if let Some(v) = s(a, "intro_ease") {
+        let e = ease_choice(v)?;
+        if let Some(m) = c.intro.as_mut() {
+            m.ease = Some(e);
+        }
+    }
+    if let (Some(v), Some(m)) = (f(a, "intro_delay"), c.intro.as_mut()) {
+        m.delay = v.max(0.0);
+    }
     if let Some(v) = s(a, "outro") {
-        c.outro = motion(v)?.map(|kind| Motion { kind, duration: c.outro.map(|m| m.duration).unwrap_or(0.6).min(half) });
+        c.outro = motion(v)?.map(|kind| Motion { kind, duration: c.outro.map(|m| m.duration).unwrap_or(0.6).min(half), ease: c.outro.and_then(|m| m.ease), delay: 0.0 });
     }
     if let (Some(d), Some(m)) = (f(a, "outro_duration"), c.outro.as_mut()) {
         m.duration = d.clamp(0.05, half);
+    }
+    if let Some(v) = s(a, "outro_ease") {
+        let e = ease_choice(v)?;
+        if let Some(m) = c.outro.as_mut() {
+            m.ease = Some(e);
+        }
+    }
+    if let Some(v) = a.get("idle_drift").and_then(Value::as_bool) {
+        c.idle_drift = v.then_some(crate::clip::DriftKind::ScaleBreath);
     }
     if let Some(v) = s(a, "transition") {
         c.transition = transition(v)?.map(|kind| Transition { kind, duration: c.transition.map(|t| t.duration).unwrap_or(0.6).min(half) });
@@ -429,7 +535,73 @@ fn apply_props(c: &mut Clip, a: &Value) -> anyhow::Result<()> {
             None => {}
         }
     }
+    if let Some(col) = color(a, "color")? {
+        if let Content::Callout(cal) = &mut c.content {
+            cal.color = col;
+            c.look.shadow.color = col;
+        }
+        if let Content::Counter(counter) = &mut c.content {
+            counter.format.color = col;
+        }
+    }
+    if let Some(v) = a.get("pulse").and_then(Value::as_bool) {
+        if let Content::Callout(cal) = &mut c.content {
+            cal.pulse = v;
+        }
+    }
+    if let Some(v) = s(a, "icon") {
+        if let Content::Callout(cal) = &mut c.content {
+            cal.icon = callout_icon(v)?;
+        }
+    }
+    if let Content::Counter(counter) = &mut c.content {
+        if let Some(v) = f(a, "from") {
+            counter.from = v;
+        }
+        if let Some(v) = f(a, "to") {
+            counter.to = v;
+        }
+        if let Some(v) = f(a, "count_duration") {
+            counter.duration = v.max(0.05);
+        }
+        if let Some(v) = a.get("decimals").and_then(Value::as_u64) {
+            counter.decimals = v as u32;
+        }
+        if let Some(v) = s(a, "prefix") {
+            counter.prefix = v.to_string();
+        }
+        if let Some(v) = s(a, "suffix") {
+            counter.suffix = v.to_string();
+        }
+        if let Some(v) = s(a, "font") {
+            counter.format.font = v.to_string();
+        }
+        if let Some(v) = a.get("weight").and_then(Value::as_u64) {
+            counter.format.weight = (v as u16).clamp(100, 900);
+        }
+        if let Some(v) = f(a, "size") {
+            counter.format.size = v.clamp(4.0, 1000.0);
+        }
+        match s(a, "align") {
+            Some("left") => counter.format.align = Align::Left,
+            Some("center") => counter.format.align = Align::Center,
+            Some("right") => counter.format.align = Align::Right,
+            _ => {}
+        }
+    }
     Ok(())
+}
+
+fn callout_icon(v: &str) -> anyhow::Result<crate::clip::CalloutIcon> {
+    use crate::clip::CalloutIcon;
+    Ok(match v {
+        "check" => CalloutIcon::Check,
+        "arrow" => CalloutIcon::Arrow,
+        "star" => CalloutIcon::Star,
+        "sparkle" => CalloutIcon::Sparkle,
+        "zap" => CalloutIcon::Zap,
+        other => bail!("Unknown callout icon `{other}`"),
+    })
 }
 
 fn kind_name(p: &Project, c: &Clip) -> &'static str {
@@ -437,6 +609,9 @@ fn kind_name(p: &Project, c: &Clip) -> &'static str {
         Content::Text(_) => "text",
         Content::Shape(_) => "shape",
         Content::Blur(_) => "blur",
+        Content::Mask(_) => "mask",
+        Content::Callout(_) => "callout",
+        Content::Counter(_) => "counter",
         Content::Media { .. } if c.part == crate::clip::Part::Sound => "audio",
         Content::Media { asset, .. } => match p.asset(*asset).map(|a| a.kind) {
             Some(MediaKind::Audio) => "audio",
@@ -513,10 +688,10 @@ impl Editor {
                     m.insert("shadow".into(), json!(true));
                 }
                 if let Some(i) = c.intro {
-                    m.insert("intro".into(), json!(format!("{:?}", i.kind)));
+                    m.insert("intro".into(), json!({ "kind": format!("{:?}", i.kind), "duration": r3(i.duration), "ease": i.ease.map(|e| format!("{e:?}").to_lowercase()), "delay": r3(i.delay) }));
                 }
                 if let Some(o2) = c.outro {
-                    m.insert("outro".into(), json!(format!("{:?}", o2.kind)));
+                    m.insert("outro".into(), json!({ "kind": format!("{:?}", o2.kind), "duration": r3(o2.duration), "ease": o2.ease.map(|e| format!("{e:?}").to_lowercase()) }));
                 }
                 if let Some(t) = c.transition {
                     m.insert("transition".into(), json!(format!("{:?}", t.kind)));
@@ -525,6 +700,13 @@ impl Editor {
                     let zooms: Vec<Value> = c.zooms.iter().map(|z| json!({ "id": z.id, "start": r3(c.start + z.at), "end": r3(c.start + z.at + z.duration), "scale": z.scale, "focus_x": r3(z.focus_x), "focus_y": r3(z.focus_y) })).collect();
                     m.insert("zooms".into(), json!(zooms));
                 }
+                if !c.presses.is_empty() {
+                    let presses: Vec<Value> = c.presses.iter().map(|pp| json!({ "id": pp.id, "at": r3(c.start + pp.at), "duration": r3(pp.duration) })).collect();
+                    m.insert("press_pulses".into(), json!(presses));
+                }
+                if c.idle_drift.is_some() {
+                    m.insert("idle_drift".into(), json!(true));
+                }
                 if !c.crop.is_none() {
                     m.insert("crop".into(), json!({ "left": r3(c.crop.left), "right": r3(c.crop.right), "top": r3(c.crop.top), "bottom": r3(c.crop.bottom) }));
                 }
@@ -532,6 +714,25 @@ impl Editor {
                     let (cw, ch) = p.canvas.size();
                     let per = cw.min(ch) as f64 / 1080.0;
                     m.insert("blur".into(), json!({ "width": r3(b.width * per / cw as f64), "height": r3(b.height * per / ch as f64), "strength": b.strength, "ellipse": b.ellipse }));
+                }
+                if let Content::Mask(mask) = &c.content {
+                    let (cw, ch) = p.canvas.size();
+                    let per = cw.min(ch) as f64 / 1080.0;
+                    m.insert("mask".into(), json!({ "width": r3(mask.width * per / cw as f64), "height": r3(mask.height * per / ch as f64), "feather": mask.feather, "ellipse": mask.ellipse, "invert": mask.invert }));
+                }
+                if let Content::Callout(cal) = &c.content {
+                    m.insert("icon".into(), json!(format!("{:?}", cal.icon).to_lowercase()));
+                    m.insert("color".into(), json!(cal.color.to_hex()));
+                    m.insert("pulse".into(), json!(cal.pulse));
+                }
+                if let Content::Counter(counter) = &c.content {
+                    m.insert("from".into(), json!(counter.from));
+                    m.insert("to".into(), json!(counter.to));
+                    m.insert("count_duration".into(), json!(r3(counter.duration)));
+                    m.insert("decimals".into(), json!(counter.decimals));
+                    m.insert("prefix".into(), json!(counter.prefix));
+                    m.insert("suffix".into(), json!(counter.suffix));
+                    m.insert("color".into(), json!(counter.format.color.to_hex()));
                 }
                 match c.part {
                     crate::clip::Part::Picture => {
@@ -663,6 +864,78 @@ impl Editor {
                 })?;
                 self.selection = vec![clip];
                 Ok(format!("Added shape clip {clip}"))
+            })(),
+            "add_glow_icon" => (|| {
+                let start = req_f(&a, "start")?;
+                let icon = callout_icon(s(&a, "icon").context("`icon` is required")?)?;
+                let fill = color(&a, "color")?.context("`color` is required")?;
+                let mut callout = crate::clip::CalloutLayer::new(icon, fill);
+                callout.pulse = a.get("pulse").and_then(Value::as_bool).unwrap_or(false);
+                let track = id(&a, "track_id");
+                let duration = f(&a, "duration").unwrap_or(1.3);
+                let clip = self.ai_edit("Add glow icon", |p| {
+                    let id = p.add_callout_clip(track, start, duration.max(0.1), callout)?;
+                    let c = p.clip_mut(id)?;
+                    apply_props(c, &a)?;
+                    Ok(id)
+                })?;
+                self.selection = vec![clip];
+                Ok(format!("Added glow icon clip {clip}"))
+            })(),
+            "add_counter" => (|| {
+                let start = req_f(&a, "start")?;
+                let (from, to) = (req_f(&a, "from")?, req_f(&a, "to")?);
+                let track = id(&a, "track_id");
+                let duration = f(&a, "duration").unwrap_or(2.0);
+                let clip = self.ai_edit("Add counter", |p| {
+                    let id = p.add_counter_clip(track, start, duration.max(0.1), crate::clip::CounterLayer::new(from, to))?;
+                    let c = p.clip_mut(id)?;
+                    apply_props(c, &a)?;
+                    Ok(id)
+                })?;
+                self.selection = vec![clip];
+                Ok(format!("Added counter clip {clip}"))
+            })(),
+            "add_camera_move" => (|| {
+                let clip = req_id(&a, "clip_id")?;
+                let push_in = match s(&a, "move") {
+                    Some("push_in") => true,
+                    Some("pull_back") => false,
+                    _ => anyhow::bail!("`move` must be \"push_in\" or \"pull_back\""),
+                };
+                self.ai_edit(if push_in { "Push in" } else { "Pull back" }, |p| {
+                    let c0 = p.clip(clip).context("That clip no longer exists")?;
+                    let local = f(&a, "start").map(|t| t - c0.start).unwrap_or(0.0);
+                    if push_in { p.push_in(clip, local) } else { p.pull_back(clip, local) }
+                })?;
+                Ok(format!("Added a camera {} on clip {clip}", if push_in { "push in" } else { "pull back" }))
+            })(),
+            "add_press_pulse" => (|| {
+                let (clip, at) = (req_id(&a, "clip_id")?, req_f(&a, "at")?);
+                let duration = f(&a, "duration").unwrap_or(crate::clip::PressPulse::DEFAULT_DURATION).max(0.02);
+                let pid = self.ai_edit("Add press pulse", |p| {
+                    let pid = p.alloc_id();
+                    let c = p.clip_mut(clip)?;
+                    let local = (at - c.start).clamp(0.0, c.duration);
+                    c.presses.push(crate::clip::PressPulse { id: pid, at: local, duration });
+                    Ok(pid)
+                })?;
+                Ok(format!("Added press pulse {pid}"))
+            })(),
+            "remove_press_pulse" => (|| {
+                let (clip, pid) = (req_id(&a, "clip_id")?, req_id(&a, "pulse_id")?);
+                self.ai_edit("Remove press pulse", |p| {
+                    p.clip_mut(clip)?.presses.retain(|x| x.id != pid);
+                    Ok(())
+                })?;
+                Ok("Removed press pulse".into())
+            })(),
+            "stagger_entrances" => (|| {
+                let ids: Vec<Id> = a["clip_ids"].as_array().map(|v| v.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
+                let gap = a.get("gap_frames").and_then(Value::as_u64).map(|v| v as u32).unwrap_or(3);
+                let fps = self.doc.project.canvas.fps;
+                self.ai_edit("Stagger entrances", |p| p.stagger_group(&ids, gap, fps))?;
+                Ok(format!("Staggered {} clips' entrances", ids.len()))
             })(),
             "update_clip" => (|| {
                 let clip = req_id(&a, "clip_id")?;
@@ -905,6 +1178,62 @@ impl Editor {
                 })?;
                 Ok("Updated blur".into())
             })(),
+            "add_mask" => (|| {
+                let start = req_f(&a, "start")?;
+                let end = f(&a, "end").unwrap_or(start + 3.0);
+                anyhow::ensure!(end - start >= 0.1, "The mask must last at least 0.1 s");
+                let (x, y, w, h) = (req_f(&a, "x")?, req_f(&a, "y")?, req_f(&a, "width")?, req_f(&a, "height")?);
+                let (cw, ch) = self.doc.project.canvas.size();
+                let per = 1080.0 / cw.min(ch) as f64;
+                let layer = crate::clip::MaskLayer {
+                    width: (w * cw as f64 * per).clamp(4.0, 4000.0),
+                    height: (h * ch as f64 * per).clamp(4.0, 4000.0),
+                    feather: f(&a, "feather").unwrap_or(15.0).clamp(0.0, 100.0),
+                    ellipse: a.get("ellipse").and_then(Value::as_bool).unwrap_or(true),
+                    invert: a.get("invert").and_then(Value::as_bool).unwrap_or(false),
+                };
+                let track = id(&a, "track_id");
+                let clip = self.ai_edit("Add mask", |p| {
+                    let id = p.add_mask_clip(track, start, end - start, layer)?;
+                    let c = p.clip_mut(id)?;
+                    (c.transform.x, c.transform.y) = (x, y);
+                    Ok(id)
+                })?;
+                self.selection = vec![clip];
+                Ok(format!("Added mask clip {clip}"))
+            })(),
+            "update_mask" => (|| {
+                let clip = req_id(&a, "clip_id")?;
+                let (cw, ch) = self.doc.project.canvas.size();
+                let per = 1080.0 / cw.min(ch) as f64;
+                self.ai_edit("Update mask", |p| {
+                    let c = p.clip_mut(clip)?;
+                    let Content::Mask(mask) = &mut c.content else { anyhow::bail!("Clip {clip} is not a mask") };
+                    if let Some(v) = f(&a, "width") {
+                        mask.width = (v * cw as f64 * per).clamp(4.0, 4000.0);
+                    }
+                    if let Some(v) = f(&a, "height") {
+                        mask.height = (v * ch as f64 * per).clamp(4.0, 4000.0);
+                    }
+                    if let Some(v) = f(&a, "feather") {
+                        mask.feather = v.clamp(0.0, 100.0);
+                    }
+                    if let Some(v) = a.get("ellipse").and_then(Value::as_bool) {
+                        mask.ellipse = v;
+                    }
+                    if let Some(v) = a.get("invert").and_then(Value::as_bool) {
+                        mask.invert = v;
+                    }
+                    if let Some(v) = f(&a, "x") {
+                        c.transform.x = v;
+                    }
+                    if let Some(v) = f(&a, "y") {
+                        c.transform.y = v;
+                    }
+                    Ok(())
+                })?;
+                Ok("Updated mask".into())
+            })(),
             "separate_audio" => (|| {
                 let clip = req_id(&a, "clip_id")?;
                 let sound = self.ai_edit("Separate audio", |p| p.separate_audio(clip))?;
@@ -1052,7 +1381,10 @@ impl Editor {
             }),
             "get_export_status" => Ok(match self.export.as_ref().map(|e| &e.phase) {
                 Some(super::export_dialog::Phase::Running { done, total, .. }) => format!("Rendering: {done}/{total} frames"),
-                Some(super::export_dialog::Phase::Done { path, .. }) => format!("Done: {}", path.display()),
+                Some(super::export_dialog::Phase::Done { items, .. }) => match items.as_slice() {
+                    [(path, _)] => format!("Done: {}", path.display()),
+                    many => format!("Done: {} files ({})", many.len(), many.iter().map(|(p, _)| p.display().to_string()).collect::<Vec<_>>().join(", ")),
+                },
                 Some(super::export_dialog::Phase::Failed(e)) => format!("Failed: {e}"),
                 _ => "No export running".into(),
             }),
@@ -1148,6 +1480,53 @@ mod tests {
     use super::*;
     use crate::media::ProbeInfo;
     use crate::model::{Canvas, MediaKind};
+
+    fn text_clip() -> Clip {
+        Clip::new(1, 1, 0.0, 4.0, Content::Text(TextLayer::default()))
+    }
+
+    #[test]
+    fn apply_props_sets_idle_drift_intro_ease_and_delay() {
+        let mut c = text_clip();
+        c.intro = Some(Motion { kind: MotionKind::Fade, duration: 0.5, ease: None, delay: 0.0 });
+        c.outro = Some(Motion { kind: MotionKind::Fade, duration: 0.3, ease: None, delay: 0.0 });
+        apply_props(&mut c, &json!({ "idle_drift": true, "intro_ease": "back", "intro_delay": 0.1, "outro_ease": "ease_in" })).unwrap();
+        assert_eq!(c.idle_drift, Some(crate::clip::DriftKind::ScaleBreath));
+        assert_eq!(c.intro.unwrap().ease, Some(Ease::Back));
+        assert_eq!(c.intro.unwrap().delay, 0.1);
+        assert_eq!(c.outro.unwrap().ease, Some(Ease::EaseIn));
+
+        apply_props(&mut c, &json!({ "idle_drift": false })).unwrap();
+        assert_eq!(c.idle_drift, None);
+
+        // An intro_ease with no intro motion set is simply a no-op, not an error.
+        let mut no_intro = text_clip();
+        apply_props(&mut no_intro, &json!({ "intro_ease": "back" })).unwrap();
+        assert!(no_intro.intro.is_none());
+
+        // An unrecognized ease is a reported error, unlike the lenient keyframe `ease()` helper.
+        assert!(apply_props(&mut c, &json!({ "intro_ease": "bounce" })).is_err());
+    }
+
+    #[test]
+    fn apply_props_updates_counter_fields_and_number_style() {
+        let mut c = Clip::new(1, 1, 0.0, 4.0, Content::Counter(crate::clip::CounterLayer::new(0.0, 100.0)));
+        apply_props(&mut c, &json!({ "from": 10.0, "to": 250.0, "count_duration": 1.5, "decimals": 1, "prefix": "$", "suffix": "k", "font": "Poppins", "weight": 700, "size": 120.0, "color": "#FF0000", "align": "center" })).unwrap();
+        let Content::Counter(counter) = &c.content else { panic!("not a counter") };
+        assert_eq!((counter.from, counter.to, counter.duration, counter.decimals), (10.0, 250.0, 1.5, 1));
+        assert_eq!((counter.prefix.as_str(), counter.suffix.as_str()), ("$", "k"));
+        assert_eq!((counter.format.font.as_str(), counter.format.weight, counter.format.size), ("Poppins", 700, 120.0));
+        assert_eq!(counter.format.color, Rgba::hex(0xFF0000));
+        assert_eq!(counter.format.align, Align::Center);
+    }
+
+    #[test]
+    fn ease_choice_matches_every_schema_value_and_rejects_unknown() {
+        for v in EASES {
+            assert!(ease_choice(v).is_ok(), "{v} should be a recognized ease");
+        }
+        assert!(ease_choice("bounce").is_err());
+    }
 
     fn project_with_clip() -> (Project, Id) {
         let mut p = Project::new("t", Canvas::default());

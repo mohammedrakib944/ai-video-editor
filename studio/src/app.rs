@@ -3,11 +3,12 @@
 use std::path::{Path, PathBuf};
 
 use iced::keyboard::{self, Key, key};
-use iced::widget::{button, column, container, row, space, text};
+use iced::widget::{button, column, container, mouse_area, opaque, row, space, text, text_input};
 use iced::window;
 use iced::{Alignment, Element, Event, Fill, Subscription, Task, event};
 use iced_aw::DropDown;
 
+use crate::doc::Doc;
 use crate::editor::{self, Editor, SideTab};
 use crate::model::{FILE_EXTENSION, Project};
 use crate::settings::Settings;
@@ -21,6 +22,16 @@ use crate::ui::style;
 enum Screen {
     Start(Start),
     Editor(Box<Editor>),
+}
+
+/// An action that was about to discard unsaved changes; held while the user
+/// is asked whether to save, discard or cancel (see `App::confirm`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAction {
+    Quit,
+    NewProject,
+    CloseProject,
+    Open,
 }
 
 #[derive(Debug, Clone)]
@@ -56,8 +67,19 @@ pub enum Message {
     StartDrop(PathBuf),
     OpenSettings,
     Settings(crate::settings_dialog::Message),
+    OpenShortcuts,
+    Shortcuts(crate::shortcuts_dialog::Message),
     /// Preview zoom from the toolbar menu (None = fit).
     PreviewZoom(Option<f32>),
+    /// Save the current project, then continue the action that was waiting on it.
+    ConfirmSave,
+    /// Discard unsaved changes, then continue the action that was waiting on it.
+    ConfirmDiscard,
+    /// Keep working; abandon whatever action was waiting on unsaved changes.
+    ConfirmCancel,
+    DismissError,
+    /// Debug builds: `STUDIO_SNAPSHOT_OPEN=confirm` opens the unsaved-changes dialog.
+    DevConfirm,
 }
 
 pub struct App {
@@ -69,6 +91,7 @@ pub struct App {
     zoom_menu: bool,
     ai_dialog: bool,
     settings_dialog: bool,
+    shortcuts_dialog: bool,
     /// The AI being checked in the Connect AI dialog.
     ai_checking: Option<crate::settings::AiProvider>,
     /// Waiting for the ChatGPT sign-in in the browser.
@@ -76,6 +99,8 @@ pub struct App {
     ai_detail: Option<(crate::settings::AiProvider, Result<String, String>)>,
     error: Option<String>,
     window_size: iced::Size,
+    /// Set when New/Close/Open/Quit would discard unsaved changes; shows the confirm dialog.
+    confirm: Option<PendingAction>,
 }
 
 impl App {
@@ -84,7 +109,7 @@ impl App {
             eprintln!("assistant server: {e}");
         }
         let error = (!crate::ffmpeg::is_available()).then(|| format!("FFmpeg was not found, so media can't be imported or previewed. {}", crate::ffmpeg::missing_hint()));
-        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, ai_dialog: false, settings_dialog: false, ai_checking: None, ai_signing_in: false, ai_detail: None, error, window_size: iced::Size::ZERO };
+        let app = App { settings: Settings::load(), screen: Screen::Start(Start::default()), maximized: false, app_menu: false, format_menu: false, zoom_menu: false, ai_dialog: false, settings_dialog: false, shortcuts_dialog: false, ai_checking: None, ai_signing_in: false, ai_detail: None, error, window_size: iced::Size::ZERO, confirm: None };
         let path = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file());
         let task = match path {
             Some(p) => Task::done(Message::OpenPicked(Some(p))),
@@ -138,6 +163,7 @@ impl App {
                 }
                 match msg {
                     start::Message::Create => return self.create_project(),
+                    start::Message::TryExample => return self.create_example_project(),
                     start::Message::Open => return self.update(Message::Open),
                     start::Message::OpenRecent(p) => return self.open_project(&p),
                     start::Message::ForgetRecent(p) => {
@@ -148,10 +174,17 @@ impl App {
                 }
             }
             Message::Editor(editor::Message::OpenAiConnect) | Message::OpenAi => self.ai_dialog = true,
-            // The Connect AI dialog is modal: shortcuts don't edit the project behind it.
-            Message::Editor(ref m) if (self.ai_dialog || self.settings_dialog) && editor::blocked_by_dialog(m) => {}
+            // The Connect AI dialog (and friends) are modal: shortcuts don't edit the project behind them.
+            Message::Editor(ref m) if (self.ai_dialog || self.settings_dialog || self.shortcuts_dialog || self.confirm.is_some()) && editor::blocked_by_dialog(m) => {}
             Message::Editor(editor::Message::Escape) if self.ai_dialog => self.ai_dialog = false,
             Message::Editor(editor::Message::Escape) if self.settings_dialog => self.settings_dialog = false,
+            Message::Editor(editor::Message::Escape) if self.shortcuts_dialog => self.shortcuts_dialog = false,
+            Message::Editor(editor::Message::Escape) if self.confirm.is_some() => self.confirm = None,
+            Message::OpenShortcuts => {
+                self.app_menu = false;
+                self.shortcuts_dialog = true;
+            }
+            Message::Shortcuts(crate::shortcuts_dialog::Message::Close) => self.shortcuts_dialog = false,
             Message::OpenSettings => {
                 self.app_menu = false;
                 self.settings_dialog = true;
@@ -266,21 +299,19 @@ impl App {
             }
             Message::NewProject => {
                 self.app_menu = false;
-                self.close_project();
+                if self.is_dirty() {
+                    self.confirm = Some(PendingAction::NewProject);
+                } else {
+                    self.close_project();
+                }
             }
             Message::Open => {
                 self.app_menu = false;
-                return Task::perform(
-                    async {
-                        rfd::AsyncFileDialog::new()
-                            .set_title("Open project")
-                            .add_filter("AI Video Editor project", &[FILE_EXTENSION])
-                            .pick_file()
-                            .await
-                            .map(|h| h.path().to_path_buf())
-                    },
-                    Message::OpenPicked,
-                );
+                if self.is_dirty() {
+                    self.confirm = Some(PendingAction::Open);
+                    return Task::none();
+                }
+                return pick_project_file();
             }
             Message::OpenPicked(Some(p)) => return self.open_project(&p),
             Message::OpenPicked(None) | Message::SavePicked(None) => {}
@@ -316,7 +347,11 @@ impl App {
             Message::SavePicked(Some(p)) => self.save_editor(Some(p.with_extension(FILE_EXTENSION))),
             Message::CloseProject => {
                 self.app_menu = false;
-                self.close_project();
+                if self.is_dirty() {
+                    self.confirm = Some(PendingAction::CloseProject);
+                } else {
+                    self.close_project();
+                }
             }
             Message::ToggleAssistant => {
                 if let Screen::Editor(e) = &mut self.screen {
@@ -336,14 +371,85 @@ impl App {
             }
             Message::Quit => {
                 self.app_menu = false;
+                if self.is_dirty() {
+                    self.confirm = Some(PendingAction::Quit);
+                    return Task::none();
+                }
                 self.persist();
                 if let Screen::Editor(e) = &mut self.screen {
                     e.shutdown();
                 }
                 return window::latest().and_then(window::close);
             }
+            Message::ConfirmCancel => self.confirm = None,
+            Message::ConfirmDiscard => {
+                if let Some(action) = self.confirm.take() {
+                    self.discard_changes();
+                    return self.run_pending(action);
+                }
+            }
+            Message::ConfirmSave => {
+                if let Some(action) = self.confirm.take() {
+                    let Screen::Editor(e) = &mut self.screen else { return Task::none() };
+                    match e.path.clone() {
+                        Some(path) => match e.doc.project.save(&path) {
+                            Ok(()) => {
+                                e.doc.mark_saved();
+                                self.settings.touch_recent(&e.doc.project.name, &path, e.doc.project.canvas.summary());
+                                self.settings.save();
+                                return self.run_pending(action);
+                            }
+                            Err(err) => {
+                                self.error = Some(format!("Could not save: {err}"));
+                                // Keep the dialog open so the user can retry or discard instead.
+                                self.confirm = Some(action);
+                            }
+                        },
+                        // Never saved before: let them pick where, then they can try again.
+                        None => return self.update(Message::SaveAs),
+                    }
+                }
+            }
+            Message::DismissError => self.error = None,
+            Message::DevConfirm => self.confirm = Some(PendingAction::Quit),
         }
         Task::none()
+    }
+
+    /// Whether the open project (if any) has edits that aren't saved to disk yet.
+    fn is_dirty(&self) -> bool {
+        matches!(&self.screen, Screen::Editor(e) if e.doc.is_dirty())
+    }
+
+    /// Reverts the open project to its last saved file, dropping in-memory edits
+    /// ("Don't save" in the unsaved-changes dialog). A project that was never saved
+    /// has nothing on disk to protect, so it's left as-is — it's about to be replaced anyway.
+    fn discard_changes(&mut self) {
+        if let Screen::Editor(e) = &mut self.screen {
+            if let Some(path) = e.path.clone() {
+                if let Ok(fresh) = Project::load(&path) {
+                    e.doc = Doc::new(fresh);
+                }
+            }
+        }
+    }
+
+    /// Continues whatever New/Close/Open/Quit was waiting on the unsaved-changes dialog.
+    fn run_pending(&mut self, action: PendingAction) -> Task<Message> {
+        match action {
+            PendingAction::Quit => {
+                self.persist();
+                if let Screen::Editor(e) = &mut self.screen {
+                    e.shutdown();
+                }
+                window::latest().and_then(window::close)
+            }
+            PendingAction::NewProject | PendingAction::CloseProject => {
+                self.close_project();
+                Task::none()
+            }
+            PendingAction::Open => pick_project_file(),
+        }
     }
 
     /// Saves the project (if it has a file) and the layout.
@@ -352,10 +458,12 @@ impl App {
             self.settings.inspector_collapsed = e.collapsed.clone();
             self.settings.favorite_effects = e.favorite_effects.clone();
             self.settings.effects_open = e.effects_open.clone();
+            self.settings.skills = e.skills.clone();
             self.settings.layout = e.layout();
             if let (true, Some(path)) = (e.doc.is_dirty(), e.path.clone()) {
-                if e.doc.project.save(&path).is_ok() {
-                    e.doc.mark_saved();
+                match e.doc.project.save(&path) {
+                    Ok(()) => e.doc.mark_saved(),
+                    Err(err) => self.error = Some(format!("Could not save \"{}\": {err}", e.doc.project.name)),
                 }
             }
         }
@@ -366,8 +474,20 @@ impl App {
         let Screen::Start(start) = &self.screen else { return Task::none() };
         let name = if start.name.trim().is_empty() { "Untitled project".to_string() } else { start.name.trim().to_string() };
         let project = Project::new(&name, start.canvas);
+        self.save_new_project(project)
+    }
+
+    /// A short pre-built scene, so a first-time user has something finished to
+    /// explore and pull apart instead of a blank canvas.
+    fn create_example_project(&mut self) -> Task<Message> {
+        let Screen::Start(start) = &self.screen else { return Task::none() };
+        let project = crate::sample::demo_project(start.canvas);
+        self.save_new_project(project)
+    }
+
+    fn save_new_project(&mut self, project: Project) -> Task<Message> {
         let dir = self.settings.projects_dir();
-        let path = unique_path(&dir, &name);
+        let path = unique_path(&dir, &project.name);
         let saved = std::fs::create_dir_all(&dir).map_err(anyhow::Error::from).and_then(|_| project.save(&path));
         let path = match saved {
             Ok(()) => {
@@ -395,6 +515,7 @@ impl App {
         editor.collapsed = self.settings.inspector_collapsed.clone();
         editor.favorite_effects = self.settings.favorite_effects.clone();
         editor.effects_open = self.settings.effects_open.clone();
+        editor.skills = self.settings.skills.clone();
         let _ = editor.update(editor::Message::WindowSize(self.window_size));
         let task = editor.boot().map(Message::Editor);
         let task = task.chain(window::latest().and_then(window::size).map(Message::WindowSize));
@@ -449,6 +570,7 @@ impl App {
                 space().into(),
                 row![
                     crate::ai_connect::chip(self.settings.ai, Message::OpenAi),
+                    widgets::tip(widgets::icon_button(code::KEYBOARD, Some(Message::OpenShortcuts)), "Keyboard shortcuts", Some("Ctrl+/"), iced::widget::tooltip::Position::Bottom),
                     widgets::tip(widgets::icon_button(code::SETTINGS, Some(Message::OpenSettings)), "Settings", Some("Ctrl+,"), iced::widget::tooltip::Position::Bottom),
                 ]
                 .spacing(6)
@@ -465,10 +587,19 @@ impl App {
         let mut content = column![title_bar, body];
         if let Some(err) = &self.error {
             content = content.push(
-                container(row![icon(code::TRIANGLE_ALERT, 14).color(DANGER), text(err).size(T_SMALL).color(TEXT_1)].spacing(S2).align_y(Alignment::Center))
-                    .padding([8, 14])
-                    .width(Fill)
-                    .style(style::badge(DANGER)),
+                container(
+                    row![
+                        icon(code::TRIANGLE_ALERT, 14).color(DANGER),
+                        text(err).size(T_SMALL).color(TEXT_1),
+                        space().width(Fill),
+                        widgets::icon_button(code::X, Some(Message::DismissError)).width(22).height(22),
+                    ]
+                    .spacing(S2)
+                    .align_y(Alignment::Center),
+                )
+                .padding([8, 14])
+                .width(Fill)
+                .style(style::badge(DANGER)),
             );
         }
         // The window is always the same stack of layers, empty when unused: changing the shape
@@ -505,7 +636,12 @@ impl App {
         } else {
             space().into()
         };
-        let window_content: Element<'_, Message> = iced::widget::stack![content, dragged_layer, settings_layer, ai_layer].into();
+        let confirm_layer: Element<'_, Message> = match self.confirm {
+            Some(action) => confirm_dialog(action),
+            None => space().into(),
+        };
+        let shortcuts_layer: Element<'_, Message> = if self.shortcuts_dialog { crate::shortcuts_dialog::view().map(Message::Shortcuts) } else { space().into() };
+        let window_content: Element<'_, Message> = iced::widget::stack![content, dragged_layer, settings_layer, ai_layer, shortcuts_layer, confirm_layer].into();
         chrome::frame(window_content, self.maximized, Message::Window)
     }
 
@@ -521,8 +657,10 @@ impl App {
                 MenuItem::Separator,
                 MenuItem::new(code::SAVE, "Save", Message::Save).shortcut("Ctrl+S"),
                 MenuItem::new(code::COPY, "Save as…", Message::SaveAs).shortcut("Ctrl+Shift+S"),
+                MenuItem::new(code::PENCIL, "Rename project…", Message::Editor(editor::Message::RenameProjectStart)),
                 MenuItem::Separator,
                 MenuItem::new(code::SLIDERS_HORIZONTAL, "Settings…", Message::OpenSettings).shortcut("Ctrl+,"),
+                MenuItem::new(code::KEYBOARD, "Keyboard shortcuts…", Message::OpenShortcuts).shortcut("Ctrl+/"),
                 MenuItem::Separator,
                 MenuItem::new(code::X, "Close project", Message::CloseProject),
                 MenuItem::new(code::ARROW_UP_RIGHT, "Quit", Message::Quit).shortcut("Ctrl+Q"),
@@ -539,9 +677,22 @@ impl App {
             (true, false) => ("Saved", TEXT_4),
             (false, _) => ("Not saved", WARNING),
         };
+        let name: Element<'_, Message> = match &e.renaming_project {
+            Some(draft) => text_input("Project name", draft)
+                .id("project-rename")
+                .on_input(|s| Message::Editor(editor::Message::RenameProjectInput(s)))
+                .on_submit(Message::Editor(editor::Message::RenameProjectCommit))
+                .padding([3, 6])
+                .size(T_BODY)
+                .style(style::input)
+                .into(),
+            None => mouse_area(text(&e.doc.project.name).font(INTER_SEMIBOLD).size(T_BODY))
+                .on_double_click(Message::Editor(editor::Message::RenameProjectStart))
+                .into(),
+        };
         let left = row![
             dropdown,
-            text(&e.doc.project.name).font(INTER_SEMIBOLD).size(T_BODY),
+            name,
             container(row![container(space().width(6).height(6)).style(style::swatch(status.1, 3.0)), text(status.0).size(T_CAPTION).color(TEXT_3)].spacing(5).align_y(Alignment::Center))
                 .padding([0, 4]),
         ]
@@ -615,6 +766,7 @@ impl App {
             container(widgets::vdivider(18.0)).padding([0, 6]),
             widgets::tip(crate::ai_connect::chip(self.settings.ai, Message::OpenAi), "AI connection", None, pos),
             space().width(4),
+            widgets::tip(widgets::icon_button(code::KEYBOARD, Some(Message::OpenShortcuts)), "Keyboard shortcuts", Some("Ctrl+/"), pos),
             widgets::tip(widgets::icon_button(code::SETTINGS, Some(Message::OpenSettings)), "Settings", Some("Ctrl+,"), pos),
             space().width(4),
             widgets::tip(widgets::icon_toggle(code::SPARKLES, e.side_tab == SideTab::Assistant, Message::ToggleAssistant), "Assistant", Some("Ctrl+K"), pos),
@@ -649,6 +801,10 @@ fn snapshot_task() -> Task<Message> {
         Ok("assistant") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::ToggleAssistant),
         Ok("settings") => Task::done(Message::OpenSettings),
         Ok("effects") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::LibraryTab(editor::LibraryTab::Transitions))),
+        Ok("skills") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::OpenSkills)),
+        Ok("shortcuts") => Task::done(Message::OpenShortcuts),
+        Ok("confirm") => Task::done(Message::DevConfirm),
+        Ok("export") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::OpenExport)),
         _ => Task::none(),
     };
     // `STUDIO_SNAPSHOT_SELECT=clip[,range_start,range_end]` selects a clip (and a range).
@@ -692,6 +848,55 @@ fn snapshot_task() -> Task<Message> {
     Task::batch([open, scroll_first, hscroll, select, typing, text_select, zoom, chat, reopen, seek, shot])
 }
 
+/// The "You have unsaved changes" dialog shown before New/Close/Open/Quit would discard them.
+fn confirm_dialog(action: PendingAction) -> Element<'static, Message> {
+    let verb = match action {
+        PendingAction::Quit => "quitting",
+        PendingAction::NewProject => "starting a new project",
+        PendingAction::CloseProject => "closing this project",
+        PendingAction::Open => "opening another project",
+    };
+    let card = container(
+        column![
+            row![
+                container(icon(code::TRIANGLE_ALERT, 16).color(ON_ACCENT)).center(34).style(style::logo),
+                column![text("Unsaved changes").font(INTER_SEMIBOLD).size(T_TITLE), text(format!("Save your changes before {verb}?")).size(T_SMALL).color(TEXT_3)].spacing(2).width(Fill),
+            ]
+            .spacing(S3)
+            .align_y(Alignment::Center),
+            row![
+                widgets::ghost_button(None, "Cancel", Some(Message::ConfirmCancel)),
+                space().width(Fill),
+                widgets::secondary_button(None, "Don't save", Some(Message::ConfirmDiscard)),
+                widgets::primary_button(Some(code::SAVE), "Save", Some(Message::ConfirmSave)),
+            ]
+            .spacing(S2)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(S4),
+    )
+    .width(420)
+    .padding(S6)
+    .style(style::popover);
+    let scrim = mouse_area(container(space().width(Fill).height(Fill)).style(style::scrim)).on_press(Message::ConfirmCancel);
+    iced::widget::stack![scrim, container(opaque(card)).center(Fill)].into()
+}
+
+/// Opens the "Open project" file picker.
+fn pick_project_file() -> Task<Message> {
+    Task::perform(
+        async {
+            rfd::AsyncFileDialog::new()
+                .set_title("Open project")
+                .add_filter("AI Video Editor project", &[FILE_EXTENSION])
+                .pick_file()
+                .await
+                .map(|h| h.path().to_path_buf())
+        },
+        Message::OpenPicked,
+    )
+}
+
 fn window_task(action: WindowAction) -> Task<Message> {
     match action {
         WindowAction::Drag => window::latest().and_then(window::drag),
@@ -716,6 +921,7 @@ fn shortcut(event: Event, status: event::Status, _window: window::Id) -> Option<
         Key::Character("e") => Some(Message::Editor(editor::Message::OpenExport)),
         Key::Character("q") => Some(Message::Quit),
         Key::Character(",") => Some(Message::OpenSettings),
+        Key::Character("/") => Some(Message::OpenShortcuts),
         Key::Character("0") => Some(Message::PreviewZoom(None)),
         Key::Character("1") => Some(Message::PreviewZoom(Some(1.0))),
         Key::Named(key::Named::Escape) => Some(Message::AppMenu(false)),

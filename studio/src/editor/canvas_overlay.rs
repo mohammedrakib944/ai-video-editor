@@ -14,7 +14,7 @@ use super::Message;
 use super::inspector::Edit;
 use super::library::Effect;
 use crate::clip::{Content, Crop, Zoom};
-use crate::model::{Id, Project};
+use crate::model::{Aspect, Id, Project};
 use crate::render::scene::{LayerSpec, Scene, px_per_unit};
 use crate::ui::tokens::*;
 
@@ -39,6 +39,19 @@ pub struct Overlay<'a> {
     pub display: Size,
     /// The preview is zoomed in or out (not fitted), so the wheel pans it.
     pub zoomed: bool,
+    /// Live 9:16/1:1 crop guides, shown while the canvas itself is 16:9.
+    pub show_safe_zones: bool,
+}
+
+/// The centered rectangle `target`'s aspect ratio would occupy inside a `(canvas_w, canvas_h)`
+/// canvas — how a 16:9 master re-crops to a narrower export without re-animating. In canvas
+/// pixels: `(x, y, w, h)`.
+fn safe_zone_rect(canvas_w: f32, canvas_h: f32, target: Aspect) -> (f32, f32, f32, f32) {
+    let (tw, th) = target.ratio();
+    let (tw, th) = (tw as f32, th as f32);
+    let scale = (canvas_w / tw).min(canvas_h / th);
+    let (w, h) = (tw * scale, th * scale);
+    ((canvas_w - w) / 2.0, (canvas_h - h) / 2.0, w, h)
 }
 
 /// A grabbed part of an editable rectangle.
@@ -264,19 +277,19 @@ impl Overlay<'_> {
         self.scene.layers.iter().rev().find(|l| contains(l, p) && !self.locked(l.clip))
     }
 
-    /// Shapes, markers and blur boxes resize from every corner and side.
+    /// Shapes, markers, blur and mask boxes resize from every corner and side.
     fn stretchable(&self, clip: Id) -> bool {
-        self.project.clip(clip).is_some_and(|c| matches!(c.content, Content::Shape(_) | Content::Blur(_)))
+        self.project.clip(clip).is_some_and(|c| matches!(c.content, Content::Shape(_) | Content::Blur(_) | Content::Mask(_)))
     }
 
-    /// Media and shapes have rounded corners; text and blur boxes don't.
+    /// Media and shapes have rounded corners; text, blur and mask boxes don't.
     fn roundable(&self, clip: Id) -> bool {
-        self.project.clip(clip).is_some_and(|c| !matches!(c.content, Content::Text(_) | Content::Blur(_)))
+        self.project.clip(clip).is_some_and(|c| !matches!(c.content, Content::Text(_) | Content::Blur(_) | Content::Mask(_)))
     }
 
-    /// Blur boxes stay upright, so they have no rotation knob.
+    /// Blur and mask boxes stay upright, so they have no rotation knob.
     fn rotatable(&self, clip: Id) -> bool {
-        self.project.clip(clip).is_some_and(|c| !matches!(c.content, Content::Blur(_)))
+        self.project.clip(clip).is_some_and(|c| !matches!(c.content, Content::Blur(_) | Content::Mask(_)))
     }
 
     /// The corner-radius dot, inside the top-left corner.
@@ -395,6 +408,7 @@ impl canvas::Program<Message> for Overlay<'_> {
                     let boxed = match &clip.content {
                         Content::Shape(s) => Some((s.width, s.height)),
                         Content::Blur(b) => Some((b.width, b.height)),
+                        Content::Mask(m) => Some((m.width, m.height)),
                         _ => None,
                     };
                     if let Some((width, height)) = boxed {
@@ -550,6 +564,18 @@ impl canvas::Program<Message> for Overlay<'_> {
         // Hairline around the canvas.
         f.stroke(&Path::rectangle(Point::new(self.origin.x - 0.5, self.origin.y - 0.5), Size::new(self.display.width + 1.0, self.display.height + 1.0)), Stroke::default().with_color(CANVAS_BORDER).with_width(1.0));
 
+        if self.show_safe_zones && self.project.canvas.aspect == Aspect::Landscape {
+            let (cw, ch) = (self.scene.width as f32, self.scene.height as f32);
+            let dashed = |color: Color| Stroke { line_dash: canvas::LineDash { segments: &[6.0, 5.0], offset: 0 }, ..Stroke::default().with_color(color).with_width(1.5) };
+            for (target, color, label) in [(Aspect::Portrait, Color { a: 0.8, ..Color::WHITE }, "9:16"), (Aspect::Square, Color { a: 0.8, ..BRAND_2 }, "1:1")] {
+                let (x, y, w, h) = safe_zone_rect(cw, ch, target);
+                let (a, b) = (s(Point::new(x, y)), s(Point::new(x + w, y + h)));
+                let rect = Path::rectangle(a, Size::new(b.x - a.x, b.y - a.y));
+                f.stroke(&rect, dashed(color));
+                chip(&mut f, a, label, color);
+            }
+        }
+
         if let Some((clip, z)) = self.zoom_edit {
             if let Some(l) = self.layer(clip) {
                 let r = zoom_rect(l, &z);
@@ -666,6 +692,7 @@ impl canvas::Program<Message> for Overlay<'_> {
             let size = self.project.clip(l.clip).and_then(|c| match &c.content {
                 Content::Shape(sh) => Some((sh.width, sh.height)),
                 Content::Blur(b) => Some((b.width, b.height)),
+                Content::Mask(m) => Some((m.width, m.height)),
                 _ => None,
             });
             if let (Some(Drag::ShapeBox { .. }), Some((w, h))) = (state.drag, size) {
@@ -804,6 +831,19 @@ mod tests {
     }
 
     #[test]
+    fn safe_zone_is_centered_and_sized_to_the_target_aspect() {
+        let (x, y, w, h) = safe_zone_rect(1920.0, 1080.0, Aspect::Portrait);
+        assert!((w / h - 9.0 / 16.0).abs() < 1e-3, "keeps the 9:16 ratio, got {w}x{h}");
+        assert!((h - 1080.0).abs() < 1e-3, "the full height fits inside a 16:9 canvas");
+        assert!((x - (1920.0 - w) / 2.0).abs() < 1e-3 && (y - 0.0).abs() < 1e-3, "centered horizontally, flush top/bottom");
+
+        let (x, y, w, h) = safe_zone_rect(1920.0, 1080.0, Aspect::Square);
+        assert!((w - h).abs() < 1e-3, "1:1 is actually square");
+        assert!((w - 1080.0).abs() < 1e-3, "limited by the shorter side");
+        assert!((x - (1920.0 - w) / 2.0).abs() < 1e-3 && (y - (1080.0 - h) / 2.0).abs() < 1e-3, "centered both ways");
+    }
+
+    #[test]
     fn shapes_stretch_past_their_old_box_with_the_far_side_fixed() {
         let r = FULL.stretched(Grip::Edges(false, false, true, false), 0.5, 0.3, 0.05);
         assert_eq!((r.x0, r.y0, r.x1, r.y1), (0.0, 0.0, 1.5, 1.0), "only the right side moves, past 1");
@@ -814,14 +854,14 @@ mod tests {
     fn layer(clip: Id, center: [f32; 2], size: [f32; 2]) -> LayerSpec {
         LayerSpec {
             clip, slot: 1, frame: None, center, size, rotation: 0.0, opacity: 1.0, radius: 0.0, border: 0.0, border_color: [0.0; 4],
-            shadow_blur: 0.0, shadow_y: 0.0, shadow_color: [0.0; 4], uv: [0.0, 0.0, 1.0, 1.0], tint_top: [1.0; 4], tint_bottom: [1.0; 4], grade: [0.0; 4], shape: [0.0; 4], blurs: [[0.0; 8]; crate::clip::MAX_BLURS], blurrable: false, blur_box: None,
+            shadow_blur: 0.0, shadow_y: 0.0, shadow_color: [0.0; 4], uv: [0.0, 0.0, 1.0, 1.0], tint_top: [1.0; 4], tint_bottom: [1.0; 4], grade: [0.0; 4], grade2: [0.0; 4], shape: [0.0; 4], blurs: [[0.0; 8]; crate::clip::MAX_BLURS], masks: [[0.0; 8]; crate::clip::MAX_MASKS], blurrable: false, blur_box: None, mask_box: None,
         }
     }
 
     /// Presses the left button at canvas point (x, y) and says which clip the drag moves.
     fn press(project: &Project, layers: Vec<LayerSpec>, selection: &[Id], x: f32, y: f32) -> Option<Id> {
         let scene = Arc::new(Scene { width: 1920, height: 1080, background: [0.0; 4], layers });
-        let overlay = Overlay { project, scene, selection, zoom_edit: None, crop_edit: None, dragging: None, origin: Vector::ZERO, display: Size::new(1920.0, 1080.0), zoomed: false };
+        let overlay = Overlay { project, scene, selection, zoom_edit: None, crop_edit: None, dragging: None, origin: Vector::ZERO, display: Size::new(1920.0, 1080.0), zoomed: false, show_safe_zones: false };
         let mut state = State::default();
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(1920.0, 1080.0));
         let _ = canvas::Program::update(&overlay, &mut state, &canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), bounds, mouse::Cursor::Available(Point::new(x, y)));

@@ -5,7 +5,7 @@ use iced::{Alignment, Color, Element, Fill, Length, mouse};
 use iced_aw::ContextMenu;
 
 use super::{Editor, LibraryTab, Message, fmt_duration};
-use crate::clip::{MotionKind, Rgba, TransitionKind};
+use crate::clip::{CalloutIcon, MotionKind, Rgba, TransitionKind};
 use crate::model::MediaKind;
 use crate::ui::icons::{code, icon, tinted};
 use crate::ui::tokens::*;
@@ -34,6 +34,18 @@ impl Editor {
                         space().height(6),
                         widgets::section("Shapes"),
                         shape_grid(),
+                        space().height(6),
+                        widgets::section("Callouts"),
+                        text("A glowing icon accent that pops in — use sparingly, at a genuinely important moment.").size(T_CAPTION).color(TEXT_4),
+                        callout_grid(),
+                        space().height(6),
+                        widgets::section("Counter"),
+                        text("A number that counts up or down — great for before/after metrics.").size(T_CAPTION).color(TEXT_4),
+                        button(column![text("0 → 100").font(INTER_BOLD).size(20.0), text("Counts up over 1s").size(T_CAPTION).color(TEXT_3)].spacing(4))
+                            .width(Fill)
+                            .padding([12, 12])
+                            .style(style::choice_card(false))
+                            .on_press(Message::AddCounter),
                     ]
                     .spacing(S2)
                     .padding([8, 10]),
@@ -42,6 +54,7 @@ impl Editor {
                 .into()
             }
             LibraryTab::Transitions => self.effects_tab(),
+            LibraryTab::Animation => self.animation_tab(),
             LibraryTab::Sounds => self.sounds_tab(),
         }
     }
@@ -159,13 +172,26 @@ impl Editor {
 
 
     fn effects_tab(&self) -> Element<'_, Message> {
+        let groups: Vec<EffectGroup> = catalog().into_iter().filter(|g| !is_animation_group(g.title)).collect();
+        self.effect_groups_view(groups)
+    }
+
+    fn animation_tab(&self) -> Element<'_, Message> {
+        let groups: Vec<EffectGroup> = catalog().into_iter().filter(|g| is_animation_group(g.title)).collect();
+        self.effect_groups_view(groups)
+    }
+
+    /// Shared by the Effects and Animation tabs: a Favorites shelf on top, then every group
+    /// (from the given subset of `catalog()`) as a collapsible card grid.
+    fn effect_groups_view(&self, groups: Vec<EffectGroup>) -> Element<'_, Message> {
         let has_selection = !self.selection.is_empty();
         // Click applies to the selection; drag drops onto any clip (timeline or preview).
         // The star in the corner keeps an effect in Favorites.
         let card = |glyph: char, label: &'static str, caption: Option<&'static str>, effect: Effect| -> Element<'_, Message> {
             let hovered = self.effect_hover == Some(effect);
             let favorite = self.favorite_effects.iter().any(|k| *k == effect.key());
-            let mut info = column![container(icon(glyph, 18).color(ACCENT_HOVER)).center_x(Fill).height(30).align_y(Alignment::Center), text(label).font(INTER_MEDIUM).size(T_SMALL)].spacing(4).align_x(Alignment::Center);
+            let glyph_row = row![space().width(5), icon(glyph, 18).color(ACCENT_HOVER)].align_y(Alignment::Center);
+            let mut info = column![container(glyph_row).center_x(Fill).height(30).align_y(Alignment::Center), text(label).font(INTER_MEDIUM).size(T_SMALL)].spacing(4).align_x(Alignment::Center);
             if let Some(c) = caption {
                 info = info.push(text(c).size(T_CAPTION).color(TEXT_3));
             }
@@ -175,7 +201,7 @@ impl Editor {
                 .style(style::ghost)
                 .on_press(Message::ToggleFavoriteEffect(effect));
             let star = widgets::tip(star, if favorite { "Remove from favorites" } else { "Add to favorites" }, None, iced::widget::tooltip::Position::Top);
-            let card = stack![body, container(star).align_right(Fill).padding(2)];
+            let card = stack![body, container(star).align_right(Fill).padding(6)];
             mouse_area(card)
                 .on_press(Message::EffectPress(effect))
                 .on_release(Message::EffectClick(effect))
@@ -191,7 +217,6 @@ impl Editor {
         let mut col = column![text(hint).size(T_CAPTION).color(TEXT_3)].spacing(S3);
 
         // Favorites: always open, on top.
-        let groups = catalog();
         let favorites: Vec<Element<'_, Message>> = self
             .favorite_effects
             .iter()
@@ -224,14 +249,16 @@ impl Editor {
             .on_press(Message::ToggleEffectGroup(g.title));
             let mut group = column![head].spacing(S2);
             if open {
+                let mut body = column![].spacing(S2);
                 if g.title == MARKERS {
-                    group = group.push(self.marker_swatches());
+                    body = body.push(self.marker_swatches());
                 }
-                group = group.push(grid(g.items.iter().map(|&(glyph, label, effect)| card(glyph, label, None, effect)).collect()));
+                body = body.push(grid(g.items.iter().map(|&(glyph, label, effect)| card(glyph, label, None, effect)).collect()));
                 if g.title == MARKERS {
                     let timeline_marker = widgets::secondary_button(Some(code::FLAG), "Add timeline marker", Some(Message::AddMarker)).width(Fill);
-                    group = group.push(widgets::tip(timeline_marker, "A colored flag on the ruler (or a span over the marked range)", Some("Shift+M"), iced::widget::tooltip::Position::Top));
+                    body = body.push(widgets::tip(timeline_marker, "A colored flag on the ruler (or a span over the marked range)", Some("Shift+M"), iced::widget::tooltip::Position::Top));
                 }
+                group = group.push(container(body).padding(iced::Padding { top: 0.0, right: 10.0, bottom: 10.0, left: 10.0 }));
             }
             col = col.push(container(group).width(Fill).style(style::inset));
         }
@@ -300,11 +327,33 @@ pub enum Effect {
     Intro(MotionKind),
     Outro(MotionKind),
     Blur,
+    /// Isolates (or, inverted, hides) part of the picture inside a box.
+    Mask,
     Highlight(Highlight),
     /// Rounded corners, a border or a drop shadow on a picture.
     Frame(FrameStyle),
     /// A zoom (or a pan, right after another zoom) on a video or image.
     Zoom,
+    /// A named, one-click camera move (push in / pull back), tied to the playhead.
+    Camera(CameraPreset),
+}
+
+/// A ready-made camera move, built from the playhead to the end of the clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraPreset {
+    /// Slow, continuous zoom in from normal to a closer framing, held to the end.
+    PushIn,
+    /// Starts punched in and pulls back to reveal the whole frame, held to the end.
+    PullBack,
+}
+
+impl CameraPreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            CameraPreset::PushIn => "Push in",
+            CameraPreset::PullBack => "Pull back",
+        }
+    }
 }
 
 /// The frame styles a picture can get from the Effects tab (adjusted in the inspector).
@@ -317,6 +366,11 @@ pub enum FrameStyle {
 
 /// The marker group of the Effects tab (it also has the color swatches).
 pub const MARKERS: &str = "Markers";
+
+/// The `catalog()` groups shown on the Animation tab instead of the Effects tab.
+fn is_animation_group(title: &str) -> bool {
+    title == "Animate in" || title == "Animate out" || title == "Zoom & pan"
+}
 
 /// One group of the Effects tab: its title and its effects (icon, name, effect).
 pub struct EffectGroup {
@@ -345,7 +399,7 @@ pub fn catalog() -> Vec<EffectGroup> {
                 (code::MINUS, "Underline", Effect::Highlight(Highlight::Underline)),
             ],
         },
-        EffectGroup { title: "Hide", items: vec![(code::DROPLETS, "Blur area", Effect::Blur)] },
+        EffectGroup { title: "Hide", items: vec![(code::DROPLETS, "Blur area", Effect::Blur), (code::SCAN_EYE, "Mask area", Effect::Mask)] },
         EffectGroup {
             title: "Frame",
             items: vec![
@@ -354,9 +408,16 @@ pub fn catalog() -> Vec<EffectGroup> {
                 (code::LAYERS, "Shadow", Effect::Frame(FrameStyle::Shadow)),
             ],
         },
-        EffectGroup { title: "Zoom & pan", items: vec![(code::ZOOM_IN, "Zoom", Effect::Zoom)] },
         EffectGroup {
-            title: "Transition in",
+            title: "Zoom & pan",
+            items: vec![
+                (code::ZOOM_IN, "Zoom", Effect::Zoom),
+                (code::MAXIMIZE_2, CameraPreset::PushIn.label(), Effect::Camera(CameraPreset::PushIn)),
+                (code::MINIMIZE_2, CameraPreset::PullBack.label(), Effect::Camera(CameraPreset::PullBack)),
+            ],
+        },
+        EffectGroup {
+            title: "Transition",
             items: vec![
                 (code::BLEND, "Crossfade", Effect::Transition(TransitionKind::Crossfade)),
                 (code::ARROW_LEFT_RIGHT, "Slide", Effect::Transition(TransitionKind::SlideLeft)),
@@ -387,9 +448,11 @@ impl Effect {
             Effect::Intro(k) => format!("in:{k:?}"),
             Effect::Outro(k) => format!("out:{k:?}"),
             Effect::Blur => "blur".into(),
+            Effect::Mask => "mask".into(),
             Effect::Highlight(h) => format!("marker:{h:?}"),
             Effect::Frame(f) => format!("frame:{f:?}"),
             Effect::Zoom => "zoom".into(),
+            Effect::Camera(p) => format!("camera:{p:?}"),
         }
     }
 }
@@ -510,6 +573,73 @@ impl ShapePreset {
             }
         }
     }
+}
+
+/// Ready-made glowing icon callouts in the library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalloutPreset {
+    Check,
+    Arrow,
+    Star,
+    Sparkle,
+    Zap,
+}
+
+impl CalloutPreset {
+    const ALL: [CalloutPreset; 5] = [CalloutPreset::Check, CalloutPreset::Arrow, CalloutPreset::Star, CalloutPreset::Sparkle, CalloutPreset::Zap];
+
+    /// Delegates to `CalloutIcon`'s own label/glyph so this preset list and the clip's actual
+    /// icon enum never drift apart.
+    fn label(self) -> &'static str {
+        self.icon().label()
+    }
+
+    fn glyph(self) -> char {
+        crate::render::scene::callout_glyph(self.icon())
+    }
+
+    fn color(self) -> Rgba {
+        match self {
+            CalloutPreset::Check => Rgba::hex(0x2EF2A2),
+            CalloutPreset::Arrow => Rgba::hex(0x4C8DFF),
+            CalloutPreset::Star => Rgba::hex(0xFFD166),
+            CalloutPreset::Sparkle => Rgba::hex(0xD6FF00),
+            CalloutPreset::Zap => Rgba::hex(0xFF8A4C),
+        }
+    }
+
+    /// The callout layer for this preset.
+    pub fn build(self) -> crate::clip::CalloutLayer {
+        crate::clip::CalloutLayer::new(self.icon(), self.color())
+    }
+
+    fn icon(self) -> CalloutIcon {
+        match self {
+            CalloutPreset::Check => CalloutIcon::Check,
+            CalloutPreset::Arrow => CalloutIcon::Arrow,
+            CalloutPreset::Star => CalloutIcon::Star,
+            CalloutPreset::Sparkle => CalloutIcon::Sparkle,
+            CalloutPreset::Zap => CalloutIcon::Zap,
+        }
+    }
+}
+
+fn callout_grid<'a>() -> Element<'a, Message> {
+    let items = CalloutPreset::ALL.iter().map(|&p| -> Element<'a, Message> {
+        let Rgba(r, g, b, a) = p.color();
+        let col = Color::from_rgba(r, g, b, a);
+        button(
+            column![container(tinted(p.glyph(), 18, col)).center(34).style(style::badge(col)), text(p.label()).font(INTER_MEDIUM).size(T_CAPTION)]
+                .spacing(6)
+                .align_x(Alignment::Center),
+        )
+        .width(Fill)
+        .padding([10, 4])
+        .style(style::choice_card(false))
+        .on_press(Message::AddCallout(p))
+        .into()
+    });
+    iced::widget::grid(items.collect::<Vec<_>>()).fluid(84).spacing(6).height(iced::widget::grid::Sizing::EvenlyDistribute(Length::Shrink)).into()
 }
 
 fn shape_grid<'a>() -> Element<'a, Message> {

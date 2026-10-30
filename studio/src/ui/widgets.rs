@@ -46,7 +46,7 @@ pub fn icon_toggle<'a, M: Clone + 'a>(code: char, active: bool, on_press: M) -> 
     button(container(icon(code, 15)).center(CONTROL_H - 2.0)).width(CONTROL_H - 2.0).height(CONTROL_H - 2.0).padding(0).style(style::toggle(active)).on_press(on_press)
 }
 
-fn labeled<'a, M: 'a>(code: Option<char>, label: &'a str, font: iced::Font) -> Element<'a, M> {
+fn labeled<'a, M: 'a>(code: Option<char>, label: impl text::IntoFragment<'a>, font: iced::Font) -> Element<'a, M> {
     let mut r = row![].spacing(7).align_y(Alignment::Center);
     if let Some(c) = code {
         r = r.push(icon(c, 14));
@@ -54,15 +54,15 @@ fn labeled<'a, M: 'a>(code: Option<char>, label: &'a str, font: iced::Font) -> E
     r.push(text(label).font(font).size(T_BODY)).into()
 }
 
-pub fn primary_button<'a, M: Clone + 'a>(code: Option<char>, label: &'a str, on_press: Option<M>) -> button::Button<'a, M> {
+pub fn primary_button<'a, M: Clone + 'a>(code: Option<char>, label: impl text::IntoFragment<'a>, on_press: Option<M>) -> button::Button<'a, M> {
     button(labeled(code, label, INTER_SEMIBOLD)).padding([7, 14]).height(CONTROL_H).style(style::primary).on_press_maybe(on_press)
 }
 
-pub fn secondary_button<'a, M: Clone + 'a>(code: Option<char>, label: &'a str, on_press: Option<M>) -> button::Button<'a, M> {
+pub fn secondary_button<'a, M: Clone + 'a>(code: Option<char>, label: impl text::IntoFragment<'a>, on_press: Option<M>) -> button::Button<'a, M> {
     button(labeled(code, label, INTER_MEDIUM)).padding([7, 13]).height(CONTROL_H).style(style::secondary).on_press_maybe(on_press)
 }
 
-pub fn ghost_button<'a, M: Clone + 'a>(code: Option<char>, label: &'a str, on_press: Option<M>) -> button::Button<'a, M> {
+pub fn ghost_button<'a, M: Clone + 'a>(code: Option<char>, label: impl text::IntoFragment<'a>, on_press: Option<M>) -> button::Button<'a, M> {
     button(labeled(code, label, INTER_MEDIUM)).padding([7, 10]).height(CONTROL_H).style(style::ghost).on_press_maybe(on_press)
 }
 

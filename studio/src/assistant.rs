@@ -45,6 +45,15 @@ back-to-back zooms to pan between parts. Leave breathing room between zooms.
 - Timing: whenever there's music or a narration track, call analyze_audio_beats on it before animating anything over it, and land \
 zooms, cuts and text entrances on the returned times. Pacing that matches the audio is what reads as professional instead of \
 arbitrary; don't guess timing against audio you haven't analyzed.
+- Glow icons (add_glow_icon): a sparse accent, not decoration. Use at most one or two per video, only at a genuinely important \
+moment (a result landing, a step completing, a point being emphasized) — never on every cut or every clip. Keep them short \
+(around 1-1.5 s); let the pop-in read as the moment, don't leave pulse on for long stretches. Overusing these reads as cheap, \
+not premium.
+- Other polish tools, used the same sparingly: add_press_pulse for a quick click-scale dip right when something is tapped or \
+clicked in a screen recording; add_counter for a before/after number that counts up or down, eased, never a one-frame jump; \
+add_camera_move for a slow, deliberate push in or pull back held to the end of a clip (different from add_zoom, which calls \
+attention to part of the frame); idle_drift (on update_clip) to keep a long held shot from looking frozen; intro_ease: \"back\" \
+for a bouncy, springy entrance; stagger_entrances to offset a group's intros a few frames apart instead of all firing at once.
 After a few changes, use get_frame to check your work visually and fix anything that looks off (overlaps, text too small or \
 cut off). Keep replies short and friendly: one or two sentences about what you changed.";
 
@@ -99,6 +108,7 @@ pub fn describe_tool(name: &str, input: &Value) -> String {
         "add_media_clip" => format!("Placing media at {}", t("start")),
         "add_text" => format!("Adding “{}”", q("text")),
         "add_shape" => "Adding a shape".into(),
+        "add_glow_icon" => format!("Adding a glow icon ({})", q("icon")),
         "update_clip" => "Adjusting a clip".into(),
         "move_clip" => format!("Moving a clip to {}", t("start")),
         "trim_clip" => "Trimming a clip".into(),
@@ -202,10 +212,16 @@ pub fn codex_sign_in() -> Result<(), String> {
     }
 }
 
-/// The system prompt, with the platform the editor runs on.
-fn instructions() -> String {
+/// The system prompt, with the platform the editor runs on and the user's own enabled skills
+/// (already joined by the caller, empty if none).
+fn instructions(skills: &str) -> String {
     let os = if cfg!(windows) { "Windows" } else { "Linux" };
-    format!("{SYSTEM_PROMPT}\nThe editor runs on {os}; file paths are {os} paths.")
+    let mut s = format!("{SYSTEM_PROMPT}\nThe editor runs on {os}; file paths are {os} paths.");
+    if !skills.is_empty() {
+        s.push_str("\n\nThe user has also written these additional skills for you:\n\n");
+        s.push_str(skills);
+    }
+    s
 }
 
 /// What one assistant process has reported, collected by its reader thread.
@@ -327,14 +343,14 @@ impl Agent {
     }
 
     /// Claude Code: one long-lived process reading stream-json messages on stdin.
-    fn spawn_claude(&mut self, exe: &Path, cwd: &Path) -> anyhow::Result<()> {
+    fn spawn_claude(&mut self, exe: &Path, cwd: &Path, skills: &str) -> anyhow::Result<()> {
         let tag = Self::new_tag();
         let dir = crate::ffmpeg::work_dir();
         let cfg = dir.join(format!("assistant-mcp-{}.json", std::process::id()));
         let server = json!({ "type": "http", "url": mcp::url(), "headers": { mcp::RUN_HEADER: tag } });
         std::fs::write(&cfg, serde_json::to_string_pretty(&json!({ "mcpServers": { SERVER_KEY: server } }))?)?;
         let prompt = dir.join(format!("assistant-prompt-{}.txt", std::process::id()));
-        std::fs::write(&prompt, instructions())?;
+        std::fs::write(&prompt, instructions(skills))?;
         let mut args: Vec<String> = [
             "-p",
             "--input-format",
@@ -458,8 +474,9 @@ impl Agent {
         Ok(())
     }
 
-    /// Sends a message. `context` describes the editor state in one line.
-    pub fn send(&mut self, text: &str, context: &str, cwd: &Path) -> anyhow::Result<()> {
+    /// Sends a message. `context` describes the editor state in one line; `skills` is the user's
+    /// enabled skills, already joined into one block (empty if none).
+    pub fn send(&mut self, text: &str, context: &str, cwd: &Path, skills: &str) -> anyhow::Result<()> {
         anyhow::ensure!(!self.busy, "The assistant is still working on the last message");
         let (Some(provider), Some(exe)) = (self.provider, self.exe.clone()) else {
             anyhow::bail!("Connect an AI first");
@@ -472,7 +489,7 @@ impl Agent {
                     self.end_process();
                 }
                 if self.running.is_none() {
-                    self.spawn_claude(&exe, cwd)?;
+                    self.spawn_claude(&exe, cwd, skills)?;
                 }
                 let msg = json!({ "type": "user", "message": { "role": "user", "content": content } });
                 let r = self.running.as_mut().unwrap();
@@ -485,7 +502,7 @@ impl Agent {
             AiProvider::Codex => {
                 // One process per reply. A new conversation carries the instructions in its first message.
                 self.end_process();
-                let prompt = if self.session.is_none() { format!("<instructions>\n{}\n</instructions>\n\n{content}", instructions()) } else { content };
+                let prompt = if self.session.is_none() { format!("<instructions>\n{}\n</instructions>\n\n{content}", instructions(skills)) } else { content };
                 self.spawn_codex(&exe, cwd, &prompt)?;
             }
         }
@@ -804,8 +821,8 @@ mod tests {
 
         // Stopped in the middle of a tool call: the whole process tree ends at once.
         mode("slow");
-        agent.send("first", "", &dir).unwrap();
-        assert!(agent.send("again", "", &dir).is_err(), "no second message while one is running");
+        agent.send("first", "", &dir, "").unwrap();
+        assert!(agent.send("again", "", &dir, "").is_err(), "no second message while one is running");
         wait(&mut agent, |e| e.iter().any(|e| matches!(e, Event::ToolStart { .. })));
         let first_run = agent.running.as_ref().unwrap().tag.clone();
         assert!(agent.accepts(&first_run));
@@ -816,7 +833,7 @@ mod tests {
 
         // The next message gets a clean reply: no stale error, the conversation resumes.
         mode("fast");
-        agent.send("second", "", &dir).unwrap();
+        agent.send("second", "", &dir, "").unwrap();
         let events = wait(&mut agent, |e| !turn_done(e).is_empty());
         assert_eq!(turn_done(&events), [&None], "exactly one clean end: {events:?}");
         assert!(!agent.busy);
@@ -828,19 +845,19 @@ mod tests {
 
         // Claude Code dies in the middle of a reply: one error with what it printed, then it recovers.
         mode("crash");
-        agent.send("third", "", &dir).unwrap();
+        agent.send("third", "", &dir, "").unwrap();
         let events = wait(&mut agent, |e| !turn_done(e).is_empty());
         assert!(matches!(turn_done(&events)[..], [Some(e)] if e.contains("boom")), "{events:?}");
         assert!(!agent.busy && agent.running.is_none() && agent.session.is_some());
 
         // The saved conversation can't be opened: the next message starts a new one.
         mode("noresume");
-        agent.send("fourth", "", &dir).unwrap();
+        agent.send("fourth", "", &dir, "").unwrap();
         let events = wait(&mut agent, |e| !turn_done(e).is_empty());
         assert!(matches!(turn_done(&events)[..], [Some(e)] if e.contains("new conversation")), "{events:?}");
         assert!(agent.session.is_none());
         mode("fast");
-        agent.send("fifth", "", &dir).unwrap();
+        agent.send("fifth", "", &dir, "").unwrap();
         let events = wait(&mut agent, |e| !turn_done(e).is_empty());
         assert_eq!(turn_done(&events), [&None]);
         assert!(!std::fs::read_to_string(dir.join("args.txt")).unwrap().contains("--resume"));
@@ -942,7 +959,7 @@ mod tests {
 
         // First message: a new thread, with the instructions in the prompt read from stdin.
         mode("ok");
-        agent.send("Add a title", "playhead 0.00s", &dir).unwrap();
+        agent.send("Add a title", "playhead 0.00s", &dir, "").unwrap();
         let tag = agent.running.as_ref().unwrap().tag.clone();
         assert!(agent.accepts(&tag));
         let events = wait(&mut agent, |e| !turn_done(e).is_empty());
@@ -957,7 +974,7 @@ mod tests {
         assert!(!agent.busy);
 
         // The next message continues the same thread, without repeating the instructions.
-        agent.send("Make it bigger", "", &dir).unwrap();
+        agent.send("Make it bigger", "", &dir, "").unwrap();
         let events = wait(&mut agent, |e| !turn_done(e).is_empty());
         assert_eq!(turn_done(&events), [&None]);
         let (args, prompt) = (read("args.txt"), read("prompt.txt"));
@@ -966,19 +983,19 @@ mod tests {
 
         // A failed reply shows Codex's message; the next one still works.
         mode("fail");
-        agent.send("Again", "", &dir).unwrap();
+        agent.send("Again", "", &dir, "").unwrap();
         let events = wait(&mut agent, |e| !turn_done(e).is_empty());
         assert!(matches!(turn_done(&events)[..], [Some(m)] if m.contains("usage limit")), "{events:?}");
 
         // Stopped while a tool runs: the whole process tree ends, and late calls are refused.
         mode("slow");
-        agent.send("Slow one", "", &dir).unwrap();
+        agent.send("Slow one", "", &dir, "").unwrap();
         wait(&mut agent, |e| e.iter().any(|e| matches!(e, Event::ToolStart { .. })));
         let tag = agent.running.as_ref().unwrap().tag.clone();
         assert!(agent.stop());
         assert!(!agent.accepts(&tag) && agent.poll().is_empty());
         mode("ok");
-        agent.send("After stop", "", &dir).unwrap();
+        agent.send("After stop", "", &dir, "").unwrap();
         let events = wait(&mut agent, |e| !turn_done(e).is_empty());
         assert_eq!(turn_done(&events), [&None], "no stale error after Stop: {events:?}");
         std::thread::sleep(std::time::Duration::from_millis(4000));

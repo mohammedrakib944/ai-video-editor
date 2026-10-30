@@ -53,11 +53,111 @@ impl Quality {
     }
 }
 
+/// A named delivery target for the export dialog: besides a quality, it can cap the
+/// output resolution and pick an audio bitrate to match what a platform actually uses.
+/// `Custom` defers entirely to the dialog's own quality picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Preset {
+    Custom,
+    Web,
+    YouTube,
+    Social,
+    Archive,
+}
+
+impl Preset {
+    pub const ALL: [Preset; 5] = [Preset::Custom, Preset::Web, Preset::YouTube, Preset::Social, Preset::Archive];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Preset::Custom => "Custom",
+            Preset::Web => "Web",
+            Preset::YouTube => "YouTube",
+            Preset::Social => "Social (9:16)",
+            Preset::Archive => "Archive master",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Preset::Custom => "Pick your own quality below",
+            Preset::Web => "H.264, capped at 1080p — small enough to embed or email",
+            Preset::YouTube => "High bitrate H.264 at full resolution",
+            Preset::Social => "Capped at 1080px wide for Instagram/TikTok/Reels",
+            Preset::Archive => "Highest quality, full resolution — for safekeeping or re-editing",
+        }
+    }
+
+    fn quality(self, custom: Quality) -> Quality {
+        match self {
+            Preset::Custom => custom,
+            Preset::Web | Preset::Social => Quality::Standard,
+            Preset::YouTube | Preset::Archive => Quality::High,
+        }
+    }
+
+    /// Caps the output width (height scales to match); `None` keeps the project's own size.
+    fn max_width(self) -> Option<u32> {
+        match self {
+            Preset::Web | Preset::Social => Some(1080),
+            Preset::Custom | Preset::YouTube | Preset::Archive => None,
+        }
+    }
+
+    fn audio_kbps(self) -> u32 {
+        match self {
+            Preset::Web | Preset::Social => 128,
+            Preset::Custom | Preset::YouTube => 192,
+            Preset::Archive => 320,
+        }
+    }
+
+    /// Integrated loudness target in LUFS for the final mix; `None` leaves it unprocessed
+    /// (Custom defers to the user, Archive keeps the original dynamics for re-editing).
+    fn loudness(self) -> Option<f64> {
+        match self {
+            Preset::Web | Preset::YouTube | Preset::Social => Some(-14.0),
+            Preset::Custom | Preset::Archive => None,
+        }
+    }
+}
+
+/// Resolved settings for one export: a preset folds down to this, and a bare `Quality`
+/// (existing callers, tests, MCP) converts into the full-resolution, 192 kbps default.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExportSettings {
+    pub quality: Quality,
+    pub max_width: Option<u32>,
+    pub audio_kbps: u32,
+    pub loudness: Option<f64>,
+}
+
+impl From<Quality> for ExportSettings {
+    fn from(quality: Quality) -> Self {
+        ExportSettings { quality, max_width: None, audio_kbps: 192, loudness: None }
+    }
+}
+
+impl ExportSettings {
+    pub fn from_preset(preset: Preset, custom_quality: Quality) -> Self {
+        ExportSettings { quality: preset.quality(custom_quality), max_width: preset.max_width(), audio_kbps: preset.audio_kbps(), loudness: preset.loudness() }
+    }
+}
+
 /// Estimated file size in megabytes.
 pub fn estimate_mb(size: (u32, u32), fps: u32, quality: Quality, seconds: f64) -> f64 {
     let pixels = (size.0 * size.1) as f64 / (1920.0 * 1080.0);
     let video = quality.mbps_1080p30() * pixels.powf(0.75) * (fps as f64 / 30.0).powf(0.6);
     (video + 0.19) * seconds / 8.0
+}
+
+/// `size` scaled down to `max_width` (height keeps the aspect ratio, rounded to an even
+/// number as `-2` would in the FFmpeg scale filter); unchanged if it's already narrower.
+pub fn scaled_size(size: (u32, u32), max_width: Option<u32>) -> (u32, u32) {
+    match max_width {
+        Some(mw) if mw < size.0 => (mw, ((size.1 as f64 * mw as f64 / size.0 as f64) / 2.0).round() as u32 * 2),
+        _ => size,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +183,8 @@ fn headless_gpu() -> anyhow::Result<Gpu> {
 
 /// Renders the whole project to `path`. Writes to a temporary file first, so a
 /// failed or cancelled export never leaves a broken video behind.
-pub fn export(project: &Project, path: &Path, quality: Quality, cancel: &AtomicBool, progress: &dyn Fn(Progress)) -> anyhow::Result<PathBuf> {
+pub fn export(project: &Project, path: &Path, settings: impl Into<ExportSettings>, cancel: &AtomicBool, progress: &dyn Fn(Progress)) -> anyhow::Result<PathBuf> {
+    let settings = settings.into();
     let total = project.duration();
     if total <= 0.0 {
         bail!("The timeline is empty — add a clip before exporting");
@@ -97,7 +198,7 @@ pub fn export(project: &Project, path: &Path, quality: Quality, cancel: &AtomicB
     let mut renderer = Offscreen::new(w, h)?;
 
     // FFmpeg: raw frames on stdin, audio mixed from the source files.
-    let (inputs, graph) = audio::mix_graph(project, 1, total);
+    let (inputs, graph) = audio::mix_graph(project, 1, total, settings.loudness);
     let graph_file = ffmpeg::work_dir().join(format!("export-{}.txt", std::process::id()));
     std::fs::write(&graph_file, &graph).context("could not write the audio graph")?;
     let part = path.with_file_name(format!("{}.part", path.file_name().and_then(|n| n.to_str()).unwrap_or("export.mp4")));
@@ -108,8 +209,11 @@ pub fn export(project: &Project, path: &Path, quality: Quality, cancel: &AtomicB
     }
     cmd.arg(ffmpeg::filter_script_option()).arg(&graph_file);
     cmd.args(["-map", "0:v", "-map", "[aout]"]);
-    cmd.args(["-c:v", "libx264", "-preset", "medium", "-crf", &quality.crf().to_string(), "-pix_fmt", "yuv420p", "-r", &fps.to_string()]);
-    cmd.args(["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-f", "mp4", "-y"]).arg(&part);
+    if let Some(mw) = settings.max_width.filter(|&mw| mw < w) {
+        cmd.args(["-vf", &format!("scale={mw}:-2")]);
+    }
+    cmd.args(["-c:v", "libx264", "-preset", "medium", "-crf", &settings.quality.crf().to_string(), "-pix_fmt", "yuv420p", "-r", &fps.to_string()]);
+    cmd.args(["-c:a", "aac", "-b:a", &format!("{}k", settings.audio_kbps), "-movflags", "+faststart", "-f", "mp4", "-y"]).arg(&part);
     let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().context("could not start FFmpeg")?;
     let mut stdin = child.stdin.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
@@ -307,8 +411,8 @@ impl scene::Sources for ExactSources<'_> {
         }
     }
 
-    fn text(&self, layer: &crate::clip::TextLayer, px_per_unit: f32) -> Option<Arc<super::Frame>> {
-        self.inner.text(layer, px_per_unit)
+    fn text(&self, layer: &crate::clip::TextLayer, px_per_unit: f32, local: f64) -> Option<Arc<super::Frame>> {
+        self.inner.text(layer, px_per_unit, local)
     }
 }
 
@@ -343,7 +447,7 @@ mod tests {
         p.clip_mut(v).unwrap().look.corner_radius = 30.0;
         p.set_speed(v, 2.0).unwrap();
         let t = p.add_text_clip(None, 0.2, crate::edit::DEFAULT_STILL, TextLayer { text: "নতুন Studio".into(), ..Default::default() }).unwrap();
-        p.clip_mut(t).unwrap().intro = Some(Motion { kind: MotionKind::Pop, duration: 0.4 });
+        p.clip_mut(t).unwrap().intro = Some(Motion { kind: MotionKind::Pop, duration: 0.4, ease: None, delay: 0.0 });
         p.add_shape_clip(Some(p.tracks[1].id), 0.0, crate::edit::DEFAULT_STILL, ShapeLayer::new(ShapeKind::Rectangle, 200.0, 80.0, Rgba::hex(0x7C6DFF), None)).unwrap();
 
         let out = dir.join("out.mp4");

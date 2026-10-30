@@ -2,12 +2,13 @@
 
 use std::ops::RangeInclusive;
 
-use iced::widget::{button, checkbox, column, container, pick_list, row, slider, space, text, text_input, toggler};
-use iced::{Alignment, Color, Element, Fill, Length};
+use iced::widget::{button, checkbox, column, container, image, pick_list, row, slider, space, stack, text, text_input, toggler};
+use iced::gradient::Linear;
+use iced::{Alignment, Background, Color, Element, Fill, Gradient, Length};
 
 use super::Message;
 use super::timeline::clip_label;
-use crate::clip::{Align, Clip, Content, Fit, MotionKind, Rgba, TransitionKind};
+use crate::clip::{Align, Clip, Content, Fit, Grade, GradePreset, MotionKind, Rgba, TransitionKind, GRADE_PRESETS};
 use crate::model::{Id, MediaKind, Project};
 use crate::ui::icons::{code, icon, tinted};
 use crate::ui::tokens::*;
@@ -33,11 +34,23 @@ pub enum Edit {
     Contrast(f64),
     Saturation(f64),
     Temperature(f64),
+    Lift(f64),
+    Gamma(f64),
+    Gain(f64),
     ResetGrade,
+    /// Sets all four grade fields at once, from a preset in `clip::GRADE_PRESETS`.
+    GradePreset(crate::clip::Grade),
     Volume(f64),
     Mute(bool),
     FadeIn(f64),
     FadeOut(f64),
+    EqLow(f64),
+    EqMid(f64),
+    EqHigh(f64),
+    ResetEq,
+    Compressor(bool),
+    CompressorAmount(f64),
+    Denoise(f64),
     Speed(f64),
     Text(String),
     Font(String),
@@ -46,6 +59,10 @@ pub enum Edit {
     TextColor(Rgba),
     Align(Align),
     TextBox(bool),
+    /// Words fade in one after another instead of all at once.
+    TextReveal(bool),
+    TextRevealDuration(f64),
+    TextRevealStagger(f64),
     ShapeKind(crate::clip::ShapeKind),
     ShapeFill(Rgba),
     ShapeGradient(bool),
@@ -57,9 +74,12 @@ pub enum Edit {
     Outro(Option<MotionKind>),
     IntroDuration(f64),
     OutroDuration(f64),
+    /// Snaps the intro to an overshooting "bouncy" entrance (`Ease::Back`, 0.5s), or back off it.
+    IntroBouncy(bool),
     Transition(Option<TransitionKind>),
     TransitionDuration(f64),
     RemoveZoom(Id),
+    RemovePress(Id),
     ZoomScale(Id, f64),
     ZoomFocusX(Id, f64),
     ZoomFocusY(Id, f64),
@@ -72,10 +92,26 @@ pub enum Edit {
     /// Blur clips: strength (0..100), oval or box (the box is moved and sized on the preview).
     BlurStrength(f64),
     BlurEllipse(bool),
-    /// A shape resized on the canvas: width and height (canvas units) and its new center.
+    /// Mask clips: edge softness (0..100), oval or box, and invert (hide the box instead of
+    /// showing only it) — the box itself is moved and sized on the preview.
+    MaskFeather(f64),
+    MaskEllipse(bool),
+    MaskInvert(bool),
+    /// A shape, blur or mask resized on the canvas: width and height (canvas units) and its new center.
     ShapeBox(f64, f64, f64, f64),
     /// Restyles characters `start..end` of a text clip.
     SpanStyle(usize, usize, crate::clip::SpanChange),
+    CalloutIcon(crate::clip::CalloutIcon),
+    CalloutColor(Rgba),
+    CalloutPulse(bool),
+    /// A slow, continuous breathing so a still moment never looks frozen.
+    IdleDrift(bool),
+    CounterFrom(f64),
+    CounterTo(f64),
+    CounterDuration(f64),
+    CounterDecimals(u32),
+    CounterPrefix(String),
+    CounterSuffix(String),
 }
 
 impl Edit {
@@ -93,21 +129,35 @@ impl Edit {
             Edit::BorderWidth(_) | Edit::BorderColor(_) => ("border", "Border"),
             Edit::Shadow(_) | Edit::ShadowBlur(_) | Edit::ShadowOffset(_) | Edit::ShadowOpacity(_) => ("shadow", "Shadow"),
             Edit::Brightness(_) | Edit::Contrast(_) | Edit::Saturation(_) | Edit::Temperature(_) => ("grade", "Color"),
+            Edit::Lift(_) | Edit::Gamma(_) | Edit::Gain(_) => ("grade", "Three-way color"),
             Edit::ResetGrade => ("reset-grade", "Reset color"),
+            Edit::GradePreset(_) => ("grade", "Color grade"),
             Edit::Volume(_) | Edit::Mute(_) => ("volume", "Volume"),
             Edit::FadeIn(_) | Edit::FadeOut(_) => ("fade", "Audio fade"),
+            Edit::EqLow(_) | Edit::EqMid(_) | Edit::EqHigh(_) => ("eq", "Equalizer"),
+            Edit::ResetEq => ("reset-eq", "Reset equalizer"),
+            Edit::Compressor(_) | Edit::CompressorAmount(_) => ("compressor", "Compressor"),
+            Edit::Denoise(_) => ("denoise", "Noise reduction"),
             Edit::Speed(_) => ("speed", "Speed"),
             Edit::Text(_) => ("text", "Edit text"),
             Edit::SpanStyle(..) => ("text-span", "Style words"),
             Edit::Font(_) | Edit::FontSize(_) | Edit::Weight(_) | Edit::TextColor(_) | Edit::Align(_) | Edit::TextBox(_) => ("text-style", "Text style"),
-            Edit::Intro(_) | Edit::Outro(_) | Edit::IntroDuration(_) | Edit::OutroDuration(_) => ("motion", "Animation"),
+            Edit::TextReveal(_) | Edit::TextRevealDuration(_) | Edit::TextRevealStagger(_) => ("text-reveal", "Kinetic reveal"),
+            Edit::Intro(_) | Edit::Outro(_) | Edit::IntroDuration(_) | Edit::OutroDuration(_) | Edit::IntroBouncy(_) => ("motion", "Animation"),
             Edit::ShapeKind(_) | Edit::ShapeThickness(_) | Edit::ShapeBox(..) => ("shape", "Shape"),
             Edit::ShapeFill(_) | Edit::ShapeGradient(_) | Edit::ShapeFillTo(_) | Edit::ShapeRadial(_) | Edit::ShapeAngle(_) => ("shape-fill", "Shape fill"),
             Edit::Transition(_) | Edit::TransitionDuration(_) => ("transition", "Transition"),
             Edit::RemoveZoom(_) => ("remove-zoom", "Remove zoom"),
+            Edit::RemovePress(_) => ("remove-press", "Remove press pulse"),
             Edit::ZoomScale(..) | Edit::ZoomFocusX(..) | Edit::ZoomFocusY(..) | Edit::ZoomFocus(..) => ("zoom", "Zoom"),
             Edit::Crop(_) | Edit::CropLeft(_) | Edit::CropTop(_) | Edit::CropRight(_) | Edit::CropBottom(_) => ("crop", "Crop"),
             Edit::BlurStrength(_) | Edit::BlurEllipse(_) => ("blur", "Blur"),
+            Edit::MaskFeather(_) | Edit::MaskEllipse(_) | Edit::MaskInvert(_) => ("mask", "Mask"),
+            Edit::CalloutIcon(_) => ("callout-icon", "Callout icon"),
+            Edit::CalloutColor(_) => ("callout-color", "Callout color"),
+            Edit::CalloutPulse(_) => ("callout-pulse", "Callout pulse"),
+            Edit::IdleDrift(_) => ("idle-drift", "Idle drift"),
+            Edit::CounterFrom(_) | Edit::CounterTo(_) | Edit::CounterDuration(_) | Edit::CounterDecimals(_) | Edit::CounterPrefix(_) | Edit::CounterSuffix(_) => ("counter", "Counter"),
         }
     }
 
@@ -138,13 +188,24 @@ impl Edit {
             Edit::Contrast(v) => g.contrast = v,
             Edit::Saturation(v) => g.saturation = v,
             Edit::Temperature(v) => g.temperature = v,
+            Edit::Lift(v) => g.lift = v,
+            Edit::Gamma(v) => g.gamma = v,
+            Edit::Gain(v) => g.gain = v,
             Edit::ResetGrade => c.grade = Default::default(),
+            Edit::GradePreset(grade) => c.grade = grade,
             Edit::Volume(v) => c.audio.volume = v,
             Edit::Mute(m) => c.audio.muted = m,
             Edit::FadeIn(v) => c.audio.fade_in = v,
             Edit::FadeOut(v) => c.audio.fade_out = v,
-            Edit::Intro(k) => c.intro = k.map(|kind| crate::clip::Motion { kind, duration: c.intro.map(|m| m.duration).unwrap_or(0.6) }),
-            Edit::Outro(k) => c.outro = k.map(|kind| crate::clip::Motion { kind, duration: c.outro.map(|m| m.duration).unwrap_or(0.6) }),
+            Edit::EqLow(v) => c.audio.eq.low = v,
+            Edit::EqMid(v) => c.audio.eq.mid = v,
+            Edit::EqHigh(v) => c.audio.eq.high = v,
+            Edit::ResetEq => c.audio.eq = Default::default(),
+            Edit::Compressor(on) => c.audio.compressor.enabled = on,
+            Edit::CompressorAmount(v) => c.audio.compressor.amount = v,
+            Edit::Denoise(v) => c.audio.denoise = v,
+            Edit::Intro(k) => c.intro = k.map(|kind| crate::clip::Motion { kind, duration: c.intro.map(|m| m.duration).unwrap_or(0.6), ease: c.intro.and_then(|m| m.ease), delay: c.intro.map(|m| m.delay).unwrap_or(0.0) }),
+            Edit::Outro(k) => c.outro = k.map(|kind| crate::clip::Motion { kind, duration: c.outro.map(|m| m.duration).unwrap_or_else(|| c.intro.map(|m| m.duration * 0.6).unwrap_or(0.6)), ease: c.outro.and_then(|m| m.ease), delay: 0.0 }),
             Edit::IntroDuration(d) => {
                 if let Some(m) = &mut c.intro {
                     m.duration = d;
@@ -155,13 +216,25 @@ impl Edit {
                     m.duration = d;
                 }
             }
-            Edit::Transition(k) => c.transition = k.map(|kind| crate::clip::Transition { kind, duration: c.transition.map(|t| t.duration).unwrap_or(0.6) }),
-            Edit::TransitionDuration(d) => {
-                if let Some(t) = &mut c.transition {
-                    t.duration = d;
+            Edit::IntroBouncy(on) => {
+                // Same cap as every other intro/outro duration path: never longer than half the
+                // clip, so the entrance actually finishes instead of animating for its whole life.
+                let bouncy_duration = 0.5f64.min((c.duration / 2.0).max(0.1));
+                if let Some(m) = &mut c.intro {
+                    if on {
+                        m.ease = Some(crate::clip::Ease::Back);
+                        m.duration = bouncy_duration;
+                    } else {
+                        m.ease = None;
+                    }
                 }
             }
+            // Transition and TransitionDuration are intercepted in `Message::Edit` and routed to
+            // `Project::set_transition`, since they need project-level access (the previous clip,
+            // and rippling later clips) that a single-clip `Edit::apply` can't provide.
+            Edit::Transition(_) | Edit::TransitionDuration(_) => {}
             Edit::RemoveZoom(id) => c.zooms.retain(|z| z.id != id),
+            Edit::RemovePress(id) => c.presses.retain(|p| p.id != id),
             Edit::ZoomScale(id, v) => c.zooms.iter_mut().filter(|z| z.id == id).for_each(|z| z.scale = v),
             Edit::ZoomFocusX(id, v) => c.zooms.iter_mut().filter(|z| z.id == id).for_each(|z| z.focus_x = v),
             Edit::ZoomFocusY(id, v) => c.zooms.iter_mut().filter(|z| z.id == id).for_each(|z| z.focus_y = v),
@@ -174,6 +247,7 @@ impl Edit {
             Edit::CropTop(v) => c.crop.top = v.clamp(0.0, (crate::clip::Crop::MAX - c.crop.bottom).max(0.0)),
             Edit::CropRight(v) => c.crop.right = v.clamp(0.0, (crate::clip::Crop::MAX - c.crop.left).max(0.0)),
             Edit::CropBottom(v) => c.crop.bottom = v.clamp(0.0, (crate::clip::Crop::MAX - c.crop.top).max(0.0)),
+            Edit::IdleDrift(on) => c.idle_drift = on.then_some(crate::clip::DriftKind::ScaleBreath),
             edit if matches!(c.content, Content::Blur(_)) => {
                 if let Content::Blur(b) = &mut c.content {
                     match edit {
@@ -182,6 +256,21 @@ impl Edit {
                         Edit::ShapeBox(w, h, x, y) => {
                             b.width = w.clamp(4.0, 4000.0);
                             b.height = h.clamp(4.0, 4000.0);
+                            (c.transform.x, c.transform.y) = (x, y);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            edit if matches!(c.content, Content::Mask(_)) => {
+                if let Content::Mask(m) = &mut c.content {
+                    match edit {
+                        Edit::MaskFeather(v) => m.feather = v.clamp(0.0, 100.0),
+                        Edit::MaskEllipse(on) => m.ellipse = on,
+                        Edit::MaskInvert(on) => m.invert = on,
+                        Edit::ShapeBox(w, h, x, y) => {
+                            m.width = w.clamp(4.0, 4000.0);
+                            m.height = h.clamp(4.0, 4000.0);
                             (c.transform.x, c.transform.y) = (x, y);
                         }
                         _ => {}
@@ -207,6 +296,38 @@ impl Edit {
                     }
                 }
             }
+            edit if matches!(c.content, Content::Callout(_)) => {
+                if let Content::Callout(cal) = &mut c.content {
+                    match edit {
+                        Edit::CalloutIcon(i) => cal.icon = i,
+                        Edit::CalloutColor(col) => {
+                            cal.color = col;
+                            l.shadow.color = col;
+                        }
+                        Edit::CalloutPulse(on) => cal.pulse = on,
+                        _ => {}
+                    }
+                }
+            }
+            edit if matches!(c.content, Content::Counter(_)) => {
+                if let Content::Counter(counter) = &mut c.content {
+                    match edit {
+                        Edit::CounterFrom(v) => counter.from = v,
+                        Edit::CounterTo(v) => counter.to = v,
+                        Edit::CounterDuration(v) => counter.duration = v.max(0.05),
+                        Edit::CounterDecimals(n) => counter.decimals = n,
+                        Edit::CounterPrefix(s) => counter.prefix = s,
+                        Edit::CounterSuffix(s) => counter.suffix = s,
+                        // The displayed number's styling reuses the text edits.
+                        Edit::Font(f) => counter.format.font = f,
+                        Edit::FontSize(v) => counter.format.size = v,
+                        Edit::Weight(w) => counter.format.weight = w,
+                        Edit::TextColor(col) => counter.format.color = col,
+                        Edit::Align(a) => counter.format.align = a,
+                        _ => {}
+                    }
+                }
+            }
             edit => {
                 if let Content::Text(tl) = &mut c.content {
                     match edit {
@@ -218,6 +339,17 @@ impl Edit {
                         Edit::TextColor(col) => tl.color = col,
                         Edit::Align(a) => tl.align = a,
                         Edit::TextBox(on) => tl.background = on.then_some(Rgba(0.0, 0.0, 0.0, 0.55)),
+                        Edit::TextReveal(on) => tl.reveal = on.then(crate::clip::TextReveal::default),
+                        Edit::TextRevealDuration(v) => {
+                            if let Some(r) = &mut tl.reveal {
+                                r.duration = v.max(0.05);
+                            }
+                        }
+                        Edit::TextRevealStagger(v) => {
+                            if let Some(r) = &mut tl.reveal {
+                                r.stagger = v.max(0.0);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -279,6 +411,9 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
         (Content::Text(_), _) => (code::TYPE, clip::TEXT, "Text"),
         (Content::Shape(_), _) => (code::SQUARE, clip::EFFECT, "Shape"),
         (Content::Blur(_), _) => (code::DROPLETS, clip::BLUR, "Blur"),
+        (Content::Mask(_), _) => (code::SCAN_EYE, clip::MASK, "Mask"),
+        (Content::Callout(_), _) => (code::SPARKLE, clip::EFFECT, "Callout"),
+        (Content::Counter(_), _) => (code::GAUGE, clip::TEXT, "Counter"),
         (_, Some(MediaKind::Audio)) => (code::AUDIO_LINES, clip::AUDIO, "Audio"),
         _ if sound_only => (code::AUDIO_LINES, clip::AUDIO, "Audio"),
         (_, Some(MediaKind::Image)) => (code::IMAGE, clip::IMAGE, "Image"),
@@ -317,6 +452,12 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
     // A blur clip only has its blur and its place.
     if let Content::Blur(b) = &clip.content {
         let col = blur_clip(clip, b, ctx, col, &mut shown);
+        return widgets::scroll(col.padding(iced::Padding { top: 0.0, right: 10.0, bottom: 12.0, left: 4.0 })).height(Fill).into();
+    }
+
+    // A mask clip only has its mask and its place.
+    if let Content::Mask(m) = &clip.content {
+        let col = mask_clip(clip, m, ctx, col, &mut shown);
         return widgets::scroll(col.padding(iced::Padding { top: 0.0, right: 10.0, bottom: 12.0, left: 4.0 })).height(Fill).into();
     }
 
@@ -374,6 +515,60 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             .spacing(S3)
             .into(),
         ));
+        let mut reveal_col = column![toggle_row("Kinetic reveal", t.reveal.is_some(), move |on| e(Edit::TextReveal(on)))].spacing(S3);
+        if let Some(r) = t.reveal {
+            reveal_col = reveal_col
+                .push(slider_row("Word duration", r.duration, 0.05..=1.5, 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::TextRevealDuration(v))))
+                .push(slider_row("Stagger", r.stagger, 0.0..=0.3, 0.01, |v| format!("{v:.2}s"), move |v| e(Edit::TextRevealStagger(v))));
+        }
+        col = add(col, &mut shown, ctx.section(code::SPARKLES, "Kinetic reveal", reveal_col.into()));
+    }
+
+    if let Content::Counter(counter) = &clip.content {
+        let t = &counter.format;
+        let font_pick = pick_list(&FONTS[..], FONTS.iter().find(|f| **f == t.font).copied(), move |f: &str| e(Edit::Font(f.to_string())))
+            .padding([6, 9])
+            .text_size(T_BODY)
+            .width(Fill)
+            .style(style::select)
+            .menu_style(style::select_menu);
+        let weights = [(400u16, "Regular"), (500, "Medium"), (600, "Semibold"), (700, "Bold")];
+        let aligns = [Align::Left, Align::Center, Align::Right];
+        col = add(col, &mut shown, ctx.section(
+            code::GAUGE,
+            "Counter",
+            column![
+                slider_row("From", counter.from, -9999.0..=9999.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::CounterFrom(v))),
+                slider_row("To", counter.to, -9999.0..=9999.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::CounterTo(v))),
+                slider_row("Duration", counter.duration, 0.2..=5.0, 0.1, |v| format!("{v:.1}s"), move |v| e(Edit::CounterDuration(v))),
+                widgets::segmented(&[0u32, 1, 2], counter.decimals, |d| format!("{d} decimals"), move |d| e(Edit::CounterDecimals(d))),
+                row![
+                    text_input("Prefix", &counter.prefix).on_input(move |s| e(Edit::CounterPrefix(s))).padding([8, 10]).size(T_BODY).style(style::input).width(Length::FillPortion(1)),
+                    text_input("Suffix", &counter.suffix).on_input(move |s| e(Edit::CounterSuffix(s))).padding([8, 10]).size(T_BODY).style(style::input).width(Length::FillPortion(1)),
+                ]
+                .spacing(S2),
+            ]
+            .spacing(S3)
+            .into(),
+        ));
+        col = add(col, &mut shown, ctx.section(
+            code::TYPE,
+            "Number style",
+            column![
+                row![container(font_pick).width(Length::FillPortion(3)), container(widgets::segmented(&aligns, t.align, |a| match a {
+                    Align::Left => "Left".into(),
+                    Align::Center => "Center".into(),
+                    Align::Right => "Right".into(),
+                }, move |a| e(Edit::Align(a)))).width(Length::FillPortion(4))]
+                .spacing(S2)
+                .align_y(Alignment::Center),
+                widgets::segmented(&weights.map(|w| w.0), t.weight, move |w| weights.iter().find(|x| x.0 == *w).map(|x| x.1).unwrap_or("").to_string(), move |w| e(Edit::Weight(w))),
+                slider_row("Size", t.size, 12.0..=400.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::FontSize(v))),
+                color_row("Color", t.color, (id, "text", hex), move |c| e(Edit::TextColor(c))),
+            ]
+            .spacing(S3)
+            .into(),
+        ));
     }
 
     if let Content::Shape(s) = &clip.content {
@@ -405,6 +600,22 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
         col = add(col, &mut shown, ctx.section(code::SHAPES, "Shape", body.into()));
     }
 
+    if let Content::Callout(cal) = &clip.content {
+        let icon_pick = pick_list(&crate::clip::CalloutIcon::ALL[..], Some(cal.icon), move |k| e(Edit::CalloutIcon(k)))
+            .padding([6, 9])
+            .text_size(T_BODY)
+            .width(Fill)
+            .style(style::select)
+            .menu_style(style::select_menu);
+        let body = column![
+            row![text("Icon").size(T_SMALL).color(TEXT_2).width(84), icon_pick].align_y(Alignment::Center),
+            color_row("Glow color", cal.color, (id, "callout", hex), move |c| e(Edit::CalloutColor(c))),
+            toggle_row("Pulse", cal.pulse, move |on| e(Edit::CalloutPulse(on))),
+        ]
+        .spacing(S3);
+        col = add(col, &mut shown, ctx.section(code::SPARKLE, "Callout", body.into()));
+    }
+
     // Everything below adjusts what the clip already has. Effects are added from the Effects
     // tab; position and size are set on the preview.
     if is_visual {
@@ -412,6 +623,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
         let mut layer = column![
             slider_row("Rotation", tr.rotation, -180.0..=180.0, 0.5, |v| format!("{v:.0}°"), move |v| e(Edit::Rotation(v))),
             slider_row("Opacity", tr.opacity * 100.0, 0.0..=100.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::Opacity(v / 100.0))),
+            toggle_row("Idle drift", clip.idle_drift.is_some(), move |on| e(Edit::IdleDrift(on))),
         ]
         .spacing(S3);
         if matches!(clip.content, Content::Media { .. }) {
@@ -455,6 +667,8 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             }
         }
 
+        col = add(col, &mut shown, ctx.section(code::PALETTE, "Color grade", grade_presets(clip.grade, ctx.thumb.clone(), move |g| e(Edit::GradePreset(g)))));
+
         let g = &clip.grade;
         col = add(col, &mut shown, ctx.section_reset(
             code::PALETTE,
@@ -465,6 +679,11 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
                 slider_row("Contrast", g.contrast * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Contrast(v / 100.0))),
                 slider_row("Saturation", g.saturation * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Saturation(v / 100.0))),
                 slider_row("Warmth", g.temperature * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Temperature(v / 100.0))),
+                widgets::divider(),
+                text("Three-way (shadows / mids / highlights)").font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_3),
+                slider_row("Lift", g.lift * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Lift(v / 100.0))),
+                slider_row("Gamma", g.gamma * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Gamma(v / 100.0))),
+                slider_row("Gain", g.gain * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Gain(v / 100.0))),
             ]
             .spacing(S3)
             .into(),
@@ -476,7 +695,8 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
         if let Some(m) = clip.intro {
             anim = anim
                 .push(applied(format!("In · {}", MotionChoice(Some(m.kind))), e(Edit::Intro(None))))
-                .push(slider_row("Duration", m.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::IntroDuration(v))));
+                .push(slider_row("Duration", m.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::IntroDuration(v))))
+                .push(toggle_row("Bouncy", m.ease == Some(crate::clip::Ease::Back), move |on| e(Edit::IntroBouncy(on))));
         }
         if let Some(m) = clip.outro {
             anim = anim
@@ -487,12 +707,15 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             col = add(col, &mut shown, ctx.section(code::SPARKLES, "Animation", anim.into()));
         }
         if let Some(t) = clip.transition {
+            // Capped by the real overlap, not half this clip's length: it can't eat more of
+            // either clip than that clip actually has.
+            let cap = project.prev_on_track(clip).map_or(clip.duration, |p| clip.duration.min(p.duration));
             let trans = column![
                 applied(TransitionChoice(Some(t.kind)).to_string(), e(Edit::Transition(None))),
-                slider_row("Duration", t.duration, 0.1..=max_motion.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::TransitionDuration(v))),
+                slider_row("Duration", t.duration, 0.1..=cap.max(0.11), 0.05, |v| format!("{v:.2}s"), move |v| e(Edit::TransitionDuration(v))),
             ]
             .spacing(S3);
-            col = add(col, &mut shown, ctx.section(code::BLEND, "Transition in", trans.into()));
+            col = add(col, &mut shown, ctx.section(code::BLEND, "Transition", trans.into()));
         }
     }
 
@@ -537,6 +760,25 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
             );
         }
         col = add(col, &mut shown, ctx.section(code::ZOOM_IN, "Zoom & pan", zooms.into()));
+    }
+
+    if !clip.presses.is_empty() {
+        let mut presses = column![].spacing(S3);
+        for (i, press) in clip.presses.iter().enumerate() {
+            let pid = press.id;
+            presses = presses.push(
+                row![
+                    tinted(code::POINTER, 13, BRAND_2),
+                    text(format!("Press {}", i + 1)).font(INTER_SEMIBOLD).size(T_SMALL),
+                    text(format!("at {:.2}s", press.at)).size(T_CAPTION).color(TEXT_3),
+                    space().width(Fill),
+                    widgets::tip(widgets::icon_button(code::TRASH_2, Some(e(Edit::RemovePress(pid)))).width(24).height(24), "Remove", None, iced::widget::tooltip::Position::Left),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            );
+        }
+        col = add(col, &mut shown, ctx.section(code::POINTER, "Press pulses", presses.into()));
     }
 
     if let Content::Media { speed, .. } = clip.content {
@@ -601,6 +843,21 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
         }
         audio = audio.push(container(part).padding(S3).width(Fill).style(style::inset));
         col = add(col, &mut shown, ctx.section(code::VOLUME_2, "Audio", audio.into()));
+
+        let polish = column![
+            text("Equalizer").font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_3),
+            slider_row("Low", a.eq.low, -15.0..=15.0, 0.5, |v| format!("{v:+.1} dB"), move |v| e(Edit::EqLow(v))),
+            slider_row("Mid", a.eq.mid, -15.0..=15.0, 0.5, |v| format!("{v:+.1} dB"), move |v| e(Edit::EqMid(v))),
+            slider_row("High", a.eq.high, -15.0..=15.0, 0.5, |v| format!("{v:+.1} dB"), move |v| e(Edit::EqHigh(v))),
+            widgets::ghost_button(None, "Reset equalizer", (!a.eq.is_flat()).then_some(e(Edit::ResetEq))).padding([5, 9]),
+            widgets::divider(),
+            toggle_row("Compressor", a.compressor.enabled, move |on| e(Edit::Compressor(on))),
+            slider_row("Amount", a.compressor.amount, 0.0..=100.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::CompressorAmount(v))),
+            widgets::divider(),
+            slider_row("Noise reduction", a.denoise, 0.0..=97.0, 1.0, |v| if v == 0.0 { "Off".into() } else { format!("{v:.0}%") }, move |v| e(Edit::Denoise(v))),
+        ]
+        .spacing(S3);
+        col = add(col, &mut shown, ctx.section(code::SLIDERS_HORIZONTAL, "Audio polish", polish.into()));
     }
 
     // Header plus at least one section: otherwise the search found nothing here.
@@ -656,6 +913,30 @@ fn blur_clip<'a>(clip: &'a Clip, b: &crate::clip::BlurLayer, ctx: &Ctx<'a>, col:
     add(col, shown, ctx.section(code::DROPLETS, "Blur", body.into()))
 }
 
+/// A mask clip: how soft its edge is, what shape, invert, how big, and where.
+fn mask_clip<'a>(clip: &'a Clip, m: &crate::clip::MaskLayer, ctx: &Ctx<'a>, col: iced::widget::Column<'a, Message>, shown: &mut usize) -> iced::widget::Column<'a, Message> {
+    let id = clip.id;
+    let e = move |edit: Edit| Message::Edit(id, edit);
+    let body = column![
+        slider_row("Feather", m.feather, 0.0..=100.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::MaskFeather(v))),
+        row![
+            text("Shape").size(T_SMALL).color(TEXT_2).width(84),
+            widgets::segmented(&[false, true], m.ellipse, |el| if *el { "Oval".into() } else { "Box".into() }, move |el| e(Edit::MaskEllipse(el))),
+        ]
+        .align_y(Alignment::Center),
+        toggle_row("Invert", m.invert, move |on| e(Edit::MaskInvert(on))),
+        text(if m.invert {
+            "Hides the video and images under its box; everywhere else stays visible. Move and size it on the preview; trim it on the timeline, or keyframe its position to follow a moving subject."
+        } else {
+            "Shows only the video and images under its box; everywhere else is hidden. Move and size it on the preview; trim it on the timeline, or keyframe its position to follow a moving subject."
+        })
+        .size(T_CAPTION)
+        .color(TEXT_3),
+    ]
+    .spacing(S3);
+    add(col, shown, ctx.section(code::SCAN_EYE, "Mask", body.into()))
+}
+
 /// What the inspector shows besides the clip: edit modes, the range, typed colors,
 /// collapsed sections and the search text.
 pub struct Ctx<'a> {
@@ -667,6 +948,8 @@ pub struct Ctx<'a> {
     pub hex: Option<&'a HexDraft>,
     pub collapsed: &'a std::collections::BTreeSet<String>,
     pub query: &'a str,
+    /// The selected clip's cached thumbnail, shown as the preview in each Color grade tile.
+    pub thumb: Option<iced::widget::image::Handle>,
 }
 
 /// Words that find a section in the search box, besides its title.
@@ -677,10 +960,11 @@ fn keywords(title: &str) -> &'static str {
         "Layer" => "rotation rotate angle opacity transparency framing fit fill transform",
         "Frame style" => "corners rounded radius border outline stroke drop shadow blur distance strength",
         "Color" => "brightness contrast saturation warmth temperature grade",
+        "Color grade" => "look preset style cinematic studio vivid flat vintage mood original",
         "Crop" => "cut trim edges left right top bottom",
         "Blur" => "hide privacy pixelate blur area censor obscure strength oval box",
         "Animation" => "intro outro in out motion fade slide pop zoom duration",
-        "Transition in" => "crossfade slide push wipe zoom through duration",
+        "Transition" => "crossfade slide push wipe zoom through duration",
         "Zoom & pan" => "camera focus magnify pan",
         "Speed" => "fast slow time tempo",
         "Audio" => "volume mute fade sound range level loud quiet",
@@ -768,6 +1052,82 @@ fn slider_row<'a>(name: &'a str, value: f64, range: RangeInclusive<f64>, step: f
     .spacing(S2)
     .align_y(Alignment::Center)
     .into()
+}
+
+/// The Color grade grid: a uniform square preview tile per preset in `GRADE_PRESETS`, grouped by
+/// category, each built from the clip's own thumbnail so it reads as a real preview, not an icon.
+/// Clicking a tile applies that look to the clip immediately.
+fn grade_presets<'a>(current: Grade, thumb: Option<image::Handle>, on_pick: impl Fn(Grade) -> Message + Clone + 'a) -> Element<'a, Message> {
+    const TILE: f32 = 68.0;
+    let mut col = column![].spacing(S3);
+    let mut category: &'static str = "";
+    let mut row_items: Vec<Element<'a, Message>> = Vec::new();
+    let flush = |col: iced::widget::Column<'a, Message>, title: &'static str, items: Vec<Element<'a, Message>>| {
+        if items.is_empty() {
+            return col;
+        }
+        let grid = iced::widget::grid(items).fluid(TILE + 12.0).spacing(8).height(iced::widget::grid::Sizing::EvenlyDistribute(Length::Shrink));
+        if title.is_empty() {
+            col.push(grid)
+        } else {
+            col.push(column![text(title).font(INTER_SEMIBOLD).size(T_CAPTION).color(TEXT_3), grid].spacing(5))
+        }
+    };
+    for preset in GRADE_PRESETS {
+        if preset.category != category {
+            col = flush(col, category, std::mem::take(&mut row_items));
+            category = preset.category;
+        }
+        let on_pick = on_pick.clone();
+        row_items.push(grade_tile(preset, thumb.clone(), current == preset.grade, TILE, move || on_pick(preset.grade)));
+    }
+    flush(col, category, row_items).into()
+}
+
+/// One square preview tile in the Color grade grid.
+fn grade_tile<'a>(preset: &'static GradePreset, thumb: Option<image::Handle>, active: bool, size: f32, on_press: impl Fn() -> Message + 'a) -> Element<'a, Message> {
+    let preview = container(grade_preview(thumb, preset.grade, size)).style(move |_| container::Style {
+        border: iced::Border { color: if active { ACCENT } else { LINE }, width: if active { 2.0 } else { 1.0 }, radius: R_MD.into() },
+        ..Default::default()
+    });
+    let tile = column![preview, text(preset.name).size(T_CAPTION).color(if active { TEXT_1 } else { TEXT_3 }).wrapping(text::Wrapping::None)]
+        .spacing(4)
+        .width(size + 12.0)
+        .align_x(Alignment::Center);
+    button(tile).padding(6).style(style::ghost).on_press(on_press()).into()
+}
+
+/// A thumbnail (or a plain panel, for clips with none) with translucent washes approximating a
+/// grade's brightness, contrast, warmth and saturation — a quick visual cue, not the real render.
+fn grade_preview<'a>(thumb: Option<image::Handle>, g: Grade, size: f32) -> Element<'a, Message> {
+    let mut layers: Vec<Element<'a, Message>> = vec![match thumb {
+        Some(h) => image(h).width(size).height(size).content_fit(iced::ContentFit::Cover).into(),
+        None => container(space()).width(size).height(size).style(style::inset).into(),
+    }];
+    let wash = |color: Color, alpha: f32| -> Element<'a, Message> { container(space().width(size).height(size)).style(move |_| container::Style { background: Some(Color { a: alpha, ..color }.into()), ..Default::default() }).into() };
+    let (b, c, t, s) = (g.brightness as f32, g.contrast as f32, g.temperature as f32, g.saturation as f32);
+    if b.abs() > 0.01 {
+        layers.push(wash(if b > 0.0 { Color::WHITE } else { Color::BLACK }, (b.abs() * 0.45).min(0.35)));
+    }
+    if c > 0.01 {
+        // A flat wash can't steepen a tonal curve, so a corner-to-corner gradient (crushed
+        // shadows to lifted highlights) stands in for "more punch."
+        let a = (c * 0.8).min(0.4);
+        let grad: Background = Gradient::Linear(Linear::new(std::f32::consts::PI * 0.75).add_stop(0.0, Color { a, ..Color::BLACK }).add_stop(1.0, Color { a, ..Color::WHITE })).into();
+        layers.push(container(space().width(size).height(size)).style(move |_| container::Style { background: Some(grad), ..Default::default() }).into());
+    } else if c < -0.01 {
+        // Negative contrast flattens the image toward mid-gray.
+        layers.push(wash(Color::from_rgb(0.5, 0.5, 0.5), (-c * 0.8).min(0.35)));
+    }
+    if t.abs() > 0.01 {
+        layers.push(wash(if t > 0.0 { Color::from_rgb8(255, 150, 60) } else { Color::from_rgb8(70, 140, 255) }, (t.abs() * 0.5).min(0.3)));
+    }
+    if s < -0.01 {
+        layers.push(wash(Color::from_rgb(0.5, 0.5, 0.5), (-s * 0.55).min(0.45)));
+    } else if s > 0.01 {
+        layers.push(wash(Color::from_rgb8(255, 0, 180), (s * 0.4).min(0.3)));
+    }
+    container(stack(layers)).width(size).height(size).clip(true).into()
 }
 
 /// The selected characters of a text box, as char indices `start..end` into its text.

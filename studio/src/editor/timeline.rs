@@ -13,6 +13,7 @@ use super::Message;
 use crate::clip::{Clip, Content};
 use crate::edit::Edge;
 use crate::model::{Id, MediaKind, Project, TrackKind};
+use crate::ui::icons::code;
 use crate::ui::tokens::*;
 
 pub const RULER_H: f32 = 30.0;
@@ -98,6 +99,9 @@ fn clip_color(project: &Project, clip: &Clip) -> Color {
         Content::Text(_) => clip::TEXT,
         Content::Shape(_) => clip::EFFECT,
         Content::Blur(_) => clip::BLUR,
+        Content::Mask(_) => clip::MASK,
+        Content::Callout(_) => clip::EFFECT,
+        Content::Counter(_) => clip::TEXT,
     }
 }
 
@@ -114,6 +118,9 @@ pub fn clip_label(project: &Project, clip: &Clip) -> String {
         Content::Text(t) => t.text.lines().next().unwrap_or("Text").to_string(),
         Content::Shape(_) => "Shape".into(),
         Content::Blur(_) => "Blur".into(),
+        Content::Mask(_) => "Mask".into(),
+        Content::Callout(c) => format!("Callout · {}", c.icon.label()),
+        Content::Counter(c) => format!("Counter · {:.0}→{:.0}", c.from, c.to),
     }
 }
 
@@ -372,6 +379,9 @@ enum Drag {
     /// Moving a zoom along its clip; `at` is clip-relative.
     ZoomMove { clip: Id, zoom: Id, grab: f64, at: f64, press: Point, moved: bool },
     ZoomTrim { clip: Id, zoom: Id, edge: Edge, at: f64, duration: f64 },
+    /// Resizing a transition by its handle. `seam` is the fixed cut point (doesn't move as
+    /// `duration` changes); the clip's new start, once applied, is `seam - duration`.
+    TransitionTrim { clip: Id, seam: f64, duration: f64 },
     /// Range tool: drawing a range, or dragging one of its edges; `fixed` is the other end.
     Range { fixed: f64 },
 }
@@ -439,6 +449,40 @@ impl Lanes<'_> {
             let zone = if p.x - x0 <= grab { Zone::Edge(Edge::Start) } else if x1 - p.x <= grab { Zone::Edge(Edge::End) } else { Zone::Body };
             Some((clip, z, zone))
         })
+    }
+
+    /// The handle at the leading edge of an applied transition's bowtie, under `p`: drag it to
+    /// resize the transition's duration (the cut itself, at the bowtie's other end, stays put).
+    /// Scans clips directly rather than going through `hit` (whole-clip hit-testing), since a
+    /// transition's own clip genuinely overlaps its previous one right where this handle lives.
+    fn transition_hit(&self, p: Point) -> Option<(&Clip, f64)> {
+        let (track, _, top, h) = self.row_at(p.y)?;
+        if p.y < top || p.y > top + h || self.project.track(track).is_some_and(|t| t.locked) {
+            return None;
+        }
+        self.project.clips_on(track).find_map(|c| {
+            let tr = c.transition?;
+            ((self.view.x(c.start) - p.x).abs() <= EDGE_GRAB).then_some((c, tr.duration))
+        })
+    }
+
+    /// The incoming clip of the nearest transition-eligible seam (a clip whose start touches a
+    /// previous clip on the same track) within grab distance of `p`, for dropping a Transition
+    /// effect precisely where two clips meet instead of generically "on a clip".
+    fn seam_hit(&self, p: Point) -> Option<Id> {
+        const SEAM_GRAB: f32 = 28.0;
+        let (track, _, top, h) = self.row_at(p.y)?;
+        if p.y < top || p.y > top + h || self.project.track(track).is_some_and(|t| t.locked) {
+            return None;
+        }
+        self.project
+            .clips_on(track)
+            // Touching, or already overlapping its previous clip via an existing transition.
+            .filter(|c| c.transition.is_some() || self.project.prev_on_track(c).is_some_and(|pv| (pv.end() - c.start).abs() < 1e-6))
+            .map(|c| (c.id, (self.view.x(c.start) - p.x).abs()))
+            .filter(|&(_, d)| d <= SEAM_GRAB)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id)
     }
 
     fn snap_points(&self, exclude: Option<Id>) -> Vec<f64> {
@@ -555,6 +599,11 @@ impl canvas::Program<Message> for Lanes<'_> {
                     });
                     return Some(Action::publish(Message::ZoomEdit(Some((clip.id, z.id)))).and_capture());
                 }
+                // A transition's handle also takes clicks first, over the ordinary start-trim zone.
+                if let Some((clip, duration)) = self.transition_hit(p) {
+                    state.drag = Some(Drag::TransitionTrim { clip: clip.id, seam: clip.start + duration, duration });
+                    return Some(Action::publish(Message::Select(Some(clip.id), false)).and_capture());
+                }
                 {
                     match self.hit(p) {
                         Some((clip, Zone::Edge(edge))) => {
@@ -628,6 +677,13 @@ impl canvas::Program<Message> for Lanes<'_> {
                         *at = (s - c.start).clamp(0.0, (c.duration - z.duration).max(0.0));
                         state.guide = guide;
                     }
+                    Drag::TransitionTrim { clip, seam, duration } => {
+                        let c = self.project.clip(*clip)?;
+                        let prev_dur = self.project.prev_on_track(c).map(|pv| pv.duration).unwrap_or(f64::MAX);
+                        let max_dur = c.duration.min(prev_dur).max(0.1);
+                        let t = self.view.t(p.x);
+                        *duration = (*seam - t).clamp(0.1, max_dur);
+                    }
                     Drag::ZoomTrim { clip, zoom, edge, at, duration } => {
                         let c = self.project.clip(*clip)?;
                         let z = c.zooms.iter().find(|z| z.id == *zoom)?;
@@ -652,7 +708,9 @@ impl canvas::Program<Message> for Lanes<'_> {
             canvas::Event::Mouse(mouse::Event::ButtonReleased(_)) => {
                 state.guide = None;
                 if let (Some(effect), Some(p)) = (self.dnd_effect, local) {
-                    let clip = self.hit(p).map(|(c, _)| c.id);
+                    // A transition targets the seam between two clips, not whichever clip's body
+                    // happens to be under the cursor.
+                    let clip = if matches!(effect, super::library::Effect::Transition(_)) { self.seam_hit(p) } else { self.hit(p).map(|(c, _)| c.id) };
                     let track = self.row_at(p.y).map(|r| r.0);
                     let (t, _) = self.snap(self.view.t(p.x).max(0.0), None);
                     return Some(Action::publish(Message::DropEffect { effect, target: super::DropTarget::Timeline { clip, track, t } }).and_capture());
@@ -677,6 +735,7 @@ impl canvas::Program<Message> for Lanes<'_> {
                         Message::ZoomTiming { clip, zoom, at, duration }
                     }
                     Drag::ZoomTrim { clip, zoom, at, duration, .. } => Message::ZoomTiming { clip, zoom, at, duration },
+                    Drag::TransitionTrim { clip, duration, .. } => Message::Edit(clip, super::inspector::Edit::TransitionDuration(duration)),
                 };
                 Some(Action::publish(msg).and_capture())
             }
@@ -729,6 +788,13 @@ impl canvas::Program<Message> for Lanes<'_> {
                     ghost(&mut o, r, clip_color(self.project, c));
                 }
             }
+            Some(Drag::TransitionTrim { clip, seam, duration }) => {
+                if let Some((_, _, top, rh)) = self.project.clip(clip).and_then(|c| self.row_of(c.track)) {
+                    let (x0, x1) = (self.view.x(seam - duration), self.view.x(seam));
+                    let r = Rectangle::new(Point::new(x0, top), Size::new(x1 - x0, rh));
+                    ghost(&mut o, r, ACCENT);
+                }
+            }
             Some(Drag::ZoomMove { clip, zoom, at, moved: true, .. }) | Some(Drag::ZoomTrim { clip, zoom, at, .. }) => {
                 if let (Some(c), Some((_, _, top, rh))) = (self.project.clip(clip), self.project.clip(clip).and_then(|c| self.row_of(c.track))) {
                     let duration = match state.drag {
@@ -744,9 +810,24 @@ impl canvas::Program<Message> for Lanes<'_> {
             _ => {}
         }
 
-        // Where a dragged effect would land.
-        if let (Some(_), Some(p)) = (self.dnd_effect, state.hover) {
-            if let Some((c, _)) = self.hit(p) {
+        // Where a dragged effect would land. A transition doesn't cover the whole clip like
+        // other effects - preview the actual overlap it would cut into the previous clip,
+        // so dropping it reads as "a crossfade goes here", not "this effect fills the clip".
+        if let (Some(effect), Some(p)) = (self.dnd_effect, state.hover) {
+            if matches!(effect, super::library::Effect::Transition(_)) {
+                if let Some(id) = self.seam_hit(p) {
+                    if let (Some(c), Some(prev)) = (self.project.clip(id), self.project.clip(id).and_then(|c| self.project.prev_on_track(c))) {
+                        if let Some((_, _, top, rh)) = self.row_of(c.track) {
+                            let existing = c.transition.map(|t| t.duration).unwrap_or(0.0);
+                            let seam = c.start + existing;
+                            let duration = (if existing > 0.0 { existing } else { 0.6 }).clamp(0.1, c.duration.min(prev.duration));
+                            let (x0, x1) = (self.view.x(seam - duration), self.view.x(seam));
+                            let r = Rectangle::new(Point::new(x0, top), Size::new(x1 - x0, rh));
+                            ghost(&mut o, r, ACCENT);
+                        }
+                    }
+                }
+            } else if let Some((c, _)) = self.hit(p) {
                 if let Some((_, _, top, rh)) = self.row_of(c.track) {
                     let r = Rectangle::new(Point::new(self.view.x(c.start), top), Size::new((c.duration * self.view.zoom) as f32, rh));
                     ghost(&mut o, r, ACCENT);
@@ -809,7 +890,7 @@ impl canvas::Program<Message> for Lanes<'_> {
     fn mouse_interaction(&self, state: &LanesState, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
         match state.drag {
             Some(Drag::Move { moved: true, .. }) | Some(Drag::Pan { .. }) => return mouse::Interaction::Grabbing,
-            Some(Drag::Trim { .. } | Drag::ZoomTrim { .. }) => return mouse::Interaction::ResizingHorizontally,
+            Some(Drag::Trim { .. } | Drag::ZoomTrim { .. } | Drag::TransitionTrim { .. }) => return mouse::Interaction::ResizingHorizontally,
             Some(Drag::ZoomMove { moved: true, .. }) => return mouse::Interaction::Grabbing,
             Some(Drag::Range { .. }) => return mouse::Interaction::ResizingHorizontally,
             _ => {}
@@ -820,6 +901,9 @@ impl canvas::Program<Message> for Lanes<'_> {
         }
         if let Some((_, _, zone)) = self.zoom_hit(p) {
             return if zone == Zone::Body { mouse::Interaction::Grab } else { mouse::Interaction::ResizingHorizontally };
+        }
+        if self.transition_hit(p).is_some() {
+            return mouse::Interaction::ResizingHorizontally;
         }
         match self.hit(p) {
             Some((_, Zone::Edge(_))) => mouse::Interaction::ResizingHorizontally,
@@ -879,6 +963,9 @@ impl Lanes<'_> {
         let size = f.size();
         if layer == Layer::Base {
             f.fill_rectangle(Point::ORIGIN, size, SURFACE_0);
+            if self.project.clips.is_empty() {
+                self.draw_empty_hint(f, size);
+            }
         }
         let (t0, t1) = (self.view.scroll, self.view.t(size.width));
         for (track, kind, top, h) in rows(self.project, self.vscroll).into_iter().filter(|r| r.2 + r.3 > 0.0 && r.2 < size.height) {
@@ -898,6 +985,42 @@ impl Lanes<'_> {
                 }
             }
         }
+    }
+
+    /// Guidance shown in place of lane content before anything's been added to the project.
+    fn draw_empty_hint(&self, f: &mut Frame, size: Size) {
+        let cx = size.width / 2.0;
+        let cy = (size.height / 2.0).max(40.0);
+        f.fill_text(Text {
+            content: code::FILM.to_string(),
+            position: Point::new(cx, cy - 28.0),
+            color: TEXT_4,
+            size: 20.0.into(),
+            font: ICONS,
+            align_x: alignment::Horizontal::Center.into(),
+            align_y: alignment::Vertical::Center,
+            ..Text::default()
+        });
+        f.fill_text(Text {
+            content: "Nothing here yet".to_string(),
+            position: Point::new(cx, cy),
+            color: TEXT_2,
+            size: T_LARGE.into(),
+            font: INTER_SEMIBOLD,
+            align_x: alignment::Horizontal::Center.into(),
+            align_y: alignment::Vertical::Center,
+            ..Text::default()
+        });
+        f.fill_text(Text {
+            content: "Drag media from the library, or press T to add text".to_string(),
+            position: Point::new(cx, cy + 22.0),
+            color: TEXT_3,
+            size: T_SMALL.into(),
+            font: INTER,
+            align_x: alignment::Horizontal::Center.into(),
+            align_y: alignment::Vertical::Center,
+            ..Text::default()
+        });
     }
 
     fn filmstrip(&self, clip: &Clip) -> Option<(&crate::model::Asset, &super::media_cache::AssetMedia)> {
@@ -1014,18 +1137,26 @@ impl Lanes<'_> {
             }
         }
 
-        // Transition into the clip: a soft wedge at its start.
+        // A transition pulls this clip's start to genuinely overlap the previous clip, so this
+        // span (`r.x` to `r.x + tw`) is real shared screen time, not just this clip's own corner.
+        // Draw it as a bowtie straddling the seam, like most editors' transition icon, instead of
+        // a one-sided wedge that reads as this clip's own entrance effect.
         if let Some(tr) = clip.transition {
             // min/max, not clamp: very short clips are narrower than the 6 px minimum.
             let tw = ((tr.duration * self.view.zoom) as f32).max(6.0).min(r.width);
-            let wedge = Path::new(|b| {
+            let mid_y = r.y + r.height / 2.0;
+            let bowtie = Path::new(|b| {
                 b.move_to(Point::new(r.x, r.y));
-                b.line_to(Point::new(r.x + tw, r.y));
+                b.line_to(Point::new(r.x + tw, mid_y));
                 b.line_to(Point::new(r.x, r.y + r.height));
                 b.close();
+                b.move_to(Point::new(r.x + tw, r.y));
+                b.line_to(Point::new(r.x, mid_y));
+                b.line_to(Point::new(r.x + tw, r.y + r.height));
+                b.close();
             });
-            f.fill(&wedge, Color { a: 0.35, ..Color::WHITE });
-            f.stroke(&Path::line(Point::new(r.x + tw, r.y), Point::new(r.x, r.y + r.height)), Stroke::default().with_color(Color { a: 0.8, ..Color::WHITE }).with_width(1.0));
+            f.fill(&bowtie, Color { a: 0.35, ..Color::WHITE });
+            f.stroke(&Path::line(Point::new(r.x + tw / 2.0, r.y), Point::new(r.x + tw / 2.0, r.y + r.height)), Stroke::default().with_color(Color { a: 0.8, ..Color::WHITE }).with_width(1.0));
         }
 
         // Zoom and pan animations as bands along the bottom, like Camtasia's animation arrows.
@@ -1217,5 +1348,78 @@ mod range_tests {
         // Without the tool, the same drag moves the clip as before.
         let msgs = run(&p, None, false, &drag(Point::new(200.0, y), Point::new(350.0, y)));
         assert!(matches!(msgs.last(), Some(Message::MoveClip { .. })), "{msgs:?}");
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+    use crate::clip::{TextLayer, TransitionKind};
+    use crate::editor::library::Effect;
+
+    fn run(project: &Project, dnd_effect: Option<Effect>, events: &[(mouse::Event, Point)]) -> Vec<Message> {
+        let (media, missing, cache) = (MediaCache::default(), std::collections::HashSet::new(), Caches::default());
+        let lanes = Lanes {
+            project, media: &media, selection: &[], playhead: 0.0, view: View { scroll: 0.0, zoom: 100.0 }, snapping: false, zoom_edit: None, range: None, range_mode: false,
+            dnd: None, dnd_effect, missing: &missing, cache: &cache, overflow: false, vscroll: 0.0,
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 300.0));
+        let mut state = LanesState::default();
+        events.iter().filter_map(|(e, at)| canvas::Program::update(&lanes, &mut state, &canvas::Event::Mouse(*e), bounds, mouse::Cursor::Available(*at)).and_then(|a| a.into_inner().0)).collect()
+    }
+
+    fn drag(from: Point, to: Point) -> Vec<(mouse::Event, Point)> {
+        vec![(mouse::Event::ButtonPressed(mouse::Button::Left), from), (mouse::Event::CursorMoved { position: to }, to), (mouse::Event::ButtonReleased(mouse::Button::Left), to)]
+    }
+
+    /// Two clips touching at 4 s, with a 1 s crossfade already on the second one (so it visually
+    /// starts at 3 s). Returns (project, second clip id, the row's mid-y).
+    fn two_clips_with_a_transition() -> (Project, Id, f32) {
+        let mut p = Project::new("t", Default::default());
+        let track = p.tracks.iter().find(|t| t.kind == TrackKind::Visual).unwrap().id;
+        p.add_text_clip(Some(track), 0.0, 4.0, TextLayer::default()).unwrap();
+        let second = p.add_text_clip(Some(track), 4.0, 4.0, TextLayer::default()).unwrap();
+        p.set_transition(second, Some(TransitionKind::Crossfade), 1.0).unwrap();
+        let (_, _, top, h) = rows(&p, 0.0).into_iter().find(|r| r.0 == track).unwrap();
+        (p, second, top + h / 2.0)
+    }
+
+    #[test]
+    fn dragging_a_transition_s_leading_edge_resizes_it() {
+        let (p, second, y) = two_clips_with_a_transition();
+        let view = View { scroll: 0.0, zoom: 100.0 };
+        // The bowtie's leading (left) edge sits at the clip's current start, 3 s in; the cut
+        // itself (4 s) never moves. Dragging that edge further left lengthens the transition.
+        let edge_x = view.x(p.clip(second).unwrap().start);
+        let msgs = run(&p, None, &drag(Point::new(edge_x, y), Point::new(edge_x - 50.0, y)));
+        match msgs.last() {
+            Some(Message::Edit(id, crate::editor::inspector::Edit::TransitionDuration(d))) => {
+                assert_eq!(*id, second);
+                assert!((*d - 1.5).abs() < 0.01, "{d}");
+            }
+            other => panic!("expected a transition duration edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropping_a_transition_near_the_seam_targets_the_incoming_clip_not_whatever_is_under_it() {
+        let mut p = Project::new("t", Default::default());
+        let track = p.tracks.iter().find(|t| t.kind == TrackKind::Visual).unwrap().id;
+        p.add_text_clip(Some(track), 0.0, 4.0, TextLayer::default()).unwrap();
+        let second = p.add_text_clip(Some(track), 4.0, 4.0, TextLayer::default()).unwrap();
+        let (_, _, top, h) = rows(&p, 0.0).into_iter().find(|r| r.0 == track).unwrap();
+        let y = top + h / 2.0;
+        let view = View { scroll: 0.0, zoom: 100.0 };
+        let seam_x = view.x(4.0);
+        let effect = Effect::Transition(TransitionKind::Crossfade);
+        // Dropped a little into the first clip's tail, not on the second clip's own body.
+        let msgs = run(&p, Some(effect), &[(mouse::Event::ButtonReleased(mouse::Button::Left), Point::new(seam_x - 10.0, y))]);
+        match msgs.as_slice() {
+            [Message::DropEffect { effect: e, target: crate::editor::DropTarget::Timeline { clip, .. } }] => {
+                assert_eq!(*e, effect);
+                assert_eq!(*clip, Some(second));
+            }
+            other => panic!("expected a transition drop targeting the incoming clip, got {other:?}"),
+        }
     }
 }

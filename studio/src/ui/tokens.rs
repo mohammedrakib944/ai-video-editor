@@ -70,6 +70,8 @@ pub mod clip {
     pub const EFFECT: Color = hex(0xFF8A4C);
     /// Blur bands on clips.
     pub const BLUR: Color = hex(0x7CC4FF);
+    /// Mask bands on clips.
+    pub const MASK: Color = hex(0xFF6FA8);
 }
 
 // Spacing scale (px).

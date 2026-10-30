@@ -1,7 +1,6 @@
 [workspace]
-# The app is `studio` (AI Video Studio). `spikes/` holds throwaway prototypes.
+# The app is `studio` (AI Video Studio).
 members = ["studio"]
-exclude = ["spikes"]
 resolver = "2"
 
 [profile.dev]

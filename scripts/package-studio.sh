@@ -16,7 +16,9 @@ rm -rf "$out"
 mkdir -p "$out/bin" "$out/share/applications" "$out/share/licenses"
 
 install -m 755 target/release/ai-video-studio "$out/bin/ai-video-studio"
-cp studio/assets/fonts/LICENSE-Inter.txt studio/assets/icons/LICENSE-lucide.txt "$out/share/licenses/"
+cp studio/assets/fonts/LICENSE-Inter.txt studio/assets/fonts/LICENSE-Poppins.txt \
+   studio/assets/fonts/LICENSE-HindSiliguri.txt studio/assets/icons/LICENSE-lucide.txt \
+   "$out/share/licenses/"
 
 # The icon in the freedesktop hicolor theme layout.
 tmp="$(mktemp -d)"
