@@ -307,8 +307,8 @@ impl scene::Sources for ExactSources<'_> {
         }
     }
 
-    fn text(&self, layer: &crate::clip::TextLayer, px_per_unit: f32) -> Option<Arc<super::Frame>> {
-        self.inner.text(layer, px_per_unit)
+    fn text(&self, layer: &crate::clip::TextLayer, px_per_unit: f32, local: f64) -> Option<Arc<super::Frame>> {
+        self.inner.text(layer, px_per_unit, local)
     }
 }
 
@@ -343,7 +343,7 @@ mod tests {
         p.clip_mut(v).unwrap().look.corner_radius = 30.0;
         p.set_speed(v, 2.0).unwrap();
         let t = p.add_text_clip(None, 0.2, crate::edit::DEFAULT_STILL, TextLayer { text: "নতুন Studio".into(), ..Default::default() }).unwrap();
-        p.clip_mut(t).unwrap().intro = Some(Motion { kind: MotionKind::Pop, duration: 0.4 });
+        p.clip_mut(t).unwrap().intro = Some(Motion { kind: MotionKind::Pop, duration: 0.4, ease: None, delay: 0.0 });
         p.add_shape_clip(Some(p.tracks[1].id), 0.0, crate::edit::DEFAULT_STILL, ShapeLayer::new(ShapeKind::Rectangle, 200.0, 80.0, Rgba::hex(0x7C6DFF), None)).unwrap();
 
         let out = dir.join("out.mp4");

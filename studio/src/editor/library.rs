@@ -5,7 +5,7 @@ use iced::{Alignment, Color, Element, Fill, Length, mouse};
 use iced_aw::ContextMenu;
 
 use super::{Editor, LibraryTab, Message, fmt_duration};
-use crate::clip::{MotionKind, Rgba, TransitionKind};
+use crate::clip::{CalloutIcon, MotionKind, Rgba, TransitionKind};
 use crate::model::MediaKind;
 use crate::ui::icons::{code, icon, tinted};
 use crate::ui::tokens::*;
@@ -34,6 +34,18 @@ impl Editor {
                         space().height(6),
                         widgets::section("Shapes"),
                         shape_grid(),
+                        space().height(6),
+                        widgets::section("Callouts"),
+                        text("A glowing icon accent that pops in — use sparingly, at a genuinely important moment.").size(T_CAPTION).color(TEXT_4),
+                        callout_grid(),
+                        space().height(6),
+                        widgets::section("Counter"),
+                        text("A number that counts up or down — great for before/after metrics.").size(T_CAPTION).color(TEXT_4),
+                        button(column![text("0 → 100").font(INTER_BOLD).size(20.0), text("Counts up over 1s").size(T_CAPTION).color(TEXT_3)].spacing(4))
+                            .width(Fill)
+                            .padding([12, 12])
+                            .style(style::choice_card(false))
+                            .on_press(Message::AddCounter),
                     ]
                     .spacing(S2)
                     .padding([8, 10]),
@@ -305,6 +317,26 @@ pub enum Effect {
     Frame(FrameStyle),
     /// A zoom (or a pan, right after another zoom) on a video or image.
     Zoom,
+    /// A named, one-click camera move (push in / pull back), tied to the playhead.
+    Camera(CameraPreset),
+}
+
+/// A ready-made camera move, built from the playhead to the end of the clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraPreset {
+    /// Slow, continuous zoom in from normal to a closer framing, held to the end.
+    PushIn,
+    /// Starts punched in and pulls back to reveal the whole frame, held to the end.
+    PullBack,
+}
+
+impl CameraPreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            CameraPreset::PushIn => "Push in",
+            CameraPreset::PullBack => "Pull back",
+        }
+    }
 }
 
 /// The frame styles a picture can get from the Effects tab (adjusted in the inspector).
@@ -354,9 +386,16 @@ pub fn catalog() -> Vec<EffectGroup> {
                 (code::LAYERS, "Shadow", Effect::Frame(FrameStyle::Shadow)),
             ],
         },
-        EffectGroup { title: "Zoom & pan", items: vec![(code::ZOOM_IN, "Zoom", Effect::Zoom)] },
         EffectGroup {
-            title: "Transition in",
+            title: "Zoom & pan",
+            items: vec![
+                (code::ZOOM_IN, "Zoom", Effect::Zoom),
+                (code::MAXIMIZE_2, CameraPreset::PushIn.label(), Effect::Camera(CameraPreset::PushIn)),
+                (code::MINIMIZE_2, CameraPreset::PullBack.label(), Effect::Camera(CameraPreset::PullBack)),
+            ],
+        },
+        EffectGroup {
+            title: "Transition",
             items: vec![
                 (code::BLEND, "Crossfade", Effect::Transition(TransitionKind::Crossfade)),
                 (code::ARROW_LEFT_RIGHT, "Slide", Effect::Transition(TransitionKind::SlideLeft)),
@@ -390,6 +429,7 @@ impl Effect {
             Effect::Highlight(h) => format!("marker:{h:?}"),
             Effect::Frame(f) => format!("frame:{f:?}"),
             Effect::Zoom => "zoom".into(),
+            Effect::Camera(p) => format!("camera:{p:?}"),
         }
     }
 }
@@ -510,6 +550,73 @@ impl ShapePreset {
             }
         }
     }
+}
+
+/// Ready-made glowing icon callouts in the library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalloutPreset {
+    Check,
+    Arrow,
+    Star,
+    Sparkle,
+    Zap,
+}
+
+impl CalloutPreset {
+    const ALL: [CalloutPreset; 5] = [CalloutPreset::Check, CalloutPreset::Arrow, CalloutPreset::Star, CalloutPreset::Sparkle, CalloutPreset::Zap];
+
+    /// Delegates to `CalloutIcon`'s own label/glyph so this preset list and the clip's actual
+    /// icon enum never drift apart.
+    fn label(self) -> &'static str {
+        self.icon().label()
+    }
+
+    fn glyph(self) -> char {
+        crate::render::scene::callout_glyph(self.icon())
+    }
+
+    fn color(self) -> Rgba {
+        match self {
+            CalloutPreset::Check => Rgba::hex(0x2EF2A2),
+            CalloutPreset::Arrow => Rgba::hex(0x4C8DFF),
+            CalloutPreset::Star => Rgba::hex(0xFFD166),
+            CalloutPreset::Sparkle => Rgba::hex(0xD6FF00),
+            CalloutPreset::Zap => Rgba::hex(0xFF8A4C),
+        }
+    }
+
+    /// The callout layer for this preset.
+    pub fn build(self) -> crate::clip::CalloutLayer {
+        crate::clip::CalloutLayer::new(self.icon(), self.color())
+    }
+
+    fn icon(self) -> CalloutIcon {
+        match self {
+            CalloutPreset::Check => CalloutIcon::Check,
+            CalloutPreset::Arrow => CalloutIcon::Arrow,
+            CalloutPreset::Star => CalloutIcon::Star,
+            CalloutPreset::Sparkle => CalloutIcon::Sparkle,
+            CalloutPreset::Zap => CalloutIcon::Zap,
+        }
+    }
+}
+
+fn callout_grid<'a>() -> Element<'a, Message> {
+    let items = CalloutPreset::ALL.iter().map(|&p| -> Element<'a, Message> {
+        let Rgba(r, g, b, a) = p.color();
+        let col = Color::from_rgba(r, g, b, a);
+        button(
+            column![container(tinted(p.glyph(), 18, col)).center(34).style(style::badge(col)), text(p.label()).font(INTER_MEDIUM).size(T_CAPTION)]
+                .spacing(6)
+                .align_x(Alignment::Center),
+        )
+        .width(Fill)
+        .padding([10, 4])
+        .style(style::choice_card(false))
+        .on_press(Message::AddCallout(p))
+        .into()
+    });
+    iced::widget::grid(items.collect::<Vec<_>>()).fluid(84).spacing(6).height(iced::widget::grid::Sizing::EvenlyDistribute(Length::Shrink)).into()
 }
 
 fn shape_grid<'a>() -> Element<'a, Message> {

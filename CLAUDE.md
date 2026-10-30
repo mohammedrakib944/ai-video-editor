@@ -48,8 +48,8 @@ GNU toolchain + MinGW-w64 (WinLibs). Windows packaging:
 `cargo run -p studio -- project.aivp` with these env vars renders the real window to a PNG and exits:
 `STUDIO_SNAPSHOT=out.png`, `STUDIO_SNAPSHOT_DELAY` (seconds), `STUDIO_SNAPSHOT_TIME` (playhead),
 `STUDIO_SNAPSHOT_SCROLL`, `STUDIO_SNAPSHOT_SELECT=clip[,a,b]` (select a clip, optionally mark a range),
-`STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|settings` (open the Connect AI dialog, the assistant panel,
-the Effects tab or Settings), `STUDIO_SNAPSHOT_ZOOM=2` (preview zoom), `STUDIO_SNAPSHOT_CHAT=reply.md` (a sample
+`STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|settings|skills` (open the Connect AI dialog, the assistant
+panel, the Effects tab, Settings or the assistant's Skills manager), `STUDIO_SNAPSHOT_ZOOM=2` (preview zoom), `STUDIO_SNAPSHOT_CHAT=reply.md` (a sample
 conversation with that Markdown reply, no AI needed), `STUDIO_SNAPSHOT_REOPEN=1` (switch to the
 assistant tab last), `STUDIO_SNAPSHOT_SEEK=seconds` (move the playhead), `STUDIO_SNAPSHOT_TEXT=start,end` (select those characters in, or `STUDIO_SNAPSHOT_TYPE=text` to type at the end of,
 the text box of a text clip selected with `STUDIO_SNAPSHOT_SELECT`). Set `APPDATA` to a scratch folder for test instances so they don't touch the
@@ -151,4 +151,11 @@ removes `WAYLAND_DISPLAY` to run under XWayland so drag and drop works — winit
 - FFmpeg filter-script files must outlive the FFmpeg process that reads them. Use
   `ffmpeg::filter_script_option()` (FFmpeg 7 `-/filter_complex` vs 6.x `-filter_complex_script`).
 - Export writes through a cleanup guard so a cancelled/failed export leaves no partial file.
+- cosmic-text's `SwashCache::with_pixels` discards a glyph color's alpha channel, replacing it with
+  the glyph's own coverage/anti-aliasing mask (`Color((coverage << 24) | base.0 & 0xFF_FFFF)` in
+  their source) — setting alpha via `Attrs::color()` has no visible effect. Per-word fade (the
+  kinetic text reveal, `render/text.rs`) instead packs a word index alongside the existing
+  style-span index into one `Attrs::metadata()` value (`pack_word_meta`/`unpack_style`/
+  `unpack_word`), builds word bounding boxes from the laid-out glyphs, and multiplies alpha by
+  position inside the `buffer.draw` callback, after coverage is known.
 

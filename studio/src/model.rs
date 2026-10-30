@@ -208,8 +208,9 @@ impl Project {
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Project> {
-        let project: Project = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let mut project: Project = serde_json::from_str(&std::fs::read_to_string(path)?)?;
         anyhow::ensure!(project.version <= FORMAT_VERSION, "This project was made with a newer version of the app");
+        project.migrate_transitions();
         Ok(project)
     }
 }

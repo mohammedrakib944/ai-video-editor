@@ -58,6 +58,16 @@ impl Default for Transform {
     }
 }
 
+/// A slow, continuous idle motion so a still moment never looks frozen ("nothing ever fully
+/// stops"). Content-agnostic, independent of `CalloutLayer::pulse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DriftKind {
+    /// Scale breathes gently between 1.0 and 1.02.
+    ScaleBreath,
+    /// Position drifts within about 4 canvas-unit pixels.
+    PositionDrift,
+}
+
 /// Cropping, as fractions of the source frame cut from each edge.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -170,6 +180,61 @@ pub struct Grade {
     pub saturation: f64,
     pub temperature: f64,
 }
+
+impl Grade {
+    const fn new(brightness: f64, contrast: f64, saturation: f64, temperature: f64) -> Self {
+        Grade { brightness, contrast, saturation, temperature }
+    }
+}
+
+/// One named look in the Color grade group of the Effects tab, grouped by category.
+pub struct GradePreset {
+    pub category: &'static str,
+    pub name: &'static str,
+    pub grade: Grade,
+}
+
+/// Professional color grading looks, from flat/colorful to cinematic to clean studio —
+/// plus "Original" to clear a grade back to the untouched source. Built from the same 4
+/// knobs (brightness, contrast, saturation, temperature) as the Color section in the
+/// inspector, so any preset can be fine-tuned there afterwards.
+pub const GRADE_PRESETS: &[GradePreset] = &[
+    GradePreset { category: "Original", name: "Original", grade: Grade::new(0.0, 0.0, 0.0, 0.0) },
+    // Cinematic: the moody, graded looks of film and trailers.
+    GradePreset { category: "Cinematic", name: "Teal & Orange", grade: Grade::new(0.0, 0.25, 0.1, 0.15) },
+    GradePreset { category: "Cinematic", name: "Film Noir", grade: Grade::new(-0.05, 0.35, -0.9, -0.05) },
+    GradePreset { category: "Cinematic", name: "Blockbuster", grade: Grade::new(0.02, 0.3, 0.2, 0.08) },
+    GradePreset { category: "Cinematic", name: "Moody Blue", grade: Grade::new(-0.08, 0.2, -0.1, -0.35) },
+    GradePreset { category: "Cinematic", name: "Warm Drama", grade: Grade::new(0.0, 0.25, 0.15, 0.3) },
+    GradePreset { category: "Cinematic", name: "Desaturated Thriller", grade: Grade::new(-0.1, 0.15, -0.5, -0.1) },
+    GradePreset { category: "Cinematic", name: "Golden Hour", grade: Grade::new(0.08, 0.1, 0.15, 0.4) },
+    GradePreset { category: "Cinematic", name: "Cold War", grade: Grade::new(-0.1, 0.3, -0.3, -0.4) },
+    // Studio: clean, bright, neutral looks for product and talking-head shots.
+    GradePreset { category: "Studio", name: "Clean Studio", grade: Grade::new(0.05, 0.1, 0.0, 0.0) },
+    GradePreset { category: "Studio", name: "Bright Commercial", grade: Grade::new(0.15, 0.1, 0.1, 0.05) },
+    GradePreset { category: "Studio", name: "Soft Glow", grade: Grade::new(0.1, -0.1, -0.05, 0.1) },
+    GradePreset { category: "Studio", name: "Crisp Product", grade: Grade::new(0.05, 0.25, 0.05, -0.05) },
+    GradePreset { category: "Studio", name: "High-Key", grade: Grade::new(0.25, -0.05, 0.0, 0.05) },
+    GradePreset { category: "Studio", name: "Neutral Pro", grade: Grade::new(0.0, 0.08, 0.02, 0.0) },
+    GradePreset { category: "Studio", name: "Gallery White", grade: Grade::new(0.12, 0.05, -0.1, -0.05) },
+    GradePreset { category: "Studio", name: "Tech Showcase", grade: Grade::new(0.0, 0.2, -0.05, -0.15) },
+    // Vivid & flat: punchy, colorful, poster-like looks.
+    GradePreset { category: "Vivid & flat", name: "Pop Color", grade: Grade::new(0.05, 0.1, 0.5, 0.0) },
+    GradePreset { category: "Vivid & flat", name: "Candy Flat", grade: Grade::new(0.1, -0.1, 0.4, 0.1) },
+    GradePreset { category: "Vivid & flat", name: "Electric Vivid", grade: Grade::new(0.0, 0.15, 0.6, -0.05) },
+    GradePreset { category: "Vivid & flat", name: "Pastel Flat", grade: Grade::new(0.15, -0.2, -0.2, 0.05) },
+    GradePreset { category: "Vivid & flat", name: "Neon Punch", grade: Grade::new(-0.05, 0.3, 0.55, -0.1) },
+    GradePreset { category: "Vivid & flat", name: "Bold Poster", grade: Grade::new(0.0, 0.35, 0.45, 0.0) },
+    GradePreset { category: "Vivid & flat", name: "Sunny Flat", grade: Grade::new(0.1, -0.05, 0.25, 0.25) },
+    // Vintage & mood: faded, warm or desaturated nostalgic looks.
+    GradePreset { category: "Vintage & mood", name: "Vintage Film", grade: Grade::new(0.0, -0.1, -0.2, 0.2) },
+    GradePreset { category: "Vintage & mood", name: "Faded Retro", grade: Grade::new(0.1, -0.25, -0.3, 0.15) },
+    GradePreset { category: "Vintage & mood", name: "Sepia Dream", grade: Grade::new(0.05, -0.05, -0.6, 0.45) },
+    GradePreset { category: "Vintage & mood", name: "Bleach Bypass", grade: Grade::new(0.05, 0.4, -0.7, 0.0) },
+    GradePreset { category: "Vintage & mood", name: "Dusty Rose", grade: Grade::new(0.05, -0.1, -0.15, 0.2) },
+    GradePreset { category: "Vintage & mood", name: "Midnight Mood", grade: Grade::new(-0.2, 0.2, -0.2, -0.25) },
+    GradePreset { category: "Vintage & mood", name: "Noir Fade", grade: Grade::new(-0.1, -0.15, -0.85, -0.05) },
+];
 
 /// A volume change on part of a clip (from a range selection). Times are clip-relative.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -306,6 +371,48 @@ pub fn camera_at(zooms: &[Zoom], t: f64) -> Camera {
     Camera::IDENTITY
 }
 
+/// A one-shot "button press" pulse at one moment: scale dips and recovers, like a real click.
+/// Times are relative to the clip start.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PressPulse {
+    pub id: Id,
+    pub at: f64,
+    pub duration: f64,
+}
+
+impl PressPulse {
+    /// 8 frames at 60fps.
+    pub const DEFAULT_DURATION: f64 = 8.0 / 60.0;
+    /// How far the scale dips at the midpoint of the press.
+    const DIP: f64 = 0.04;
+}
+
+/// Idle-drift offset at clip-relative time `t`: `(dx, dy)` in canvas units and a scale
+/// multiplier. Slower than `CalloutLayer::pulse`'s breathing (0.4 Hz vs. ~1.1 Hz) so it reads as
+/// restlessness, not pulsing. Bounded and non-cumulative: safe to evaluate at any `t`, including
+/// on a loop, since it never integrates away from its starting point.
+pub fn idle_drift(kind: DriftKind, t: f64) -> (f64, f64, f64) {
+    const HZ: f64 = 0.4;
+    let osc = |phase: f64| (t * std::f64::consts::TAU * HZ + phase).sin();
+    match kind {
+        DriftKind::ScaleBreath => (0.0, 0.0, 1.0 + 0.01 * (osc(0.0) + 1.0)),
+        DriftKind::PositionDrift => (4.0 * osc(0.0), 4.0 * osc(std::f64::consts::FRAC_PI_2), 1.0),
+    }
+}
+
+/// Scale multiplier from every press pulse active at clip-relative time `t` (1.0 outside any
+/// press window; dips to `1.0 - DIP` at the midpoint of a press and recovers by its end).
+pub fn press_scale(presses: &[PressPulse], t: f64) -> f32 {
+    presses
+        .iter()
+        .map(|p| {
+            let d = p.duration.max(1e-6);
+            let k = ((t - p.at) / d).clamp(0.0, 1.0);
+            1.0 - PressPulse::DIP * (k * std::f64::consts::PI).sin()
+        })
+        .product::<f64>() as f32
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Prop {
     X,
@@ -356,6 +463,23 @@ pub enum MotionKind {
 pub struct Motion {
     pub kind: MotionKind,
     pub duration: f64,
+    /// Easing of the entrance/exit progress. `None` (the default, for projects saved before
+    /// this field existed) falls back to the engine's old hard-coded behavior: `EaseOut` for
+    /// intro, `EaseIn` for outro — see `Motion::ease_or_default`.
+    #[serde(default)]
+    pub ease: Option<Ease>,
+    /// Seconds after the clip starts before this motion begins (for staggering a group's
+    /// entrances). Only meaningful on `intro`.
+    #[serde(default)]
+    pub delay: f64,
+}
+
+impl Motion {
+    /// `ease` if set, else the engine's old hard-coded default for an intro (`exit: false`) or
+    /// outro (`exit: true`) motion.
+    pub fn ease_or_default(self, exit: bool) -> Ease {
+        self.ease.unwrap_or(if exit { Ease::EaseIn } else { Ease::EaseOut })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +524,22 @@ pub struct TextLayer {
     /// Words styled differently from the rest: sorted, non-overlapping character ranges.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub spans: Vec<TextSpan>,
+    /// Kinetic reveal: words fade/ease in one after another instead of all at once.
+    pub reveal: Option<TextReveal>,
+}
+
+/// Word-by-word kinetic text reveal: each word starts `stagger` seconds after the previous one
+/// and eases in over `duration` seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextReveal {
+    pub duration: f64,
+    pub stagger: f64,
+}
+
+impl Default for TextReveal {
+    fn default() -> Self {
+        TextReveal { duration: 0.35, stagger: 0.05 }
+    }
 }
 
 /// Part of a text layer (characters `start..end`, counted in Unicode chars) with its own style.
@@ -590,7 +730,41 @@ impl Default for TextLayer {
             background: None,
             padding: 24.0,
             spans: Vec::new(),
+            reveal: None,
         }
+    }
+}
+
+/// A number that counts up or down from `from` to `to` over `duration` seconds. `format`
+/// supplies styling only (font, size, color, align, …); its `text` is overwritten every frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CounterLayer {
+    pub from: f64,
+    pub to: f64,
+    pub duration: f64,
+    #[serde(default)]
+    pub decimals: u32,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub suffix: String,
+    pub format: TextLayer,
+}
+
+impl CounterLayer {
+    pub fn new(from: f64, to: f64) -> CounterLayer {
+        CounterLayer { from, to, duration: 1.0, decimals: 0, prefix: String::new(), suffix: String::new(), format: TextLayer::default() }
+    }
+
+    /// The displayed value at clip-relative time `t`: eased, continuous, never a one-frame jump.
+    pub fn value_at(&self, t: f64) -> f64 {
+        let p = Ease::EaseOut.apply((t / self.duration.max(1e-6)).clamp(0.0, 1.0));
+        self.from + (self.to - self.from) * p
+    }
+
+    /// The text to display at clip-relative time `t`.
+    pub fn text_at(&self, t: f64) -> String {
+        format!("{}{:.*}{}", self.prefix, self.decimals as usize, self.value_at(t), self.suffix)
     }
 }
 
@@ -663,6 +837,60 @@ impl ShapeLayer {
     }
 }
 
+/// A small set of bundled glyphs for callouts; `ui::icon_codes` maps these to the Lucide font.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CalloutIcon {
+    Check,
+    Arrow,
+    Star,
+    Sparkle,
+    Zap,
+}
+
+impl std::fmt::Display for CalloutIcon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl CalloutIcon {
+    pub const ALL: [CalloutIcon; 5] = [CalloutIcon::Check, CalloutIcon::Arrow, CalloutIcon::Star, CalloutIcon::Sparkle, CalloutIcon::Zap];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CalloutIcon::Check => "Check",
+            CalloutIcon::Arrow => "Arrow",
+            CalloutIcon::Star => "Star",
+            CalloutIcon::Sparkle => "Sparkle",
+            CalloutIcon::Zap => "Zap",
+        }
+    }
+}
+
+fn default_callout_size() -> f64 {
+    96.0
+}
+
+/// A bundled icon glyph with a glow (drawn from the clip's own `look.shadow`), that pops in and
+/// can pulse — a tasteful accent at an important moment, not a drawing tool like `ShapeLayer`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CalloutLayer {
+    pub icon: CalloutIcon,
+    /// Glyph size, canvas units.
+    #[serde(default = "default_callout_size")]
+    pub size: f64,
+    pub color: Rgba,
+    /// A slow breathing scale/glow while the clip is on screen.
+    #[serde(default)]
+    pub pulse: bool,
+}
+
+impl CalloutLayer {
+    pub fn new(icon: CalloutIcon, color: Rgba) -> CalloutLayer {
+        CalloutLayer { icon, size: default_callout_size(), color, pulse: false }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Content {
     /// Video, image or audio from the media library. `src_in` is where playback starts in the file.
@@ -670,6 +898,8 @@ pub enum Content {
     Text(TextLayer),
     Shape(ShapeLayer),
     Blur(BlurLayer),
+    Callout(CalloutLayer),
+    Counter(CounterLayer),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -704,6 +934,10 @@ pub struct Clip {
     pub crop: Crop,
     #[serde(default)]
     pub part: Part,
+    #[serde(default)]
+    pub presses: Vec<PressPulse>,
+    #[serde(default)]
+    pub idle_drift: Option<DriftKind>,
 }
 
 impl Clip {
@@ -726,6 +960,8 @@ impl Clip {
             transition: None,
             crop: Crop::default(),
             part: Part::Whole,
+            presses: Vec::new(),
+            idle_drift: None,
         }
     }
 
@@ -782,6 +1018,60 @@ mod tests {
         let mid_out = camera_at(&z, 3.75);
         assert!(mid_out.scale > 1.0 && mid_out.scale < 2.0);
         assert_eq!(camera_at(&z, 5.0), Camera::IDENTITY);
+    }
+
+    #[test]
+    fn back_ease_overshoots() {
+        // The whole point of the "bouncy" entrance: progress exceeds 1.0 partway through.
+        let over = (1..100).map(|i| Ease::Back.apply(i as f64 / 100.0)).fold(0.0f64, f64::max);
+        assert!(over > 1.0, "Ease::Back should overshoot past 1.0, got max {over}");
+        assert!(Ease::Back.apply(0.0).abs() < 1e-9);
+        assert!((Ease::Back.apply(1.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn motion_ease_or_default_matches_old_hardcoded_behavior() {
+        let m = Motion { kind: MotionKind::Fade, duration: 1.0, ease: None, delay: 0.0 };
+        assert_eq!(m.ease_or_default(false), Ease::EaseOut, "intro used to always ease out");
+        assert_eq!(m.ease_or_default(true), Ease::EaseIn, "outro used to always ease in");
+        let m = Motion { kind: MotionKind::Fade, duration: 1.0, ease: Some(Ease::Back), delay: 0.0 };
+        assert_eq!(m.ease_or_default(false), Ease::Back, "an explicit ease overrides the default");
+    }
+
+    #[test]
+    fn press_pulse_dips_and_recovers() {
+        let presses = [PressPulse { id: 1, at: 1.0, duration: 0.2 }];
+        assert_eq!(press_scale(&presses, 0.5), 1.0, "unaffected before the press starts");
+        assert!((press_scale(&presses, 1.0) - 1.0).abs() < 1e-6, "no dip right at the start");
+        assert!(press_scale(&presses, 1.1) < 0.97, "dips at the midpoint");
+        assert!((press_scale(&presses, 1.2) - 1.0).abs() < 1e-6, "recovers by the end");
+        assert_eq!(press_scale(&presses, 2.0), 1.0, "unaffected long after the press");
+    }
+
+    #[test]
+    fn idle_drift_stays_bounded_and_oscillates() {
+        let samples: Vec<f64> = (0..50).map(|i| idle_drift(DriftKind::ScaleBreath, i as f64 * 0.05).2).collect();
+        assert!(samples.iter().all(|&s| (1.0..=1.02 + 1e-9).contains(&s)), "scale breath should stay within [1.0, 1.02]");
+        assert!(samples.iter().any(|&s| s > 1.015) && samples.iter().any(|&s| s < 1.005), "it should actually oscillate, not sit still");
+        let (dx, dy, mul) = idle_drift(DriftKind::PositionDrift, 1.0);
+        assert!(dx.abs() <= 4.0 + 1e-9 && dy.abs() <= 4.0 + 1e-9, "position drift should stay within about 4 units");
+        assert_eq!(mul, 1.0, "position drift doesn't also change scale");
+    }
+
+    #[test]
+    fn counter_counts_continuously_and_never_jumps() {
+        let mut c = CounterLayer::new(0.0, 100.0);
+        c.duration = 1.0;
+        c.decimals = 1;
+        c.prefix = "$".into();
+        assert_eq!(c.value_at(0.0), 0.0);
+        assert_eq!(c.value_at(1.0), 100.0);
+        assert_eq!(c.value_at(5.0), 100.0, "holds at the target after it finishes");
+        let mid = c.value_at(0.5);
+        assert!(mid > 0.0 && mid < 100.0, "in between, it's in between");
+        // Ease-out: the first half covers more ground than the second half.
+        assert!(c.value_at(0.5) > 50.0, "ease-out front-loads the motion");
+        assert_eq!(c.text_at(1.0), "$100.0");
     }
 
     #[test]

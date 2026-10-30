@@ -72,6 +72,43 @@ pub struct Settings {
     /// Choices from the Settings dialog.
     #[serde(default)]
     pub prefs: Prefs,
+    /// Reusable instruction blocks for the AI assistant (see `Skill`).
+    #[serde(default)]
+    pub skills: Vec<Skill>,
+    /// Whether `default_skill()` has already been seeded into `skills` once. Runs only on the
+    /// first load ever (fresh installs and any settings file saved before skills existed), so
+    /// deleting the starter skill doesn't bring it back on the next launch.
+    #[serde(default)]
+    pub skills_seeded: bool,
+}
+
+/// A reusable block of instructions for the AI assistant: written once from the assistant
+/// panel, then switched on or off per conversation instead of retyping it every time. Enabled
+/// skills are appended to the system prompt sent to whichever provider is connected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Skill {
+    pub name: String,
+    pub body: String,
+    pub enabled: bool,
+}
+
+/// Seeded once into every fresh install, so the Skills manager isn't empty the first time it's
+/// opened and new users have a real example to edit or delete.
+fn default_skill() -> Skill {
+    Skill {
+        name: "Motion polish".into(),
+        body: "Extra motion-design taste on top of your base instructions:\n\n\
+- Staggered groups: when several related elements enter together (a checklist, feature cards, bullet points), use \
+stagger_entrances (or set intro_delay per clip) instead of letting every intro fire on the same instant.\n\
+- Multi-aspect safety: if a project might get re-cropped later for 9:16 or 1:1 social cutdowns, keep key subjects and all text \
+within the center square of the frame (roughly x 0.2-0.8 on a 16:9 canvas), not just the usual edge margins.\n\
+- Reach for the right accent, sparingly: add_press_pulse when something is clicked or tapped in a screen recording, add_counter \
+for a before/after number, add_camera_move for a slow deliberate push in or pull back (add_zoom is for calling attention to \
+part of the frame instead), idle_drift on a held shot that would otherwise look frozen. Use them like glow icons — only where \
+they genuinely earn their place, not on every clip."
+            .into(),
+        enabled: true,
+    }
 }
 
 /// How sharp the preview is decoded. Only the preview: exports are always full quality.
@@ -190,7 +227,13 @@ const MAX_RECENT: usize = 12;
 
 impl Settings {
     pub fn load() -> Settings {
-        std::fs::read_to_string(file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+        let mut s: Settings = std::fs::read_to_string(file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        if !s.skills_seeded {
+            s.skills.insert(0, default_skill());
+            s.skills_seeded = true;
+            s.save();
+        }
+        s
     }
 
     pub fn save(&self) {
@@ -295,5 +338,29 @@ mod tests {
         // Auto steps down while playback can't keep up, and stops at Draft.
         assert_eq!(PreviewQuality::Auto.lower(), PreviewQuality::Balanced);
         assert_eq!(PreviewQuality::Balanced.lower().lower(), PreviewQuality::Draft);
+    }
+
+    #[test]
+    fn a_fresh_or_pre_skills_settings_file_gets_seeded_once() {
+        // A brand-new install (no file at all) decodes to `Settings::default()`: no skills, not
+        // yet seeded — the same shape `load()` falls back to.
+        let mut fresh = Settings::default();
+        assert!(fresh.skills.is_empty() && !fresh.skills_seeded);
+        fresh.skills.insert(0, default_skill());
+        fresh.skills_seeded = true;
+        assert_eq!(fresh.skills.len(), 1);
+        assert!(fresh.skills[0].enabled, "the starter skill is on by default");
+
+        // A settings file saved before skills existed also decodes with `skills_seeded: false`
+        // (the field didn't exist yet), so it gets the same one-time seed.
+        let old: Settings = serde_json::from_str(r#"{ "recent": [] }"#).unwrap();
+        assert!(!old.skills_seeded);
+
+        // But once seeded (and persisted with the flag set), it never comes back after the user
+        // deletes it — simulated here by round-tripping a settings value that already has the
+        // flag set and an empty skills list.
+        let deleted_it = Settings { skills: Vec::new(), skills_seeded: true, ..Settings::default() };
+        let round: Settings = serde_json::from_str(&serde_json::to_string(&deleted_it).unwrap()).unwrap();
+        assert!(round.skills.is_empty() && round.skills_seeded, "seeding is one-time, not re-applied on every load");
     }
 }

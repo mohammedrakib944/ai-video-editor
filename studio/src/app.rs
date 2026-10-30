@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use iced::keyboard::{self, Key, key};
-use iced::widget::{button, column, container, row, space, text};
+use iced::widget::{button, column, container, mouse_area, row, space, text, text_input};
 use iced::window;
 use iced::{Alignment, Element, Event, Fill, Subscription, Task, event};
 use iced_aw::DropDown;
@@ -352,6 +352,7 @@ impl App {
             self.settings.inspector_collapsed = e.collapsed.clone();
             self.settings.favorite_effects = e.favorite_effects.clone();
             self.settings.effects_open = e.effects_open.clone();
+            self.settings.skills = e.skills.clone();
             self.settings.layout = e.layout();
             if let (true, Some(path)) = (e.doc.is_dirty(), e.path.clone()) {
                 if e.doc.project.save(&path).is_ok() {
@@ -395,6 +396,7 @@ impl App {
         editor.collapsed = self.settings.inspector_collapsed.clone();
         editor.favorite_effects = self.settings.favorite_effects.clone();
         editor.effects_open = self.settings.effects_open.clone();
+        editor.skills = self.settings.skills.clone();
         let _ = editor.update(editor::Message::WindowSize(self.window_size));
         let task = editor.boot().map(Message::Editor);
         let task = task.chain(window::latest().and_then(window::size).map(Message::WindowSize));
@@ -521,6 +523,7 @@ impl App {
                 MenuItem::Separator,
                 MenuItem::new(code::SAVE, "Save", Message::Save).shortcut("Ctrl+S"),
                 MenuItem::new(code::COPY, "Save as…", Message::SaveAs).shortcut("Ctrl+Shift+S"),
+                MenuItem::new(code::PENCIL, "Rename project…", Message::Editor(editor::Message::RenameProjectStart)),
                 MenuItem::Separator,
                 MenuItem::new(code::SLIDERS_HORIZONTAL, "Settings…", Message::OpenSettings).shortcut("Ctrl+,"),
                 MenuItem::Separator,
@@ -539,9 +542,22 @@ impl App {
             (true, false) => ("Saved", TEXT_4),
             (false, _) => ("Not saved", WARNING),
         };
+        let name: Element<'_, Message> = match &e.renaming_project {
+            Some(draft) => text_input("Project name", draft)
+                .id("project-rename")
+                .on_input(|s| Message::Editor(editor::Message::RenameProjectInput(s)))
+                .on_submit(Message::Editor(editor::Message::RenameProjectCommit))
+                .padding([3, 6])
+                .size(T_BODY)
+                .style(style::input)
+                .into(),
+            None => mouse_area(text(&e.doc.project.name).font(INTER_SEMIBOLD).size(T_BODY))
+                .on_double_click(Message::Editor(editor::Message::RenameProjectStart))
+                .into(),
+        };
         let left = row![
             dropdown,
-            text(&e.doc.project.name).font(INTER_SEMIBOLD).size(T_BODY),
+            name,
             container(row![container(space().width(6).height(6)).style(style::swatch(status.1, 3.0)), text(status.0).size(T_CAPTION).color(TEXT_3)].spacing(5).align_y(Alignment::Center))
                 .padding([0, 4]),
         ]
@@ -649,6 +665,7 @@ fn snapshot_task() -> Task<Message> {
         Ok("assistant") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::ToggleAssistant),
         Ok("settings") => Task::done(Message::OpenSettings),
         Ok("effects") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::LibraryTab(editor::LibraryTab::Transitions))),
+        Ok("skills") => Task::perform(tokio::time::sleep(std::time::Duration::from_secs_f64(delay - 1.0)), |_| Message::Editor(editor::Message::OpenSkills)),
         _ => Task::none(),
     };
     // `STUDIO_SNAPSHOT_SELECT=clip[,range_start,range_end]` selects a clip (and a range).

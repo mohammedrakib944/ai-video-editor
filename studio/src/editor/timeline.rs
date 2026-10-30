@@ -98,6 +98,8 @@ fn clip_color(project: &Project, clip: &Clip) -> Color {
         Content::Text(_) => clip::TEXT,
         Content::Shape(_) => clip::EFFECT,
         Content::Blur(_) => clip::BLUR,
+        Content::Callout(_) => clip::EFFECT,
+        Content::Counter(_) => clip::TEXT,
     }
 }
 
@@ -114,6 +116,8 @@ pub fn clip_label(project: &Project, clip: &Clip) -> String {
         Content::Text(t) => t.text.lines().next().unwrap_or("Text").to_string(),
         Content::Shape(_) => "Shape".into(),
         Content::Blur(_) => "Blur".into(),
+        Content::Callout(c) => format!("Callout · {}", c.icon.label()),
+        Content::Counter(c) => format!("Counter · {:.0}→{:.0}", c.from, c.to),
     }
 }
 
@@ -1014,18 +1018,26 @@ impl Lanes<'_> {
             }
         }
 
-        // Transition into the clip: a soft wedge at its start.
+        // A transition pulls this clip's start to genuinely overlap the previous clip, so this
+        // span (`r.x` to `r.x + tw`) is real shared screen time, not just this clip's own corner.
+        // Draw it as a bowtie straddling the seam, like most editors' transition icon, instead of
+        // a one-sided wedge that reads as this clip's own entrance effect.
         if let Some(tr) = clip.transition {
             // min/max, not clamp: very short clips are narrower than the 6 px minimum.
             let tw = ((tr.duration * self.view.zoom) as f32).max(6.0).min(r.width);
-            let wedge = Path::new(|b| {
+            let mid_y = r.y + r.height / 2.0;
+            let bowtie = Path::new(|b| {
                 b.move_to(Point::new(r.x, r.y));
-                b.line_to(Point::new(r.x + tw, r.y));
+                b.line_to(Point::new(r.x + tw, mid_y));
                 b.line_to(Point::new(r.x, r.y + r.height));
                 b.close();
+                b.move_to(Point::new(r.x + tw, r.y));
+                b.line_to(Point::new(r.x, mid_y));
+                b.line_to(Point::new(r.x + tw, r.y + r.height));
+                b.close();
             });
-            f.fill(&wedge, Color { a: 0.35, ..Color::WHITE });
-            f.stroke(&Path::line(Point::new(r.x + tw, r.y), Point::new(r.x, r.y + r.height)), Stroke::default().with_color(Color { a: 0.8, ..Color::WHITE }).with_width(1.0));
+            f.fill(&bowtie, Color { a: 0.35, ..Color::WHITE });
+            f.stroke(&Path::line(Point::new(r.x + tw / 2.0, r.y), Point::new(r.x + tw / 2.0, r.y + r.height)), Stroke::default().with_color(Color { a: 0.8, ..Color::WHITE }).with_width(1.0));
         }
 
         // Zoom and pan animations as bands along the bottom, like Camtasia's animation arrows.

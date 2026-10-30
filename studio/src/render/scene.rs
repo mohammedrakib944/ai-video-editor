@@ -3,16 +3,30 @@
 use std::sync::Arc;
 
 use super::Frame;
-use crate::clip::{self, Clip, Content, Ease, Fit, MotionKind, Prop, TransitionKind};
+use crate::clip::{self, Clip, Content, Ease, Fit, MotionKind, Prop, TextLayer, TransitionKind};
 use crate::model::{Id, MediaKind, Project, TrackKind};
+use crate::ui::icons::code;
+
+/// The Lucide glyph for a callout icon — the single source of this mapping; reused by the
+/// library grid (`editor::library::CalloutPreset::glyph`) so the two never drift apart.
+pub fn callout_glyph(icon: clip::CalloutIcon) -> char {
+    match icon {
+        clip::CalloutIcon::Check => code::CHECK,
+        clip::CalloutIcon::Arrow => code::ARROW_UP_RIGHT,
+        clip::CalloutIcon::Star => code::STAR,
+        clip::CalloutIcon::Sparkle => code::SPARKLE,
+        clip::CalloutIcon::Zap => code::ZAP,
+    }
+}
 
 /// Where a layer's pixels come from. The scene builder asks for these.
 pub trait Sources {
     /// The decoded video frame closest to `src_time` for this clip, if one is ready.
     fn video(&self, clip: Id, asset: Id, src_time: f64, playing: bool) -> Option<Arc<Frame>>;
     fn image(&self, asset: Id) -> Option<Arc<Frame>>;
-    /// Rendered text at `px_per_unit` canvas pixels per canvas unit.
-    fn text(&self, layer: &clip::TextLayer, px_per_unit: f32) -> Option<Arc<Frame>>;
+    /// Rendered text at `px_per_unit` canvas pixels per canvas unit. `local` is the clip-relative
+    /// time, used only when the layer has a kinetic reveal.
+    fn text(&self, layer: &clip::TextLayer, px_per_unit: f32, local: f64) -> Option<Arc<Frame>>;
 }
 
 #[derive(Debug, Clone)]
@@ -72,27 +86,46 @@ pub fn evaluate(project: &Project, t: f64, size: (u32, u32), sources: &dyn Sourc
     let mut layers = Vec::new();
     // Bottom track first; tracks[0] is drawn on top.
     for track in project.tracks.iter().rev().filter(|tr| tr.kind == TrackKind::Visual && !tr.hidden) {
-        let Some(clip) = project.clips_on(track.id).find(|c| t >= c.start && t < c.end()) else { continue };
-        if let Some(layer) = clip_layer(project, clip, t, w, h, unit, sources, playing) {
-            // A blur clip blurs the video and images already below it, then stays as an
-            // invisible layer so it can be picked and resized on the canvas.
-            if let Some([radius, ellipse]) = layer.blur_box {
-                if radius > 0.0 {
-                    for below in layers.iter_mut().filter(|l: &&mut LayerSpec| l.blurrable) {
-                        blur_under(below, layer.center, layer.size, radius, ellipse);
-                    }
+        // Normally exactly one clip is active on a track at once; two only inside a transition's
+        // shared overlap window — the one case clips on a track are allowed to overlap.
+        let mut actives: Vec<&Clip> = project.clips_on(track.id).filter(|c| t >= c.start && t < c.end()).collect();
+        actives.sort_by(|a, b| a.start.total_cmp(&b.start));
+        if let [outgoing, incoming] = actives[..] {
+            if let Some(tr) = incoming.transition {
+                let p = Ease::Smooth.apply((t - incoming.start) / tr.duration.max(0.01)) as f32;
+                if let Some(layer) = clip_layer(project, outgoing, t, w, h, unit, sources, playing, Some((tr.kind, p))) {
+                    push_layer(&mut layers, layer);
                 }
-                layers.push(LayerSpec { opacity: 0.0, ..layer });
-                continue;
             }
-            layers.push(layer);
+        }
+        if let Some(&clip) = actives.last() {
+            if let Some(layer) = clip_layer(project, clip, t, w, h, unit, sources, playing, None) {
+                push_layer(&mut layers, layer);
+            }
         }
     }
     Scene { width: size.0, height: size.1, background: [0.0, 0.0, 0.0, 1.0], layers }
 }
 
+/// Pushes a layer, letting a blur clip blur what's already below it on this track.
+fn push_layer(layers: &mut Vec<LayerSpec>, layer: LayerSpec) {
+    if let Some([radius, ellipse]) = layer.blur_box {
+        if radius > 0.0 {
+            for below in layers.iter_mut().filter(|l: &&mut LayerSpec| l.blurrable) {
+                blur_under(below, layer.center, layer.size, radius, ellipse);
+            }
+        }
+        layers.push(LayerSpec { opacity: 0.0, ..layer });
+    } else {
+        layers.push(layer);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32, sources: &dyn Sources, playing: bool) -> Option<LayerSpec> {
+/// `outgoing_fade`, when set, means `clip` is the *outgoing* half of a transition pair (the
+/// incoming clip's own `(kind, progress)`): it gets the mirror of the incoming clip's motion
+/// instead of applying its own `clip.transition` (which, if any, belongs to a different pair).
+fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32, sources: &dyn Sources, playing: bool, outgoing_fade: Option<(TransitionKind, f32)>) -> Option<LayerSpec> {
     if clip.part == clip::Part::Sound {
         return None;
     }
@@ -139,15 +172,37 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
         }
     };
     if let Some(m) = clip.intro {
-        let p = Ease::EaseOut.apply(local / m.duration.max(0.01)) as f32;
+        let p = m.ease_or_default(false).apply((local - m.delay) / m.duration.max(0.01)) as f32;
         if p < 1.0 {
             apply_motion(m.kind, p, false);
         }
     }
     if let Some(m) = clip.outro {
-        let p = Ease::EaseIn.apply((clip.duration - local) / m.duration.max(0.01)) as f32;
+        let p = m.ease_or_default(true).apply((clip.duration - local) / m.duration.max(0.01)) as f32;
         if p < 1.0 {
             apply_motion(m.kind, p.min(1.0), true);
+        }
+    }
+
+    if !clip.presses.is_empty() {
+        scale *= clip::press_scale(&clip.presses, local);
+    }
+
+    // "Nothing ever fully stops": a slow idle breathing/drift so a still moment doesn't freeze.
+    if let Some(kind) = clip.idle_drift {
+        let (dx, dy, scale_mul) = clip::idle_drift(kind, local);
+        x += dx as f32 * unit;
+        y += dy as f32 * unit;
+        scale *= scale_mul as f32;
+    }
+
+    // A pulsing callout breathes gently: a touch bigger and a touch brighter in sync.
+    let mut glow_mul = 1.0f32;
+    if let Content::Callout(c) = &clip.content {
+        if c.pulse {
+            let osc = (local * std::f64::consts::TAU * 1.1).sin() as f32;
+            scale *= 1.0 + 0.06 * osc;
+            glow_mul = 1.0 + 0.25 * osc.max(0.0);
         }
     }
 
@@ -163,7 +218,7 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
             (frame, natural, clip.id, [1.0; 4], [1.0; 4], true)
         }
         Content::Text(layer) => {
-            let frame = sources.text(layer, unit)?;
+            let frame = sources.text(layer, unit, local)?;
             let natural = [frame.width as f32, frame.height as f32];
             (Some(frame), natural, text_slot(clip.id), [1.0; 4], [1.0; 4], false)
         }
@@ -184,6 +239,18 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
             (None, natural, 0, top, bottom, false)
         }
         Content::Blur(b) => (None, [(b.width as f32 * unit).max(1.0), (b.height as f32 * unit).max(1.0)], 0, [0.0; 4], [0.0; 4], false),
+        Content::Callout(c) => {
+            let icon_layer = TextLayer { text: callout_glyph(c.icon).to_string(), font: "lucide".into(), size: c.size, color: c.color, padding: 0.0, ..Default::default() };
+            let frame = sources.text(&icon_layer, unit, local)?;
+            let natural = [frame.width as f32, frame.height as f32];
+            (Some(frame), natural, text_slot(clip.id), [1.0; 4], [1.0; 4], false)
+        }
+        Content::Counter(counter) => {
+            let layer = TextLayer { text: counter.text_at(local), ..counter.format.clone() };
+            let frame = sources.text(&layer, unit, local)?;
+            let natural = [frame.width as f32, frame.height as f32];
+            (Some(frame), natural, text_slot(clip.id), [1.0; 4], [1.0; 4], false)
+        }
     };
 
     // Media fits the canvas; text and shapes keep their own size.
@@ -222,8 +289,31 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
         uv = [u0 + (cx - half) * du, v0 + (cy - half) * dv, u0 + (cx + half) * du, v0 + (cy + half) * dv];
     }
 
-    // Transition into this clip.
-    if let Some(tr) = clip.transition {
+    if let Some((kind, p)) = outgoing_fade {
+        // Mirror of the incoming clip's blend below: this clip fades/slides/zooms OUT as the
+        // next one fades in, so the pair reads as one continuous transition, not two effects.
+        if p < 1.0 {
+            match kind {
+                TransitionKind::Crossfade => opacity *= 1.0 - p,
+                TransitionKind::SlideLeft | TransitionKind::Push => x -= p * w,
+                TransitionKind::SlideUp => y -= p * h,
+                TransitionKind::ZoomThrough => {
+                    let s = 1.0 + 0.35 * p;
+                    size = [size[0] * s, size[1] * s];
+                    opacity *= 1.0 - p;
+                }
+                TransitionKind::Wipe => {
+                    // Recedes from the right edge as the incoming clip reveals from the left.
+                    let right = x + size[0] / 2.0;
+                    let u_span = uv[2] - uv[0];
+                    size[0] *= 1.0 - p;
+                    x = right - size[0] / 2.0;
+                    uv[0] += u_span * p;
+                }
+            }
+        }
+    } else if let Some(tr) = clip.transition {
+        // Transition into this clip.
         let p = Ease::Smooth.apply(local / tr.duration.max(0.01)) as f32;
         if p < 1.0 {
             match tr.kind {
@@ -247,7 +337,7 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
     }
 
     let look = &clip.look;
-    let (radius, border, shadow) = if is_media || matches!(clip.content, Content::Shape(_)) {
+    let (radius, border, shadow) = if is_media || matches!(clip.content, Content::Shape(_) | Content::Callout(_)) {
         (look.corner_radius as f32 * unit * scale, look.border_width as f32 * unit * scale, look.shadow.enabled)
     } else {
         (0.0, 0.0, false)
@@ -265,9 +355,9 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
         radius: radius.min(size[0].min(size[1]) / 2.0),
         border,
         border_color: [look.border_color.0, look.border_color.1, look.border_color.2, look.border_color.3],
-        shadow_blur: if shadow { look.shadow.blur as f32 * unit } else { 0.0 },
+        shadow_blur: if shadow { look.shadow.blur as f32 * unit * glow_mul } else { 0.0 },
         shadow_y: if shadow { look.shadow.offset_y as f32 * unit } else { 0.0 },
-        shadow_color: if shadow { [sc.0, sc.1, sc.2, look.shadow.opacity as f32] } else { [0.0; 4] },
+        shadow_color: if shadow { [sc.0, sc.1, sc.2, (look.shadow.opacity as f32 * glow_mul).min(1.0)] } else { [0.0; 4] },
         uv,
         tint_top,
         tint_bottom,
@@ -331,7 +421,7 @@ mod tests {
         fn image(&self, _: Id) -> Option<Arc<Frame>> {
             None
         }
-        fn text(&self, _: &clip::TextLayer, _: f32) -> Option<Arc<Frame>> {
+        fn text(&self, _: &clip::TextLayer, _: f32, _: f64) -> Option<Arc<Frame>> {
             Some(Arc::new(Frame::new(400, 100, vec![0; 400 * 100 * 4])))
         }
     }
@@ -359,11 +449,26 @@ mod tests {
         let (mut p, c) = project();
         let clip = p.clip_mut(c).unwrap();
         clip.zooms.push(Zoom { id: 9, at: 1.0, duration: 4.0, scale: 2.0, focus_x: 0.0, focus_y: 1.0, ramp: 0.5 });
-        clip.intro = Some(Motion { kind: MotionKind::Fade, duration: 1.0 });
+        clip.intro = Some(Motion { kind: MotionKind::Fade, duration: 1.0, ease: None, delay: 0.0 });
         let s = evaluate(&p, 3.0, (1920, 1080), &NoSources, false);
         assert_eq!(s.layers[0].uv, [0.0, 0.5, 0.5, 1.0], "focus is clamped so the crop stays inside the frame");
         let early = evaluate(&p, 0.2, (1920, 1080), &NoSources, false);
         assert!(early.layers[0].opacity < 0.9);
+    }
+
+    #[test]
+    fn delayed_intro_stays_hidden_until_the_delay_passes() {
+        let (mut p, c) = project();
+        let clip = p.clip_mut(c).unwrap();
+        clip.intro = Some(Motion { kind: MotionKind::Fade, duration: 0.5, ease: None, delay: 1.0 });
+        // Before the delay: fully pre-entrance (opacity 0, as if the intro hadn't started).
+        let before = evaluate(&p, 0.5, (1920, 1080), &NoSources, false);
+        assert_eq!(before.layers[0].opacity, 0.0, "a clip with a stagger delay stays hidden until the delay elapses");
+        // After the delay elapses, the fade proceeds normally.
+        let mid = evaluate(&p, 1.25, (1920, 1080), &NoSources, false);
+        assert!(mid.layers[0].opacity > 0.0 && mid.layers[0].opacity < 1.0);
+        let done = evaluate(&p, 2.0, (1920, 1080), &NoSources, false);
+        assert_eq!(done.layers[0].opacity, 1.0);
     }
 
     #[test]
@@ -419,5 +524,26 @@ mod tests {
         let track = p.clip(c).unwrap().track;
         p.track_mut(track).unwrap().hidden = true;
         assert!(evaluate(&p, 1.0, (1920, 1080), &NoSources, false).layers.is_empty());
+    }
+
+    #[test]
+    fn a_callout_glows_and_a_pulsing_one_breathes_over_time() {
+        let mut p = Project::new("t", Canvas::default());
+        let layer = clip::CalloutLayer::new(clip::CalloutIcon::Check, clip::Rgba::hex(0x2EF2A2));
+        let id = p.add_callout_clip(None, 0.0, 4.0, layer).unwrap();
+        let still = evaluate(&p, 2.0, (1920, 1080), &NoSources, false).layers[0].clone();
+        assert!(still.shadow_blur > 0.0 && still.shadow_color[3] > 0.0, "the glow renders via the clip's shadow");
+
+        p.clip_mut(id).unwrap().content = match p.clip(id).unwrap().content.clone() {
+            Content::Callout(mut c) => {
+                c.pulse = true;
+                Content::Callout(c)
+            }
+            other => other,
+        };
+        let a = evaluate(&p, 2.0, (1920, 1080), &NoSources, false).layers[0].clone();
+        let b = evaluate(&p, 2.5, (1920, 1080), &NoSources, false).layers[0].clone();
+        assert_ne!(a.shadow_blur, b.shadow_blur, "a pulsing callout's glow changes over time");
+        assert_ne!(a.size, b.size, "and so does its scale");
     }
 }

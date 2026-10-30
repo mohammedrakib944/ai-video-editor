@@ -129,7 +129,16 @@ Projects save automatically a couple of seconds after each change.
   range is marked. Click one to jump to it and rename or recolor it in the inspector; drag to move.
 - **Zoom & pan, Camtasia-style**: put the playhead where the zoom should start and press `Z`.
   Zooms appear as bands on the clip — drag to move, drag the ends to resize, click to aim the
-  focus rectangle on the canvas. Pressing `Z` again right after a zoom adds a smooth **pan**.
+  focus rectangle on the canvas. Pressing `Z` again right after a zoom adds a smooth **pan**. The
+  Effects tab also has one-click **Push in / Pull back** camera presets that zoom from the
+  playhead to the end of the clip.
+- **Motion polish**: entrances can be **Bouncy** (a slight overshoot) in the inspector; exits
+  default to 60% of the entrance's duration. A **press pulse** (`P`) gives a clip a quick, one-shot
+  scale dip, like a button being clicked. **Idle drift** (in Layer) keeps a still moment subtly
+  alive with a slow breathing scale. Select several clips and use **Stagger entrances** (right-click
+  menu) to offset their intros a few frames apart instead of starting all at once.
+- **Safe zones**: toggle 9:16 / 1:1 crop guides over a 16:9 preview (toolbar button) to check a
+  shot will still read once it's re-cropped for social cutdowns.
 - **Preview**: GPU-rendered, with audio. Click layers to select them; drag to move (snaps to the
   center), corners to scale, the knob to rotate, the inner dot to round the corners; shapes and
   markers resize from every side (Shift on a corner keeps the proportions). Handles work past the
@@ -145,18 +154,25 @@ Projects save automatically a couple of seconds after each change.
   selected clip has: rotation, opacity and framing (position and size are set on the preview);
   **crop** (sliders, or drag the edges on the canvas); the frame styles, animations, transition and
   zooms it got from Effects, each with its settings and a ✕ to remove it; color (brightness, contrast,
-  saturation, warmth); speed; volume and fades; **range volume** (change or mute just the selected range
+  saturation, warmth, plus one-click **grade presets** — cinematic, studio, vivid & flat, vintage &
+  mood looks, previewed on the clip's own thumbnail); speed; volume and fades; **range volume** (change or mute just the selected range
   of a clip — each changed part keeps its own slider); text (Inter, Poppins, Hind Siliguri for Bangla) —
   **select words in the text box** to give just them their own color, weight, font, size, marker
-  highlight or underline (styles stay on their words while you keep typing); shapes (rectangle,
-  ellipse, triangle, star, hexagon, ring, frame with linear/radial gradients at any angle).
+  highlight or underline (styles stay on their words while you keep typing), and a **kinetic
+  reveal** toggle that fades words in one after another instead of all at once; shapes (rectangle,
+  ellipse, triangle, star, hexagon, ring, frame with linear/radial gradients at any angle); a
+  **counter** (from/to/duration/decimals, prefix/suffix) that counts up or down, eased, for
+  before/after metrics.
 - **Library tabs**: Media (grouped into videos, images and audio), Text (headline, subtitle, Bangla
-  headline, shape presets), Effects (above), Sounds (9 original effects — whoosh, pop, click, riser…).
+  headline, shape presets, callouts, counter), Effects (above), Sounds (9 original effects — whoosh,
+  pop, click, riser…).
 - **Assistant**: describe what you want; it sees the playhead, the selected clip and the marked
   range. Write on several lines freely: Enter starts a new line and only the Send button sends. Replies show
   formatted (headings, lists, code with a copy button, links) with a Copy button for the whole reply. Tool calls show
   as cards, and it can look at rendered frames to check its work. **Stop** ends the reply at once, including
   anything Claude Code started, and refuses edits still on the way; your next message continues the conversation.
+  The wand icon opens the **Skills manager**: reusable instruction blocks (brand colors, a house style,
+  a standing request) written once and switched on or off per conversation instead of retyping them.
 - **Export** to MP4 (H.264 + AAC) with progress, time left and cancel. The export uses the same
   renderer as the preview, and a cancelled or failed export leaves no broken file.
 - **Settings** (gear in the title bar, the app menu, or `Ctrl+,`): preview quality — **Auto**
@@ -175,6 +191,7 @@ Projects save automatically a couple of seconds after each change.
 | S or B (Ctrl+B) | Split at the playhead |
 | R | Range tool on · Done (clears the range) |
 | Z | Add a zoom (or pan) at the playhead |
+| P | Add a press pulse at the playhead |
 | T | Add text at the playhead |
 | Delete / Backspace | Delete the selected clips (or the zoom being edited, or the selected marker) |
 | Ctrl+D | Duplicate |

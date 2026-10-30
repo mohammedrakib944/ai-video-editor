@@ -322,10 +322,10 @@ impl Sources for Bound<'_> {
         None
     }
 
-    fn text(&self, layer: &TextLayer, px_per_unit: f32) -> Option<Arc<Frame>> {
-        let key = text::key(layer, px_per_unit);
+    fn text(&self, layer: &TextLayer, px_per_unit: f32, local: f64) -> Option<Arc<Frame>> {
+        let key = text::key(layer, px_per_unit, local);
         let mut texts = self.server.texts.borrow_mut();
-        Some(texts.entry(key).or_insert_with(|| text::rasterize(layer, px_per_unit)).clone())
+        Some(texts.entry(key).or_insert_with(|| text::rasterize(layer, px_per_unit, local)).clone())
     }
 }
 
