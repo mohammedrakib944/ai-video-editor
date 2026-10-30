@@ -166,7 +166,7 @@ impl AudioPlayer {
             return Ok(None);
         }
         let part = shifted(project, from);
-        let (inputs, graph) = audio::mix_graph(&part, 0, total);
+        let (inputs, graph) = audio::mix_graph(&part, 0, total, None);
         if inputs.is_empty() {
             return Ok(None);
         }

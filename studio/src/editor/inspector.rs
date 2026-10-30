@@ -34,6 +34,9 @@ pub enum Edit {
     Contrast(f64),
     Saturation(f64),
     Temperature(f64),
+    Lift(f64),
+    Gamma(f64),
+    Gain(f64),
     ResetGrade,
     /// Sets all four grade fields at once, from a preset in `clip::GRADE_PRESETS`.
     GradePreset(crate::clip::Grade),
@@ -41,6 +44,13 @@ pub enum Edit {
     Mute(bool),
     FadeIn(f64),
     FadeOut(f64),
+    EqLow(f64),
+    EqMid(f64),
+    EqHigh(f64),
+    ResetEq,
+    Compressor(bool),
+    CompressorAmount(f64),
+    Denoise(f64),
     Speed(f64),
     Text(String),
     Font(String),
@@ -82,7 +92,12 @@ pub enum Edit {
     /// Blur clips: strength (0..100), oval or box (the box is moved and sized on the preview).
     BlurStrength(f64),
     BlurEllipse(bool),
-    /// A shape resized on the canvas: width and height (canvas units) and its new center.
+    /// Mask clips: edge softness (0..100), oval or box, and invert (hide the box instead of
+    /// showing only it) — the box itself is moved and sized on the preview.
+    MaskFeather(f64),
+    MaskEllipse(bool),
+    MaskInvert(bool),
+    /// A shape, blur or mask resized on the canvas: width and height (canvas units) and its new center.
     ShapeBox(f64, f64, f64, f64),
     /// Restyles characters `start..end` of a text clip.
     SpanStyle(usize, usize, crate::clip::SpanChange),
@@ -114,10 +129,15 @@ impl Edit {
             Edit::BorderWidth(_) | Edit::BorderColor(_) => ("border", "Border"),
             Edit::Shadow(_) | Edit::ShadowBlur(_) | Edit::ShadowOffset(_) | Edit::ShadowOpacity(_) => ("shadow", "Shadow"),
             Edit::Brightness(_) | Edit::Contrast(_) | Edit::Saturation(_) | Edit::Temperature(_) => ("grade", "Color"),
+            Edit::Lift(_) | Edit::Gamma(_) | Edit::Gain(_) => ("grade", "Three-way color"),
             Edit::ResetGrade => ("reset-grade", "Reset color"),
             Edit::GradePreset(_) => ("grade", "Color grade"),
             Edit::Volume(_) | Edit::Mute(_) => ("volume", "Volume"),
             Edit::FadeIn(_) | Edit::FadeOut(_) => ("fade", "Audio fade"),
+            Edit::EqLow(_) | Edit::EqMid(_) | Edit::EqHigh(_) => ("eq", "Equalizer"),
+            Edit::ResetEq => ("reset-eq", "Reset equalizer"),
+            Edit::Compressor(_) | Edit::CompressorAmount(_) => ("compressor", "Compressor"),
+            Edit::Denoise(_) => ("denoise", "Noise reduction"),
             Edit::Speed(_) => ("speed", "Speed"),
             Edit::Text(_) => ("text", "Edit text"),
             Edit::SpanStyle(..) => ("text-span", "Style words"),
@@ -132,6 +152,7 @@ impl Edit {
             Edit::ZoomScale(..) | Edit::ZoomFocusX(..) | Edit::ZoomFocusY(..) | Edit::ZoomFocus(..) => ("zoom", "Zoom"),
             Edit::Crop(_) | Edit::CropLeft(_) | Edit::CropTop(_) | Edit::CropRight(_) | Edit::CropBottom(_) => ("crop", "Crop"),
             Edit::BlurStrength(_) | Edit::BlurEllipse(_) => ("blur", "Blur"),
+            Edit::MaskFeather(_) | Edit::MaskEllipse(_) | Edit::MaskInvert(_) => ("mask", "Mask"),
             Edit::CalloutIcon(_) => ("callout-icon", "Callout icon"),
             Edit::CalloutColor(_) => ("callout-color", "Callout color"),
             Edit::CalloutPulse(_) => ("callout-pulse", "Callout pulse"),
@@ -167,12 +188,22 @@ impl Edit {
             Edit::Contrast(v) => g.contrast = v,
             Edit::Saturation(v) => g.saturation = v,
             Edit::Temperature(v) => g.temperature = v,
+            Edit::Lift(v) => g.lift = v,
+            Edit::Gamma(v) => g.gamma = v,
+            Edit::Gain(v) => g.gain = v,
             Edit::ResetGrade => c.grade = Default::default(),
             Edit::GradePreset(grade) => c.grade = grade,
             Edit::Volume(v) => c.audio.volume = v,
             Edit::Mute(m) => c.audio.muted = m,
             Edit::FadeIn(v) => c.audio.fade_in = v,
             Edit::FadeOut(v) => c.audio.fade_out = v,
+            Edit::EqLow(v) => c.audio.eq.low = v,
+            Edit::EqMid(v) => c.audio.eq.mid = v,
+            Edit::EqHigh(v) => c.audio.eq.high = v,
+            Edit::ResetEq => c.audio.eq = Default::default(),
+            Edit::Compressor(on) => c.audio.compressor.enabled = on,
+            Edit::CompressorAmount(v) => c.audio.compressor.amount = v,
+            Edit::Denoise(v) => c.audio.denoise = v,
             Edit::Intro(k) => c.intro = k.map(|kind| crate::clip::Motion { kind, duration: c.intro.map(|m| m.duration).unwrap_or(0.6), ease: c.intro.and_then(|m| m.ease), delay: c.intro.map(|m| m.delay).unwrap_or(0.0) }),
             Edit::Outro(k) => c.outro = k.map(|kind| crate::clip::Motion { kind, duration: c.outro.map(|m| m.duration).unwrap_or_else(|| c.intro.map(|m| m.duration * 0.6).unwrap_or(0.6)), ease: c.outro.and_then(|m| m.ease), delay: 0.0 }),
             Edit::IntroDuration(d) => {
@@ -225,6 +256,21 @@ impl Edit {
                         Edit::ShapeBox(w, h, x, y) => {
                             b.width = w.clamp(4.0, 4000.0);
                             b.height = h.clamp(4.0, 4000.0);
+                            (c.transform.x, c.transform.y) = (x, y);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            edit if matches!(c.content, Content::Mask(_)) => {
+                if let Content::Mask(m) = &mut c.content {
+                    match edit {
+                        Edit::MaskFeather(v) => m.feather = v.clamp(0.0, 100.0),
+                        Edit::MaskEllipse(on) => m.ellipse = on,
+                        Edit::MaskInvert(on) => m.invert = on,
+                        Edit::ShapeBox(w, h, x, y) => {
+                            m.width = w.clamp(4.0, 4000.0);
+                            m.height = h.clamp(4.0, 4000.0);
                             (c.transform.x, c.transform.y) = (x, y);
                         }
                         _ => {}
@@ -365,6 +411,7 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
         (Content::Text(_), _) => (code::TYPE, clip::TEXT, "Text"),
         (Content::Shape(_), _) => (code::SQUARE, clip::EFFECT, "Shape"),
         (Content::Blur(_), _) => (code::DROPLETS, clip::BLUR, "Blur"),
+        (Content::Mask(_), _) => (code::SCAN_EYE, clip::MASK, "Mask"),
         (Content::Callout(_), _) => (code::SPARKLE, clip::EFFECT, "Callout"),
         (Content::Counter(_), _) => (code::GAUGE, clip::TEXT, "Counter"),
         (_, Some(MediaKind::Audio)) => (code::AUDIO_LINES, clip::AUDIO, "Audio"),
@@ -405,6 +452,12 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
     // A blur clip only has its blur and its place.
     if let Content::Blur(b) = &clip.content {
         let col = blur_clip(clip, b, ctx, col, &mut shown);
+        return widgets::scroll(col.padding(iced::Padding { top: 0.0, right: 10.0, bottom: 12.0, left: 4.0 })).height(Fill).into();
+    }
+
+    // A mask clip only has its mask and its place.
+    if let Content::Mask(m) = &clip.content {
+        let col = mask_clip(clip, m, ctx, col, &mut shown);
         return widgets::scroll(col.padding(iced::Padding { top: 0.0, right: 10.0, bottom: 12.0, left: 4.0 })).height(Fill).into();
     }
 
@@ -626,6 +679,11 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
                 slider_row("Contrast", g.contrast * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Contrast(v / 100.0))),
                 slider_row("Saturation", g.saturation * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Saturation(v / 100.0))),
                 slider_row("Warmth", g.temperature * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Temperature(v / 100.0))),
+                widgets::divider(),
+                text("Three-way (shadows / mids / highlights)").font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_3),
+                slider_row("Lift", g.lift * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Lift(v / 100.0))),
+                slider_row("Gamma", g.gamma * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Gamma(v / 100.0))),
+                slider_row("Gain", g.gain * 100.0, -100.0..=100.0, 1.0, |v| format!("{v:+.0}"), move |v| e(Edit::Gain(v / 100.0))),
             ]
             .spacing(S3)
             .into(),
@@ -785,6 +843,21 @@ pub fn view<'a>(project: &'a Project, clip: &'a Clip, ctx: &Ctx<'a>) -> Element<
         }
         audio = audio.push(container(part).padding(S3).width(Fill).style(style::inset));
         col = add(col, &mut shown, ctx.section(code::VOLUME_2, "Audio", audio.into()));
+
+        let polish = column![
+            text("Equalizer").font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_3),
+            slider_row("Low", a.eq.low, -15.0..=15.0, 0.5, |v| format!("{v:+.1} dB"), move |v| e(Edit::EqLow(v))),
+            slider_row("Mid", a.eq.mid, -15.0..=15.0, 0.5, |v| format!("{v:+.1} dB"), move |v| e(Edit::EqMid(v))),
+            slider_row("High", a.eq.high, -15.0..=15.0, 0.5, |v| format!("{v:+.1} dB"), move |v| e(Edit::EqHigh(v))),
+            widgets::ghost_button(None, "Reset equalizer", (!a.eq.is_flat()).then_some(e(Edit::ResetEq))).padding([5, 9]),
+            widgets::divider(),
+            toggle_row("Compressor", a.compressor.enabled, move |on| e(Edit::Compressor(on))),
+            slider_row("Amount", a.compressor.amount, 0.0..=100.0, 1.0, |v| format!("{v:.0}%"), move |v| e(Edit::CompressorAmount(v))),
+            widgets::divider(),
+            slider_row("Noise reduction", a.denoise, 0.0..=97.0, 1.0, |v| if v == 0.0 { "Off".into() } else { format!("{v:.0}%") }, move |v| e(Edit::Denoise(v))),
+        ]
+        .spacing(S3);
+        col = add(col, &mut shown, ctx.section(code::SLIDERS_HORIZONTAL, "Audio polish", polish.into()));
     }
 
     // Header plus at least one section: otherwise the search found nothing here.
@@ -838,6 +911,30 @@ fn blur_clip<'a>(clip: &'a Clip, b: &crate::clip::BlurLayer, ctx: &Ctx<'a>, col:
     ]
     .spacing(S3);
     add(col, shown, ctx.section(code::DROPLETS, "Blur", body.into()))
+}
+
+/// A mask clip: how soft its edge is, what shape, invert, how big, and where.
+fn mask_clip<'a>(clip: &'a Clip, m: &crate::clip::MaskLayer, ctx: &Ctx<'a>, col: iced::widget::Column<'a, Message>, shown: &mut usize) -> iced::widget::Column<'a, Message> {
+    let id = clip.id;
+    let e = move |edit: Edit| Message::Edit(id, edit);
+    let body = column![
+        slider_row("Feather", m.feather, 0.0..=100.0, 1.0, |v| format!("{v:.0}"), move |v| e(Edit::MaskFeather(v))),
+        row![
+            text("Shape").size(T_SMALL).color(TEXT_2).width(84),
+            widgets::segmented(&[false, true], m.ellipse, |el| if *el { "Oval".into() } else { "Box".into() }, move |el| e(Edit::MaskEllipse(el))),
+        ]
+        .align_y(Alignment::Center),
+        toggle_row("Invert", m.invert, move |on| e(Edit::MaskInvert(on))),
+        text(if m.invert {
+            "Hides the video and images under its box; everywhere else stays visible. Move and size it on the preview; trim it on the timeline, or keyframe its position to follow a moving subject."
+        } else {
+            "Shows only the video and images under its box; everywhere else is hidden. Move and size it on the preview; trim it on the timeline, or keyframe its position to follow a moving subject."
+        })
+        .size(T_CAPTION)
+        .color(TEXT_3),
+    ]
+    .spacing(S3);
+    add(col, shown, ctx.section(code::SCAN_EYE, "Mask", body.into()))
 }
 
 /// What the inspector shows besides the clip: edit modes, the range, typed colors,

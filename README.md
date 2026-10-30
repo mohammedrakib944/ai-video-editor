@@ -108,7 +108,9 @@ Projects save automatically a couple of seconds after each change.
 ## What you can do
 
 - **Start screen**: pick a format (16:9, 9:16, 1:1, 4:5, 21:9 · 720p–4K · 24–60 fps) or reopen a
-  recent project. Drop media on it to start a project from that file.
+  recent project. Drop media on it to start a project from that file. **Try an example project**
+  opens a short pre-built scene (text, a kinetic reveal, a glowing accent and a marker) to explore
+  and pull apart instead of starting from a blank timeline.
 - **Import** with the **+** button, `Ctrl+I`, or by dragging files into the window. Thumbnails,
   filmstrips and waveforms load in the background. Missing files show a red badge — right-click →
   **Locate file…** to relink.
@@ -118,6 +120,7 @@ Projects save automatically a couple of seconds after each change.
   drag a clip above the top track to put it on a new track over everything; drag media in from the
   library. **Right-click a clip** (on the timeline or the preview) for split, duplicate, **separate
   audio** (the sound moves to its own audio track), mute, zoom, crop, **bring to front / send to back**,
+  **copy color** (its color grade) and **paste color** (onto the selected clip(s), as one undo step),
   range volume and delete. On the preview, a selected element keeps the drag even where another
   element lies over it.
 - **Split at the playhead** (`S`). **Select a range** for one job (range volume, a marker over it, or
@@ -130,7 +133,7 @@ Projects save automatically a couple of seconds after each change.
 - **Zoom & pan, Camtasia-style**: put the playhead where the zoom should start and press `Z`.
   Zooms appear as bands on the clip — drag to move, drag the ends to resize, click to aim the
   focus rectangle on the canvas. Pressing `Z` again right after a zoom adds a smooth **pan**. The
-  Effects tab also has one-click **Push in / Pull back** camera presets that zoom from the
+  Animation tab also has one-click **Push in / Pull back** camera presets that zoom from the
   playhead to the end of the clip.
 - **Motion polish**: entrances can be **Bouncy** (a slight overshoot) in the inspector; exits
   default to 60% of the entrance's duration. A **press pulse** (`P`) gives a clip a quick, one-shot
@@ -145,17 +148,27 @@ Projects save automatically a couple of seconds after each change.
   canvas edge. **Zoom the preview** from the toolbar (Fit, 25–400%), `Ctrl+0` / `Ctrl+1`, or
   Ctrl + wheel; the wheel or the middle button pans a zoomed preview. This never changes the video size.
 - **Effects add, the Inspector adjusts.** The **Effects** tab is where things are added: markers (box,
-  circle, highlight, underline in a color you pick), **blur** areas, frame styles (corners, border,
-  shadow), zoom & pan, transitions and animations in/out. Click an effect to apply it to the selected
-  clips, or drag it onto any clip on the timeline or the preview. Groups start collapsed; the ☆ on a
-  card keeps it in **Favorites**, always open at the top. Markers and blurs go on the timeline at the
-  playhead for 3 s (or over the selected range); a blur only blurs the video under its box.
+  circle, highlight, underline in a color you pick), **blur** and **mask** areas, frame styles (corners,
+  border, shadow) and transitions; a separate **Animation** tab (same layout) holds zoom & pan and the
+  animate-in/out motion presets, so entrances/exits/camera moves don't crowd the Effects list. Click an effect to apply it to the
+  selected clips, or drag it onto any clip on the timeline or the preview. Groups start collapsed; the ☆ on a
+  card keeps it in **Favorites**, always open at the top (each tab favorites its own effects). Markers, blurs and masks go on the timeline at the
+  playhead for 3 s (or over the selected range); a blur only blurs the video under its box, a **mask**
+  shows only the video under its box (or, inverted, hides it) — drag its edges on the preview to resize it,
+  and keyframe its position (same as any clip) to have it follow a moving subject by hand.
+  A **transition** goes between two touching clips, not onto a clip's own body: drag it onto the
+  seam where they meet (a highlight previews the real crossfade region before you drop), or apply
+  it to a selected clip that already touches a previous one. It genuinely overlaps the two clips
+  for its duration, Camtasia-style — drag its handle (right where the clips meet) to resize it, or
+  use the Inspector's Duration slider.
 - **Inspector** (search box on top; click a section title to collapse it) shows only what the
   selected clip has: rotation, opacity and framing (position and size are set on the preview);
   **crop** (sliders, or drag the edges on the canvas); the frame styles, animations, transition and
   zooms it got from Effects, each with its settings and a ✕ to remove it; color (brightness, contrast,
-  saturation, warmth, plus one-click **grade presets** — cinematic, studio, vivid & flat, vintage &
-  mood looks, previewed on the clip's own thumbnail); speed; volume and fades; **range volume** (change or mute just the selected range
+  saturation, warmth, plus a **lift / gamma / gain** three-way for shadows/mids/highlights, and one-click
+  **grade presets** — cinematic, studio, vivid & flat, vintage & mood looks, previewed on the clip's own
+  thumbnail); speed; volume and fades; **audio polish** — a 3-band EQ, a compressor and noise reduction, per
+  clip; **range volume** (change or mute just the selected range
   of a clip — each changed part keeps its own slider); text (Inter, Poppins, Hind Siliguri for Bangla) —
   **select words in the text box** to give just them their own color, weight, font, size, marker
   highlight or underline (styles stay on their words while you keep typing), and a **kinetic
@@ -173,7 +186,10 @@ Projects save automatically a couple of seconds after each change.
   anything Claude Code started, and refuses edits still on the way; your next message continues the conversation.
   The wand icon opens the **Skills manager**: reusable instruction blocks (brand colors, a house style,
   a standing request) written once and switched on or off per conversation instead of retyping them.
-- **Export** to MP4 (H.264 + AAC) with progress, time left and cancel. The export uses the same
+- **Export** to MP4 (H.264 + AAC) with progress, time left and cancel. Pick a **delivery preset** — Web,
+  YouTube, Social (capped at 1080px wide for Instagram/TikTok/Reels), Archive master, or Custom for your
+  own quality — each sets the right bitrate, resolution cap and loudness target; **"Also as …"** queues
+  further presets to export as a batch right after the current one. The export uses the same
   renderer as the preview, and a cancelled or failed export leaves no broken file.
 - **Settings** (gear in the title bar, the app menu, or `Ctrl+,`): preview quality — **Auto**
   (sharp while paused, lighter during playback when the computer can't keep up), Full, High,
@@ -182,6 +198,10 @@ Projects save automatically a couple of seconds after each change.
   muted, the default export quality, and the folder for new projects. Changes apply right away.
 - **Other AI apps** (Claude Desktop, Cursor, …) can connect to the MCP server shown in the
   Connect AI dialog (`http://127.0.0.1:47822/mcp`) while the app is open.
+- **Keyboard shortcuts** (keyboard icon in the title bar, the app menu, or `Ctrl+/`): a reference
+  card for every shortcut, grouped by file, edit, playback, timeline and view.
+- **Unsaved changes are never discarded silently**: New, Close, Open and Quit ask first — Save,
+  Don't save or Cancel — whenever the open project has edits that haven't been saved yet.
 
 ### Keyboard
 
@@ -206,12 +226,30 @@ Projects save automatically a couple of seconds after each change.
 | Ctrl+Backspace · Ctrl+Delete | In text boxes: delete the word before · after the cursor |
 | Ctrl+N · Ctrl+O · Ctrl+S · Ctrl+Shift+S | New · open · save · save as |
 | Ctrl+I · Ctrl+E · Ctrl+K · Ctrl+, | Import · export · assistant · settings |
+| Ctrl+/ | Keyboard shortcuts |
 | Esc | Close a dialog, cancel a rename, leave zoom/crop editing, clear the selection |
+
+### Building
+
+- **Quick local test build** — just the exe, nothing else: `cargo build -p studio --release` builds
+  it into `target\release\ai-video-studio.exe` (Cargo's own build cache — don't hand-edit anything
+  else under `target\`). To get one clean, versioned file instead of digging through `target\`:
+  - **Windows**: `powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1`
+  - **Linux**: `scripts/build-release.sh`
+
+  Either one builds release and copies just the binary to `build\ai-video-studio-v<version>.exe`
+  (or `build/ai-video-studio-v<version>` on Linux) — a separate folder from Cargo's own
+  `target\release\`, cleared and rewritten each time so it never accumulates old builds. This exe
+  still finds FFmpeg the normal way (see `AIVE_FFMPEG_DIR` above), so it works for local testing but
+  isn't meant to be copied to another machine on its own — use Packaging below for that.
 
 ### Packaging
 
-- **Windows**: `powershell -ExecutionPolicy Bypass -File scriptspackage-studio.ps1` (add `-Zip`
-  for a .zip) builds `distAI Video Studio` — the app with its icon, bundled FFmpeg, icon files
+For a standalone package to hand to someone else (bundles FFmpeg so they don't need to install
+anything):
+
+- **Windows**: `powershell -ExecutionPolicy Bypass -File scripts\package-studio.ps1` (add `-Zip`
+  for a .zip) builds `dist\AI Video Studio\` — the app with its icon, bundled FFmpeg, icon files
   and licenses. Close the app running from that folder first.
 - **Linux**: `scripts/package-studio.sh` builds `dist/ai-video-studio-linux-<arch>/` and a `.tar.gz`
   with the app, the icon in every size, a desktop entry and `install.sh` (installs to `~/.local`,

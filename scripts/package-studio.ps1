@@ -23,7 +23,9 @@ foreach ($f in "ffmpeg.exe", "ffprobe.exe", "LICENSE.txt") {
     if (-not (Test-Path $src)) { throw "Missing $src - see README (Setup)" }
     Copy-Item $src (Join-Path $out "ffmpeg")
 }
-Copy-Item "studio\assets\fonts\LICENSE-Inter.txt" (Join-Path $out "licenses")
+foreach ($f in "LICENSE-Inter.txt", "LICENSE-Poppins.txt", "LICENSE-HindSiliguri.txt") {
+    Copy-Item (Join-Path "studio\assets\fonts" $f) (Join-Path $out "licenses")
+}
 Copy-Item "studio\assets\icons\LICENSE-lucide.txt" (Join-Path $out "licenses")
 
 # The icon as files too (.ico for shortcuts, PNGs for anything else).

@@ -277,19 +277,19 @@ impl Overlay<'_> {
         self.scene.layers.iter().rev().find(|l| contains(l, p) && !self.locked(l.clip))
     }
 
-    /// Shapes, markers and blur boxes resize from every corner and side.
+    /// Shapes, markers, blur and mask boxes resize from every corner and side.
     fn stretchable(&self, clip: Id) -> bool {
-        self.project.clip(clip).is_some_and(|c| matches!(c.content, Content::Shape(_) | Content::Blur(_)))
+        self.project.clip(clip).is_some_and(|c| matches!(c.content, Content::Shape(_) | Content::Blur(_) | Content::Mask(_)))
     }
 
-    /// Media and shapes have rounded corners; text and blur boxes don't.
+    /// Media and shapes have rounded corners; text, blur and mask boxes don't.
     fn roundable(&self, clip: Id) -> bool {
-        self.project.clip(clip).is_some_and(|c| !matches!(c.content, Content::Text(_) | Content::Blur(_)))
+        self.project.clip(clip).is_some_and(|c| !matches!(c.content, Content::Text(_) | Content::Blur(_) | Content::Mask(_)))
     }
 
-    /// Blur boxes stay upright, so they have no rotation knob.
+    /// Blur and mask boxes stay upright, so they have no rotation knob.
     fn rotatable(&self, clip: Id) -> bool {
-        self.project.clip(clip).is_some_and(|c| !matches!(c.content, Content::Blur(_)))
+        self.project.clip(clip).is_some_and(|c| !matches!(c.content, Content::Blur(_) | Content::Mask(_)))
     }
 
     /// The corner-radius dot, inside the top-left corner.
@@ -408,6 +408,7 @@ impl canvas::Program<Message> for Overlay<'_> {
                     let boxed = match &clip.content {
                         Content::Shape(s) => Some((s.width, s.height)),
                         Content::Blur(b) => Some((b.width, b.height)),
+                        Content::Mask(m) => Some((m.width, m.height)),
                         _ => None,
                     };
                     if let Some((width, height)) = boxed {
@@ -691,6 +692,7 @@ impl canvas::Program<Message> for Overlay<'_> {
             let size = self.project.clip(l.clip).and_then(|c| match &c.content {
                 Content::Shape(sh) => Some((sh.width, sh.height)),
                 Content::Blur(b) => Some((b.width, b.height)),
+                Content::Mask(m) => Some((m.width, m.height)),
                 _ => None,
             });
             if let (Some(Drag::ShapeBox { .. }), Some((w, h))) = (state.drag, size) {
@@ -852,7 +854,7 @@ mod tests {
     fn layer(clip: Id, center: [f32; 2], size: [f32; 2]) -> LayerSpec {
         LayerSpec {
             clip, slot: 1, frame: None, center, size, rotation: 0.0, opacity: 1.0, radius: 0.0, border: 0.0, border_color: [0.0; 4],
-            shadow_blur: 0.0, shadow_y: 0.0, shadow_color: [0.0; 4], uv: [0.0, 0.0, 1.0, 1.0], tint_top: [1.0; 4], tint_bottom: [1.0; 4], grade: [0.0; 4], shape: [0.0; 4], blurs: [[0.0; 8]; crate::clip::MAX_BLURS], blurrable: false, blur_box: None,
+            shadow_blur: 0.0, shadow_y: 0.0, shadow_color: [0.0; 4], uv: [0.0, 0.0, 1.0, 1.0], tint_top: [1.0; 4], tint_bottom: [1.0; 4], grade: [0.0; 4], grade2: [0.0; 4], shape: [0.0; 4], blurs: [[0.0; 8]; crate::clip::MAX_BLURS], masks: [[0.0; 8]; crate::clip::MAX_MASKS], blurrable: false, blur_box: None, mask_box: None,
         }
     }
 

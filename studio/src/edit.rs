@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
 
-use crate::clip::{CalloutLayer, Clip, Content, Motion, MotionKind, Part, Shadow, ShapeLayer, TextLayer, Transition, TransitionKind, Zoom};
+use crate::clip::{CalloutLayer, Clip, Content, Grade, Motion, MotionKind, Part, Shadow, ShapeLayer, TextLayer, Transition, TransitionKind, Zoom};
 use crate::media::ProbeInfo;
 use crate::model::{Asset, Id, MediaKind, Project, Track, TrackKind};
 
@@ -137,6 +137,14 @@ impl Project {
             self.unapply_transition(dep);
         }
         self.unapply_transition(id);
+    }
+
+    /// Replaces clip `id`'s color grade wholesale (used by grade presets, and to paste a grade
+    /// copied from another clip).
+    pub fn set_grade(&mut self, id: Id, grade: Grade) -> anyhow::Result<()> {
+        self.ensure_unlocked(id)?;
+        self.clip_mut(id)?.grade = grade;
+        Ok(())
     }
 
     /// Sets, resizes, or (with `kind: None`) removes the transition from clip `id`'s immediately
@@ -328,6 +336,12 @@ impl Project {
     /// A blur box over whatever is below it, from `start` for `duration` seconds.
     pub fn add_blur_clip(&mut self, track: Option<Id>, start: f64, duration: f64, blur: crate::clip::BlurLayer) -> anyhow::Result<Id> {
         self.add_clip(Content::Blur(blur), track, start, duration)
+    }
+
+    /// A mask box restricting whatever is below it to only its shape (or, inverted, hiding
+    /// its shape), from `start` for `duration` seconds.
+    pub fn add_mask_clip(&mut self, track: Option<Id>, start: f64, duration: f64, mask: crate::clip::MaskLayer) -> anyhow::Result<Id> {
+        self.add_clip(Content::Mask(mask), track, start, duration)
     }
 
     /// A glowing icon accent: pops in by default and glows via the clip's own shadow.

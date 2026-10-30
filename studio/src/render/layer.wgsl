@@ -12,6 +12,7 @@ struct Layer {
     border_color: vec4<f32>, // sRGB
     shadow_color: vec4<f32>, // sRGB rgb + strength
     grade: vec4<f32>,        // brightness, contrast, saturation, temperature
+    grade2: vec4<f32>,       // lift, gamma, gain, unused
     canvas: vec4<f32>,       // width, height, target is sRGB (1/0), has texture (1/0)
     shape: vec4<f32>,        // outline kind, ring thickness, gradient kind (0 linear / 1 radial), gradient angle (rad)
     view: vec4<f32>,         // canvas px -> clip space: x * view.x + view.y, y * view.z + view.w
@@ -19,6 +20,10 @@ struct Layer {
     // (radius u, radius v, feather in uv, shape 0 rectangle / 1 ellipse). Radius 0 = unused.
     blur_rect: array<vec4<f32>, 4>,
     blur_params: array<vec4<f32>, 4>,
+    // Masked areas of the source (up to 4): rect (u0, v0, u1, v1) then
+    // (feather in uv, shape 0 rectangle / 1 ellipse, invert 0/1, edge fade 0..1). Feather 0 = unused.
+    mask_rect: array<vec4<f32>, 4>,
+    mask_params: array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<uniform> layer: Layer;
@@ -128,6 +133,28 @@ fn blur_mask(i: i32, uv: vec2<f32>) -> f32 {
     return 1.0 - smoothstep(-feather, feather, d);
 }
 
+// How visible mask area `i` leaves source point `uv` (0..1, soft at the edge): 1 inside (or
+// outside, if inverted), blended toward fully visible by the clip's own edge fade.
+fn mask_visibility(i: i32, uv: vec2<f32>) -> f32 {
+    let r = layer.mask_rect[i];
+    let p = layer.mask_params[i];
+    let feather = max(p.x, 1e-4);
+    let c = (r.xy + r.zw) * 0.5;
+    let half = max((r.zw - r.xy) * 0.5, vec2<f32>(1e-4));
+    var d: f32;
+    if (p.y > 0.5) {
+        d = (length((uv - c) / half) - 1.0) * min(half.x, half.y);
+    } else {
+        let q = abs(uv - c) - half;
+        d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
+    }
+    var inside = 1.0 - smoothstep(-feather, feather, d);
+    if (p.z > 0.5) {
+        inside = 1.0 - inside;
+    }
+    return mix(1.0, inside, p.w);
+}
+
 // Gaussian-weighted 9×9 samples around `uv`, `radius` in uv units.
 fn blurred(uv: vec2<f32>, radius: vec2<f32>) -> vec4<f32> {
     var acc = vec4<f32>(0.0);
@@ -157,9 +184,9 @@ fn to_srgb(c: vec3<f32>) -> vec3<f32> {
     return select(hi, lo, c <= vec3<f32>(0.0031308));
 }
 
-fn apply_grade(rgb_in: vec3<f32>, g: vec4<f32>) -> vec3<f32> {
+fn apply_grade(rgb_in: vec3<f32>, g: vec4<f32>, g2: vec4<f32>) -> vec3<f32> {
     var rgb = rgb_in;
-    if (g.x != 0.0 || g.y != 0.0 || g.z != 0.0 || g.w != 0.0) {
+    if (g.x != 0.0 || g.y != 0.0 || g.z != 0.0 || g.w != 0.0 || g2.x != 0.0 || g2.y != 0.0 || g2.z != 0.0) {
         // Grade in display space, where these controls feel natural.
         var c = to_srgb(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)));
         c = c + vec3<f32>(g.x * 0.5);
@@ -167,6 +194,12 @@ fn apply_grade(rgb_in: vec3<f32>, g: vec4<f32>) -> vec3<f32> {
         let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
         c = mix(vec3<f32>(luma), c, 1.0 + g.z);
         c = c * vec3<f32>(1.0 + g.w * 0.12, 1.0 + g.w * 0.02, 1.0 - g.w * 0.12);
+        c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+        // Lift/gamma/gain: three-way color correction targeting shadows, mids and highlights
+        // separately (lift pulls up the darks, gamma reshapes the mids, gain scales the highs).
+        c = c + vec3<f32>(g2.x) * (1.0 - c) * (1.0 - c);
+        c = pow(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / exp(g2.y)));
+        c = c * (1.0 + g2.z * c);
         rgb = to_linear(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));
     }
     return rgb;
@@ -183,6 +216,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let cover = clamp(0.5 - d / aa, 0.0, 1.0);
 
     var texel = vec4<f32>(1.0);
+    var mask_vis = 1.0;
     if (layer.canvas.w > 0.5) {
         let f = in.local / max(half, vec2<f32>(0.0001)) * 0.5 + 0.5;
         let suv = mix(layer.uv.xy, layer.uv.zw, f);
@@ -196,6 +230,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 }
             }
         }
+        var mask_active = false;
+        for (var i = 0; i < 4; i++) {
+            if (layer.mask_params[i].x > 0.0) {
+                let v = mask_visibility(i, suv);
+                mask_vis = select(v, max(mask_vis, v), mask_active);
+                mask_active = true;
+            }
+        }
     }
     // Gradient position: along the angle (CSS-style, 180° = top to bottom) or out from the center.
     let n = in.local / max(half, vec2<f32>(0.0001));
@@ -205,8 +247,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         g = clamp(length(n), 0.0, 1.0);
     }
     let tint = mix(layer.tint_top, layer.tint_bottom, g);
-    var rgb = apply_grade(texel.rgb * to_linear(tint.rgb), layer.grade);
-    var a = texel.a * tint.a;
+    var rgb = apply_grade(texel.rgb * to_linear(tint.rgb), layer.grade, layer.grade2);
+    var a = texel.a * tint.a * mask_vis;
 
     if (border > 0.0) {
         let inside = clamp(0.5 - (d + border) / aa, 0.0, 1.0);

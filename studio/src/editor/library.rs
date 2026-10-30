@@ -54,6 +54,7 @@ impl Editor {
                 .into()
             }
             LibraryTab::Transitions => self.effects_tab(),
+            LibraryTab::Animation => self.animation_tab(),
             LibraryTab::Sounds => self.sounds_tab(),
         }
     }
@@ -171,13 +172,26 @@ impl Editor {
 
 
     fn effects_tab(&self) -> Element<'_, Message> {
+        let groups: Vec<EffectGroup> = catalog().into_iter().filter(|g| !is_animation_group(g.title)).collect();
+        self.effect_groups_view(groups)
+    }
+
+    fn animation_tab(&self) -> Element<'_, Message> {
+        let groups: Vec<EffectGroup> = catalog().into_iter().filter(|g| is_animation_group(g.title)).collect();
+        self.effect_groups_view(groups)
+    }
+
+    /// Shared by the Effects and Animation tabs: a Favorites shelf on top, then every group
+    /// (from the given subset of `catalog()`) as a collapsible card grid.
+    fn effect_groups_view(&self, groups: Vec<EffectGroup>) -> Element<'_, Message> {
         let has_selection = !self.selection.is_empty();
         // Click applies to the selection; drag drops onto any clip (timeline or preview).
         // The star in the corner keeps an effect in Favorites.
         let card = |glyph: char, label: &'static str, caption: Option<&'static str>, effect: Effect| -> Element<'_, Message> {
             let hovered = self.effect_hover == Some(effect);
             let favorite = self.favorite_effects.iter().any(|k| *k == effect.key());
-            let mut info = column![container(icon(glyph, 18).color(ACCENT_HOVER)).center_x(Fill).height(30).align_y(Alignment::Center), text(label).font(INTER_MEDIUM).size(T_SMALL)].spacing(4).align_x(Alignment::Center);
+            let glyph_row = row![space().width(5), icon(glyph, 18).color(ACCENT_HOVER)].align_y(Alignment::Center);
+            let mut info = column![container(glyph_row).center_x(Fill).height(30).align_y(Alignment::Center), text(label).font(INTER_MEDIUM).size(T_SMALL)].spacing(4).align_x(Alignment::Center);
             if let Some(c) = caption {
                 info = info.push(text(c).size(T_CAPTION).color(TEXT_3));
             }
@@ -187,7 +201,7 @@ impl Editor {
                 .style(style::ghost)
                 .on_press(Message::ToggleFavoriteEffect(effect));
             let star = widgets::tip(star, if favorite { "Remove from favorites" } else { "Add to favorites" }, None, iced::widget::tooltip::Position::Top);
-            let card = stack![body, container(star).align_right(Fill).padding(2)];
+            let card = stack![body, container(star).align_right(Fill).padding(6)];
             mouse_area(card)
                 .on_press(Message::EffectPress(effect))
                 .on_release(Message::EffectClick(effect))
@@ -203,7 +217,6 @@ impl Editor {
         let mut col = column![text(hint).size(T_CAPTION).color(TEXT_3)].spacing(S3);
 
         // Favorites: always open, on top.
-        let groups = catalog();
         let favorites: Vec<Element<'_, Message>> = self
             .favorite_effects
             .iter()
@@ -236,14 +249,16 @@ impl Editor {
             .on_press(Message::ToggleEffectGroup(g.title));
             let mut group = column![head].spacing(S2);
             if open {
+                let mut body = column![].spacing(S2);
                 if g.title == MARKERS {
-                    group = group.push(self.marker_swatches());
+                    body = body.push(self.marker_swatches());
                 }
-                group = group.push(grid(g.items.iter().map(|&(glyph, label, effect)| card(glyph, label, None, effect)).collect()));
+                body = body.push(grid(g.items.iter().map(|&(glyph, label, effect)| card(glyph, label, None, effect)).collect()));
                 if g.title == MARKERS {
                     let timeline_marker = widgets::secondary_button(Some(code::FLAG), "Add timeline marker", Some(Message::AddMarker)).width(Fill);
-                    group = group.push(widgets::tip(timeline_marker, "A colored flag on the ruler (or a span over the marked range)", Some("Shift+M"), iced::widget::tooltip::Position::Top));
+                    body = body.push(widgets::tip(timeline_marker, "A colored flag on the ruler (or a span over the marked range)", Some("Shift+M"), iced::widget::tooltip::Position::Top));
                 }
+                group = group.push(container(body).padding(iced::Padding { top: 0.0, right: 10.0, bottom: 10.0, left: 10.0 }));
             }
             col = col.push(container(group).width(Fill).style(style::inset));
         }
@@ -312,6 +327,8 @@ pub enum Effect {
     Intro(MotionKind),
     Outro(MotionKind),
     Blur,
+    /// Isolates (or, inverted, hides) part of the picture inside a box.
+    Mask,
     Highlight(Highlight),
     /// Rounded corners, a border or a drop shadow on a picture.
     Frame(FrameStyle),
@@ -350,6 +367,11 @@ pub enum FrameStyle {
 /// The marker group of the Effects tab (it also has the color swatches).
 pub const MARKERS: &str = "Markers";
 
+/// The `catalog()` groups shown on the Animation tab instead of the Effects tab.
+fn is_animation_group(title: &str) -> bool {
+    title == "Animate in" || title == "Animate out" || title == "Zoom & pan"
+}
+
 /// One group of the Effects tab: its title and its effects (icon, name, effect).
 pub struct EffectGroup {
     pub title: &'static str,
@@ -377,7 +399,7 @@ pub fn catalog() -> Vec<EffectGroup> {
                 (code::MINUS, "Underline", Effect::Highlight(Highlight::Underline)),
             ],
         },
-        EffectGroup { title: "Hide", items: vec![(code::DROPLETS, "Blur area", Effect::Blur)] },
+        EffectGroup { title: "Hide", items: vec![(code::DROPLETS, "Blur area", Effect::Blur), (code::SCAN_EYE, "Mask area", Effect::Mask)] },
         EffectGroup {
             title: "Frame",
             items: vec![
@@ -426,6 +448,7 @@ impl Effect {
             Effect::Intro(k) => format!("in:{k:?}"),
             Effect::Outro(k) => format!("out:{k:?}"),
             Effect::Blur => "blur".into(),
+            Effect::Mask => "mask".into(),
             Effect::Highlight(h) => format!("marker:{h:?}"),
             Effect::Frame(f) => format!("frame:{f:?}"),
             Effect::Zoom => "zoom".into(),

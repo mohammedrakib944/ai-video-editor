@@ -264,6 +264,13 @@ same instant — for a checklist, feature cards or bullet points entering togeth
             &["start", "x", "y", "width", "height"],
         ),
         tool("update_blur", "Change a blur clip's box or strength. Only the fields you pass change. Change its timing with move_clip / trim_clip.", json!({ "clip_id": int(""), "x": num("Canvas fraction"), "y": num("Canvas fraction"), "width": num("Canvas fraction"), "height": num("Canvas fraction"), "strength": num("0–100"), "ellipse": boolean("") }), &["clip_id"]),
+        tool(
+            "add_mask",
+            "Isolate part of the picture for a time range (a face, a product, a speaker): a mask clip on a video track that shows only the video and images under it, only inside its box and only between start and end (everywhere else is hidden). Set invert to flip it into a cutout that hides the box instead. Move or trim it like any clip (move_clip, trim_clip); keyframe its X/Y (set_keyframes) to follow a moving subject; remove it with delete_clips. Returns the clip id.",
+            json!({ "start": num("Timeline seconds"), "end": num("Timeline seconds (default start + 3)"), "x": num("Box center, fraction of the canvas width"), "y": num("Box center, fraction of the canvas height"), "width": num("Fraction of the canvas width"), "height": num("Fraction of the canvas height"), "feather": num("Edge softness, 0–100, default 15"), "ellipse": boolean("Oval instead of a box, default true"), "invert": boolean("Hide the box instead of isolating it"), "track_id": int("Optional video track; it must be above the footage to mask (default: a free top track)") }),
+            &["start", "x", "y", "width", "height"],
+        ),
+        tool("update_mask", "Change a mask clip's box, feather or invert. Only the fields you pass change. Change its timing with move_clip / trim_clip.", json!({ "clip_id": int(""), "x": num("Canvas fraction"), "y": num("Canvas fraction"), "width": num("Canvas fraction"), "height": num("Canvas fraction"), "feather": num("0–100"), "ellipse": boolean(""), "invert": boolean("") }), &["clip_id"]),
         tool("separate_audio", "Put the sound of a video clip on an audio track of its own (same timing and volume); the video keeps playing silently. Returns the new audio clip id.", json!({ "clip_id": int("") }), &["clip_id"]),
         tool("add_marker", "Add a timeline marker: a colored flag at a time, or a span when duration > 0. Markers organize the edit (sections, notes); they don't show in the video. Returns the marker id.", json!({ "time": num("Timeline seconds"), "duration": num("Seconds, 0 for a point (default)"), "name": string("Label"), "color": string("#RRGGBB") }), &["time"]),
         tool("update_marker", "Change a timeline marker.", json!({ "marker_id": int(""), "time": num(""), "duration": num(""), "name": string(""), "color": string("#RRGGBB") }), &["marker_id"]),
@@ -602,6 +609,7 @@ fn kind_name(p: &Project, c: &Clip) -> &'static str {
         Content::Text(_) => "text",
         Content::Shape(_) => "shape",
         Content::Blur(_) => "blur",
+        Content::Mask(_) => "mask",
         Content::Callout(_) => "callout",
         Content::Counter(_) => "counter",
         Content::Media { .. } if c.part == crate::clip::Part::Sound => "audio",
@@ -706,6 +714,11 @@ impl Editor {
                     let (cw, ch) = p.canvas.size();
                     let per = cw.min(ch) as f64 / 1080.0;
                     m.insert("blur".into(), json!({ "width": r3(b.width * per / cw as f64), "height": r3(b.height * per / ch as f64), "strength": b.strength, "ellipse": b.ellipse }));
+                }
+                if let Content::Mask(mask) = &c.content {
+                    let (cw, ch) = p.canvas.size();
+                    let per = cw.min(ch) as f64 / 1080.0;
+                    m.insert("mask".into(), json!({ "width": r3(mask.width * per / cw as f64), "height": r3(mask.height * per / ch as f64), "feather": mask.feather, "ellipse": mask.ellipse, "invert": mask.invert }));
                 }
                 if let Content::Callout(cal) = &c.content {
                     m.insert("icon".into(), json!(format!("{:?}", cal.icon).to_lowercase()));
@@ -1165,6 +1178,62 @@ impl Editor {
                 })?;
                 Ok("Updated blur".into())
             })(),
+            "add_mask" => (|| {
+                let start = req_f(&a, "start")?;
+                let end = f(&a, "end").unwrap_or(start + 3.0);
+                anyhow::ensure!(end - start >= 0.1, "The mask must last at least 0.1 s");
+                let (x, y, w, h) = (req_f(&a, "x")?, req_f(&a, "y")?, req_f(&a, "width")?, req_f(&a, "height")?);
+                let (cw, ch) = self.doc.project.canvas.size();
+                let per = 1080.0 / cw.min(ch) as f64;
+                let layer = crate::clip::MaskLayer {
+                    width: (w * cw as f64 * per).clamp(4.0, 4000.0),
+                    height: (h * ch as f64 * per).clamp(4.0, 4000.0),
+                    feather: f(&a, "feather").unwrap_or(15.0).clamp(0.0, 100.0),
+                    ellipse: a.get("ellipse").and_then(Value::as_bool).unwrap_or(true),
+                    invert: a.get("invert").and_then(Value::as_bool).unwrap_or(false),
+                };
+                let track = id(&a, "track_id");
+                let clip = self.ai_edit("Add mask", |p| {
+                    let id = p.add_mask_clip(track, start, end - start, layer)?;
+                    let c = p.clip_mut(id)?;
+                    (c.transform.x, c.transform.y) = (x, y);
+                    Ok(id)
+                })?;
+                self.selection = vec![clip];
+                Ok(format!("Added mask clip {clip}"))
+            })(),
+            "update_mask" => (|| {
+                let clip = req_id(&a, "clip_id")?;
+                let (cw, ch) = self.doc.project.canvas.size();
+                let per = 1080.0 / cw.min(ch) as f64;
+                self.ai_edit("Update mask", |p| {
+                    let c = p.clip_mut(clip)?;
+                    let Content::Mask(mask) = &mut c.content else { anyhow::bail!("Clip {clip} is not a mask") };
+                    if let Some(v) = f(&a, "width") {
+                        mask.width = (v * cw as f64 * per).clamp(4.0, 4000.0);
+                    }
+                    if let Some(v) = f(&a, "height") {
+                        mask.height = (v * ch as f64 * per).clamp(4.0, 4000.0);
+                    }
+                    if let Some(v) = f(&a, "feather") {
+                        mask.feather = v.clamp(0.0, 100.0);
+                    }
+                    if let Some(v) = a.get("ellipse").and_then(Value::as_bool) {
+                        mask.ellipse = v;
+                    }
+                    if let Some(v) = a.get("invert").and_then(Value::as_bool) {
+                        mask.invert = v;
+                    }
+                    if let Some(v) = f(&a, "x") {
+                        c.transform.x = v;
+                    }
+                    if let Some(v) = f(&a, "y") {
+                        c.transform.y = v;
+                    }
+                    Ok(())
+                })?;
+                Ok("Updated mask".into())
+            })(),
             "separate_audio" => (|| {
                 let clip = req_id(&a, "clip_id")?;
                 let sound = self.ai_edit("Separate audio", |p| p.separate_audio(clip))?;
@@ -1312,7 +1381,10 @@ impl Editor {
             }),
             "get_export_status" => Ok(match self.export.as_ref().map(|e| &e.phase) {
                 Some(super::export_dialog::Phase::Running { done, total, .. }) => format!("Rendering: {done}/{total} frames"),
-                Some(super::export_dialog::Phase::Done { path, .. }) => format!("Done: {}", path.display()),
+                Some(super::export_dialog::Phase::Done { items, .. }) => match items.as_slice() {
+                    [(path, _)] => format!("Done: {}", path.display()),
+                    many => format!("Done: {} files ({})", many.len(), many.iter().map(|(p, _)| p.display().to_string()).collect::<Vec<_>>().join(", ")),
+                },
                 Some(super::export_dialog::Phase::Failed(e)) => format!("Failed: {e}"),
                 _ => "No export running".into(),
             }),

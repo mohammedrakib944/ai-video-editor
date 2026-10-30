@@ -21,6 +21,7 @@ pub enum Message {
     Open,
     OpenRecent(PathBuf),
     ForgetRecent(PathBuf),
+    TryExample,
 }
 
 pub struct Start {
@@ -92,6 +93,7 @@ impl Start {
                 widgets::secondary_button(Some(code::FOLDER_OPEN), "Open…", Some(Message::Open)).padding([11, 16]).height(Length::Shrink),
             ]
             .spacing(S2),
+            container(widgets::ghost_button(Some(code::SPARKLES), "Try an example project first", Some(Message::TryExample)).padding([6, 10])).center_x(Fill),
         ]
         .spacing(S5);
         container(body).padding(S6).width(Length::FillPortion(11)).style(style::card).into()

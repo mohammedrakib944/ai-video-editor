@@ -54,18 +54,25 @@ pub struct LayerSpec {
     pub tint_bottom: [f32; 4],
     /// Brightness, contrast, saturation, temperature (0 = unchanged).
     pub grade: [f32; 4],
+    /// Lift, gamma, gain (0 = unchanged), fourth component unused.
+    pub grade2: [f32; 4],
     /// Outline: kind (0 rectangle, 1 ellipse, 2 triangle, 3 star, 4 hexagon, 5 ring),
     /// ring thickness in px, gradient kind (0 linear, 1 radial), gradient angle in radians.
     pub shape: [f32; 4],
     /// Blurred areas: (u0, v0, u1, v1, radius u, radius v, feather, ellipse), radius 0 = unused.
     pub blurs: [[f32; 8]; MAX_BLURS],
-    /// Video and images: blur clips above can blur this layer.
+    /// Mask areas: (u0, v0, u1, v1, feather, ellipse, invert, edge fade), feather 0 = unused.
+    pub masks: [[f32; 8]; MAX_MASKS],
+    /// Video and images: blur and mask clips above can affect this layer.
     pub blurrable: bool,
     /// A blur clip (drawn invisibly; it blurs the layers below): strength in canvas px, ellipse (1/0).
     pub blur_box: Option<[f32; 2]>,
+    /// A mask clip (drawn invisibly; it masks the layers below): feather in canvas px, ellipse (1/0),
+    /// invert (1/0), edge fade (0 at the clip's own fade-in/out edges, else 1).
+    pub mask_box: Option<[f32; 4]>,
 }
 
-pub use crate::clip::MAX_BLURS;
+pub use crate::clip::{MAX_BLURS, MAX_MASKS};
 
 #[derive(Debug, Clone)]
 pub struct Scene {
@@ -107,13 +114,18 @@ pub fn evaluate(project: &Project, t: f64, size: (u32, u32), sources: &dyn Sourc
     Scene { width: size.0, height: size.1, background: [0.0, 0.0, 0.0, 1.0], layers }
 }
 
-/// Pushes a layer, letting a blur clip blur what's already below it on this track.
+/// Pushes a layer, letting a blur or mask clip affect what's already below it on this track.
 fn push_layer(layers: &mut Vec<LayerSpec>, layer: LayerSpec) {
     if let Some([radius, ellipse]) = layer.blur_box {
         if radius > 0.0 {
             for below in layers.iter_mut().filter(|l: &&mut LayerSpec| l.blurrable) {
                 blur_under(below, layer.center, layer.size, radius, ellipse);
             }
+        }
+        layers.push(LayerSpec { opacity: 0.0, ..layer });
+    } else if let Some([feather, ellipse, invert, edge]) = layer.mask_box {
+        for below in layers.iter_mut().filter(|l: &&mut LayerSpec| l.blurrable) {
+            mask_under(below, layer.center, layer.size, feather, ellipse, invert, edge);
         }
         layers.push(LayerSpec { opacity: 0.0, ..layer });
     } else {
@@ -135,7 +147,7 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
     let mut x = animated(Prop::X, tr.x) as f32 * w;
     let mut y = animated(Prop::Y, tr.y) as f32 * h;
     let mut scale = animated(Prop::Scale, tr.scale) as f32;
-    let rotation = if matches!(clip.content, Content::Blur(_)) { 0.0 } else { (animated(Prop::Rotation, tr.rotation) as f32).to_radians() };
+    let rotation = if matches!(clip.content, Content::Blur(_) | Content::Mask(_)) { 0.0 } else { (animated(Prop::Rotation, tr.rotation) as f32).to_radians() };
     let mut opacity = animated(Prop::Opacity, tr.opacity) as f32;
     let mut uv = [0.0f32, 0.0, 1.0, 1.0];
 
@@ -239,6 +251,7 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
             (None, natural, 0, top, bottom, false)
         }
         Content::Blur(b) => (None, [(b.width as f32 * unit).max(1.0), (b.height as f32 * unit).max(1.0)], 0, [0.0; 4], [0.0; 4], false),
+        Content::Mask(m) => (None, [(m.width as f32 * unit).max(1.0), (m.height as f32 * unit).max(1.0)], 0, [0.0; 4], [0.0; 4], false),
         Content::Callout(c) => {
             let icon_layer = TextLayer { text: callout_glyph(c.icon).to_string(), font: "lucide".into(), size: c.size, color: c.color, padding: 0.0, ..Default::default() };
             let frame = sources.text(&icon_layer, unit, local)?;
@@ -362,8 +375,10 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
         tint_top,
         tint_bottom,
         grade: [g.brightness as f32, g.contrast as f32, g.saturation as f32, g.temperature as f32],
+        grade2: [g.lift as f32, g.gamma as f32, g.gain as f32, 0.0],
         shape,
         blurs: [[0.0; 8]; MAX_BLURS],
+        masks: [[0.0; 8]; MAX_MASKS],
         blurrable: is_media,
         blur_box: match clip.content {
             // Strength 100 is a 60 px radius at 1080p; it fades in and out with the clip.
@@ -374,13 +389,22 @@ fn clip_layer(project: &Project, clip: &Clip, t: f64, w: f32, h: f32, unit: f32,
             }
             _ => None,
         },
+        mask_box: match clip.content {
+            // Fades in and out with the clip, same as a blur box.
+            Content::Mask(m) => {
+                let fade = clip::BLUR_FADE.min(clip.duration / 2.0).max(1e-4);
+                let edge = (local / fade).min((clip.duration - local) / fade).clamp(0.0, 1.0) as f32;
+                let feather = (m.feather.clamp(0.0, 100.0) as f32 / 100.0 * 80.0 * unit).max(1.0);
+                Some([feather, if m.ellipse { 1.0 } else { 0.0 }, if m.invert { 1.0 } else { 0.0 }, edge * opacity.clamp(0.0, 1.0)])
+            }
+            _ => None,
+        },
     })
 }
 
-/// Blurs the part of `target` under a blur box (canvas pixels), through the layer's
-/// rotation, crop and zoom, in the first free blur slot.
-fn blur_under(target: &mut LayerSpec, center: [f32; 2], size: [f32; 2], radius: f32, ellipse: f32) {
-    let Some(slot) = target.blurs.iter_mut().find(|b| b[4] == 0.0) else { return };
+/// Maps a box (canvas px, centered at `center`) into `target`'s own UV space, through its
+/// rotation, crop and zoom. `None` if the box misses the visible part of the layer entirely.
+fn uv_box(target: &LayerSpec, center: [f32; 2], size: [f32; 2]) -> Option<([f32; 2], [f32; 2])> {
     let [u0, v0, u1, v1] = target.uv;
     let (s, c) = (-target.rotation).sin_cos();
     let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
@@ -394,10 +418,31 @@ fn blur_under(target: &mut LayerSpec, center: [f32; 2], size: [f32; 2], radius: 
     }
     // Nothing to do if the box misses the visible part of the layer.
     if hi[0] <= u0.min(u1) || lo[0] >= u0.max(u1) || hi[1] <= v0.min(v1) || lo[1] >= v0.max(v1) {
-        return;
+        return None;
     }
+    Some((lo, hi))
+}
+
+/// Blurs the part of `target` under a blur box (canvas pixels), through the layer's
+/// rotation, crop and zoom, in the first free blur slot.
+fn blur_under(target: &mut LayerSpec, center: [f32; 2], size: [f32; 2], radius: f32, ellipse: f32) {
+    let [u0, v0, u1, v1] = target.uv;
+    let Some((lo, hi)) = uv_box(target, center, size) else { return };
+    let Some(slot) = target.blurs.iter_mut().find(|b| b[4] == 0.0) else { return };
     let (ru, rv) = (radius / target.size[0].max(1e-3) * (u1 - u0).abs(), radius / target.size[1].max(1e-3) * (v1 - v0).abs());
     *slot = [lo[0], lo[1], hi[0], hi[1], ru.max(1e-5), rv.max(1e-5), 0.003, ellipse];
+}
+
+/// Restricts (or, inverted, excludes) the part of `target` under a mask box (canvas pixels),
+/// through the layer's rotation, crop and zoom, in the first free mask slot. Note: if the box
+/// misses the layer entirely, the layer is left fully visible rather than fully hidden — same
+/// edge case as a blur box dragged off a layer, and just as rare in practice.
+fn mask_under(target: &mut LayerSpec, center: [f32; 2], size: [f32; 2], feather: f32, ellipse: f32, invert: f32, edge: f32) {
+    let [u0, v0, u1, v1] = target.uv;
+    let Some((lo, hi)) = uv_box(target, center, size) else { return };
+    let Some(slot) = target.masks.iter_mut().find(|m| m[4] == 0.0) else { return };
+    let (fu, fv) = (feather / target.size[0].max(1e-3) * (u1 - u0).abs(), feather / target.size[1].max(1e-3) * (v1 - v0).abs());
+    *slot = [lo[0], lo[1], hi[0], hi[1], fu.max(fv).max(1e-5), ellipse, invert, edge];
 }
 
 /// Text layers get their own texture slots, separate from media clip ids.
@@ -508,6 +553,25 @@ mod tests {
         assert_eq!(video.blurs[1][4], 0.0, "unused slots have no radius");
         assert_eq!(blur.opacity, 0.0, "the blur clip itself draws nothing");
         assert_eq!(evaluate(&p, 6.0, (1920, 1080), &NoSources, false).layers[0].blurs[0][4], 0.0, "and none after it ends");
+    }
+
+    #[test]
+    fn a_mask_clip_isolates_only_its_box_and_only_while_it_is_on() {
+        let (mut p, _) = project();
+        let m = p.add_mask_clip(None, 2.0, 3.0, clip::MaskLayer { width: 480.0, height: 270.0, feather: 20.0, ellipse: true, invert: false }).unwrap();
+        (p.clip_mut(m).unwrap().transform.x, p.clip_mut(m).unwrap().transform.y) = (0.25, 0.5);
+        let before = evaluate(&p, 1.0, (1920, 1080), &NoSources, false);
+        assert_eq!(before.layers.len(), 1);
+        assert_eq!(before.layers[0].masks[0][4], 0.0, "no mask before the mask clip starts");
+        let during = evaluate(&p, 3.0, (1920, 1080), &NoSources, false);
+        let (video, mask) = (&during.layers[0], &during.layers[1]);
+        let r = video.masks[0];
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        assert!(near(r[0], 0.125) && near(r[1], 0.375) && near(r[2], 0.375) && near(r[3], 0.625), "the box, in the footage's coordinates: {r:?}");
+        assert!(r[4] > 0.0 && r[5] == 1.0 && r[6] == 0.0, "has a feather, is an ellipse, not inverted");
+        assert_eq!(video.masks[1][4], 0.0, "unused slots have no feather");
+        assert_eq!(mask.opacity, 0.0, "the mask clip itself draws nothing");
+        assert_eq!(evaluate(&p, 6.0, (1920, 1080), &NoSources, false).layers[0].masks[0][4], 0.0, "and none after it ends");
     }
 
     #[test]

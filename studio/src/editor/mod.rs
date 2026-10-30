@@ -57,17 +57,19 @@ pub enum LibraryTab {
     Media,
     Text,
     Transitions,
+    Animation,
     Sounds,
 }
 
 impl LibraryTab {
-    const ALL: [LibraryTab; 4] = [LibraryTab::Media, LibraryTab::Text, LibraryTab::Transitions, LibraryTab::Sounds];
+    const ALL: [LibraryTab; 5] = [LibraryTab::Media, LibraryTab::Text, LibraryTab::Transitions, LibraryTab::Animation, LibraryTab::Sounds];
 
     fn label(self) -> &'static str {
         match self {
             LibraryTab::Media => "Media",
             LibraryTab::Text => "Text",
             LibraryTab::Transitions => "Effects",
+            LibraryTab::Animation => "Animation",
             LibraryTab::Sounds => "Sounds",
         }
     }
@@ -182,6 +184,10 @@ pub enum Message {
     SeparateAudio,
     /// Mute or unmute the sound of the selected clips.
     ToggleClipMute,
+    /// Copies the selected clip's color grade, to paste onto others later.
+    CopyColor,
+    /// Pastes the copied color grade onto every selected clip that has a picture.
+    PasteColor,
     SetRange(Option<(f64, f64)>),
     DropAsset { asset: Id, track: Option<Id>, t: f64 },
     /// An effect card was pressed (a drag may follow), released without dragging, or hovered.
@@ -271,12 +277,15 @@ pub enum Message {
     ExportBrowse,
     ExportBrowsed(Option<PathBuf>),
     ExportQuality(crate::render::export::Quality),
+    ExportPreset(crate::render::export::Preset),
+    ExportQueueAddPreset(crate::render::export::Preset),
+    ExportQueueRemove(usize),
     StartExport,
     ExportProgress(crate::render::export::Progress),
     CancelExport,
     ExportRetry,
-    RevealExport,
-    PlayExport,
+    RevealExport(usize),
+    PlayExport(usize),
     Noop,
 }
 
@@ -309,6 +318,8 @@ pub struct Editor {
     effect_hover: Option<library::Effect>,
     /// Color for new markers.
     marker_color: Rgba,
+    /// A clip's color grade, copied via its context menu, ready to paste onto another.
+    color_clipboard: Option<crate::clip::Grade>,
     /// The timeline marker shown in the inspector.
     selected_marker: Option<Id>,
     /// Inspector sections the user collapsed (by title), and the inspector search text.
@@ -419,6 +430,7 @@ impl Editor {
             effect_dnd: None,
             effect_hover: None,
             marker_color: Rgba::hex(library::MARKER_COLORS[0]),
+            color_clipboard: None,
             selected_marker: None,
             collapsed: Default::default(),
             favorite_effects: Vec::new(),
@@ -1202,7 +1214,10 @@ impl Editor {
                 }
                 let ids = std::mem::take(&mut self.selection);
                 if !ids.is_empty() {
-                    self.edit(if ids.len() == 1 { "Delete clip" } else { "Delete clips" }, |p| p.delete_clips(&ids));
+                    let count = ids.len();
+                    if self.edit(if count == 1 { "Delete clip" } else { "Delete clips" }, |p| p.delete_clips(&ids)).is_some() {
+                        self.notify(if count == 1 { "Clip deleted — Ctrl+Z to undo" } else { "Clips deleted — Ctrl+Z to undo" }, false);
+                    }
                 }
             }
             Message::DuplicateSelection => {
@@ -1319,6 +1334,25 @@ impl Editor {
                         }
                         Ok(())
                     });
+                }
+            }
+            Message::CopyColor => {
+                let p = &self.doc.project;
+                if let [id] = self.selection[..] {
+                    if let Some(c) = p.clip(id).filter(|c| p.clip_has_picture(c)) {
+                        self.color_clipboard = Some(c.grade);
+                        self.notify("Color copied", false);
+                    }
+                }
+            }
+            Message::PasteColor => {
+                let Some(grade) = self.color_clipboard else { return Task::none() };
+                let p = &self.doc.project;
+                let ids: Vec<Id> = self.selection.iter().copied().filter(|&id| p.clip(id).is_some_and(|c| p.clip_has_picture(c))).collect();
+                if ids.is_empty() {
+                    self.notify("Select a clip to paste the color onto", false);
+                } else {
+                    self.edit("Paste color", |p| ids.iter().try_for_each(|&id| p.set_grade(id, grade)));
                 }
             }
             Message::SetRange(r) => {
@@ -1764,9 +1798,34 @@ impl Editor {
                     e.quality = q;
                 }
             }
-            Message::StartExport => return self.start_export(),
+            Message::ExportPreset(p) => {
+                if let Some(e) = &mut self.export {
+                    e.preset = p;
+                }
+            }
+            Message::ExportQueueAddPreset(p) => {
+                if let Some(e) = &mut self.export {
+                    let path = e.suggest_path(p);
+                    e.queue.push(export_dialog::QueuedJob { preset: p, path });
+                }
+            }
+            Message::ExportQueueRemove(i) => {
+                if let Some(e) = &mut self.export {
+                    if i < e.queue.len() {
+                        e.queue.remove(i);
+                    }
+                }
+            }
+            Message::StartExport => {
+                if let Some(e) = &mut self.export {
+                    e.completed.clear();
+                    e.total_seconds = 0.0;
+                }
+                return self.start_export();
+            }
             Message::ExportProgress(p) => {
                 use crate::render::export::Progress;
+                let mut continue_batch = false;
                 if let Some(e) = &mut self.export {
                     match p {
                         Progress::Rendering { done, total, eta } => {
@@ -1774,10 +1833,25 @@ impl Editor {
                                 (*d, *t, *e2) = (done, total, eta);
                             }
                         }
-                        Progress::Finished { path, seconds } => e.phase = export_dialog::Phase::Done { path, seconds },
+                        Progress::Finished { path, seconds } => {
+                            e.completed.push((path, e.preset));
+                            e.total_seconds += seconds;
+                            if e.queue.is_empty() {
+                                let items = std::mem::take(&mut e.completed);
+                                e.phase = export_dialog::Phase::Done { items, seconds: e.total_seconds };
+                            } else {
+                                let next = e.queue.remove(0);
+                                e.path = next.path.display().to_string();
+                                e.preset = next.preset;
+                                continue_batch = true;
+                            }
+                        }
                         Progress::Failed(err) => e.phase = export_dialog::Phase::Failed(err),
                         Progress::Cancelled => e.phase = export_dialog::Phase::Setup,
                     }
+                }
+                if continue_batch {
+                    return self.start_export();
                 }
             }
             Message::CancelExport => {
@@ -1790,12 +1864,14 @@ impl Editor {
                     e.phase = export_dialog::Phase::Setup;
                 }
             }
-            Message::RevealExport | Message::PlayExport => {
-                if let Some(export_dialog::ExportDialog { phase: export_dialog::Phase::Done { path, .. }, .. }) = &self.export {
-                    if matches!(message, Message::RevealExport) {
-                        crate::platform::reveal(path);
-                    } else {
-                        crate::platform::open(path);
+            Message::RevealExport(i) | Message::PlayExport(i) => {
+                if let Some(export_dialog::ExportDialog { phase: export_dialog::Phase::Done { items, .. }, .. }) = &self.export {
+                    if let Some((path, _)) = items.get(i) {
+                        if matches!(message, Message::RevealExport(_)) {
+                            crate::platform::reveal(path);
+                        } else {
+                            crate::platform::open(path);
+                        }
                     }
                 }
             }
@@ -1813,9 +1889,11 @@ impl Editor {
             path.set_extension("mp4");
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        dialog.phase = export_dialog::Phase::Running { done: 0, total: 1, eta: None, cancel: cancel.clone() };
+        let job = dialog.completed.len() + 1;
+        let job_total = dialog.completed.len() + dialog.queue.len() + 1;
+        dialog.phase = export_dialog::Phase::Running { done: 0, total: 1, eta: None, job, job_total, cancel: cancel.clone() };
         let project = self.doc.project.clone();
-        let quality = dialog.quality;
+        let settings = dialog.settings();
         let stream = iced::stream::channel(64, async move |mut tx: iced::futures::channel::mpsc::Sender<Progress>| {
             let (stx, srx) = std::sync::mpsc::channel::<Progress>();
             std::thread::Builder::new()
@@ -1825,7 +1903,7 @@ impl Editor {
                     let progress = |p: Progress| {
                         let _ = stx.send(p);
                     };
-                    let result = export::export(&project, &path, quality, &cancel, &progress);
+                    let result = export::export(&project, &path, settings, &cancel, &progress);
                     let last = match result {
                         Ok(path) => Progress::Finished { path, seconds: started.elapsed().as_secs_f64() },
                         Err(e) if e.to_string() == "cancelled" => Progress::Cancelled,
@@ -1955,7 +2033,11 @@ impl Editor {
                 items.push(if t >= c.start && t < c.end() { press } else { press.disabled() });
                 items.push(MenuItem::new(code::CHEVRON_UP, "Bring to front", Message::Arrange(true)).shortcut("Ctrl+]"));
                 items.push(MenuItem::new(code::CHEVRON_DOWN, "Send to back", Message::Arrange(false)).shortcut("Ctrl+["));
+                items.push(MenuItem::new(code::DROPLET, "Copy color", Message::CopyColor));
             }
+        }
+        if self.color_clipboard.is_some() && clips.iter().any(|c| p.clip_has_picture(c)) {
+            items.push(MenuItem::new(code::PALETTE, "Paste color", Message::PasteColor));
         }
         items.push(MenuItem::Separator);
         items.push(MenuItem::new(code::TRASH_2, if clips.len() == 1 { "Delete" } else { "Delete clips" }, Message::DeleteSelection).shortcut("Del").danger());
@@ -1972,7 +2054,7 @@ impl Editor {
         // Markers and blurs are new clips, placed in time and on the picture: dropped on the
         // timeline they start there; otherwise they cover the marked range (or 3 s from the
         // playhead), centered where they were dropped on the preview.
-        if matches!(effect, Effect::Highlight(_) | Effect::Blur) {
+        if matches!(effect, Effect::Highlight(_) | Effect::Blur | Effect::Mask) {
             let (start, duration) = match (target, self.range) {
                 (Some(DropTarget::Timeline { t, .. }), _) => (t, 3.0),
                 (_, Some((a, b))) if b - a >= 0.1 => (a, b - a),
@@ -1997,6 +2079,7 @@ impl Editor {
                         c.name = Some(name.to_string());
                         id
                     }
+                    Effect::Mask => p.add_mask_clip(track, start, duration, crate::clip::MaskLayer::default())?,
                     _ => p.add_blur_clip(track, start, duration, crate::clip::BlurLayer::default())?,
                 };
                 if let Some((x, y)) = at {
@@ -2008,6 +2091,9 @@ impl Editor {
             if created.is_some() && effect == Effect::Blur {
                 self.notify("Blur added — drag its box over what to hide, and trim it on the timeline", false);
             }
+            if created.is_some() && effect == Effect::Mask {
+                self.notify("Mask added — drag its box over what to keep, and trim it on the timeline", false);
+            }
             if let Some(id) = created {
                 self.selection = vec![id];
                 self.side_tab = SideTab::Inspector;
@@ -2017,13 +2103,15 @@ impl Editor {
         let targets: Vec<Id> = match (target, dropped_on) {
             (Some(_), Some(clip)) => vec![clip],
             (Some(_), None) => {
-                self.notify("Drop it on a clip", false);
+                let msg = if matches!(effect, Effect::Transition(_)) { "Drop it where two clips meet" } else { "Drop it on a clip" };
+                self.notify(msg, false);
                 return Task::none();
             }
             (None, _) => self.selection.clone(),
         };
         if targets.is_empty() {
-            self.notify("Select a clip first, or drag the effect onto one", false);
+            let msg = if matches!(effect, Effect::Transition(_)) { "Select the second of two touching clips first, or drag the effect onto where they meet" } else { "Select a clip first, or drag the effect onto one" };
+            self.notify(msg, false);
             return Task::none();
         }
         if target.is_some() {
@@ -2031,7 +2119,13 @@ impl Editor {
             self.lanes_cache.clear();
         }
         match effect {
-            Effect::Transition(kind) => self.update(Message::ApplyTransition(kind)),
+            Effect::Transition(kind) => {
+                let task = self.update(Message::ApplyTransition(kind));
+                if target.is_some() && self.doc.project.clip(targets[0]).is_some_and(|c| c.transition.is_some()) {
+                    self.notify("Transition added — drag its handle (at the cut) to resize it", false);
+                }
+                task
+            }
             Effect::Intro(kind) => self.update(Message::ApplyMotion { intro: true, kind }),
             Effect::Outro(kind) => self.update(Message::ApplyMotion { intro: false, kind }),
             Effect::Frame(style) => {
@@ -2073,7 +2167,7 @@ impl Editor {
                 self.apply_camera_preset(clip, preset);
                 Task::none()
             }
-            Effect::Blur | Effect::Highlight(_) => Task::none(),
+            Effect::Blur | Effect::Mask | Effect::Highlight(_) => Task::none(),
         }
     }
 
@@ -2094,7 +2188,7 @@ impl Editor {
     fn apply_frame_style(&mut self, targets: &[Id], style: library::FrameStyle) {
         use library::FrameStyle;
         let p = &self.doc.project;
-        let ids: Vec<Id> = targets.iter().copied().filter(|&id| p.clip(id).is_some_and(|c| p.clip_has_picture(c) && !matches!(c.content, crate::clip::Content::Text(_) | crate::clip::Content::Blur(_)))).collect();
+        let ids: Vec<Id> = targets.iter().copied().filter(|&id| p.clip(id).is_some_and(|c| p.clip_has_picture(c) && !matches!(c.content, crate::clip::Content::Text(_) | crate::clip::Content::Blur(_) | crate::clip::Content::Mask(_)))).collect();
         if ids.is_empty() {
             self.notify("Frame styles go on videos, images and shapes", false);
             return;
@@ -2531,7 +2625,17 @@ impl Editor {
             widgets::tip(widgets::icon_button(code::ZOOM_IN, Some(Message::ZoomBy(1.4))), "Zoom in", Some("+"), tip_pos()),
         ]
         .spacing(2);
-        header_row(row![text("Timeline").font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_2), container(tools).padding([0, 12])].align_y(Alignment::Center).into(), zoom.into())
+        // Lines up with where the ruler/lanes start past the track-header column (`HEADER_W`),
+        // minus the padding this header already has from the pane edge (6 outer + 12 here).
+        container(
+            row![text("Timeline").font(INTER_SEMIBOLD).size(T_SMALL).color(TEXT_2), space().width(timeline::HEADER_W - 18.0), tools, space().width(Fill), zoom]
+                .align_y(Alignment::Center)
+                .spacing(12),
+        )
+        .height(38)
+        .padding([0, 12])
+        .center_y(38)
+        .into()
     }
 
     fn timeline(&self) -> Element<'_, Message> {

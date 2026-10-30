@@ -9,7 +9,7 @@ use super::scene::{LayerSpec, Scene};
 
 /// Uniforms per layer, padded to the dynamic-offset alignment.
 const STRIDE: u64 = 512;
-const UNIFORM_SIZE: u64 = 320;
+const UNIFORM_SIZE: u64 = 464;
 
 struct Slot {
     texture: wgpu::Texture,
@@ -143,10 +143,13 @@ impl Compositor {
             tint_top: scene.background,
             tint_bottom: scene.background,
             grade: [0.0; 4],
+            grade2: [0.0; 4],
             shape: [0.0, 0.0, 0.0, std::f32::consts::PI],
             blurs: [[0.0; 8]; super::scene::MAX_BLURS],
+            masks: [[0.0; 8]; super::scene::MAX_MASKS],
             blurrable: false,
             blur_box: None,
+            mask_box: None,
         };
         let mut staging = vec![0u8; (count * STRIDE) as usize];
         self.draws.clear();
@@ -177,8 +180,8 @@ impl Compositor {
                 layer.slot
             });
             let pad = if layer.shadow_color[3] > 0.0 { layer.shadow_blur * 2.0 + layer.shadow_y.abs() + 2.0 } else { 2.0 * aa };
-            let mut u = [0.0f32; 80];
-            u[..48].copy_from_slice(&[
+            let mut u = [0.0f32; 116];
+            u[..52].copy_from_slice(&[
                 layer.center[0], layer.center[1], layer.size[0] / 2.0, layer.size[1] / 2.0,
                 layer.rotation, layer.opacity, layer.radius, layer.border,
                 layer.shadow_blur, layer.shadow_y, pad, aa,
@@ -188,14 +191,19 @@ impl Compositor {
                 layer.border_color[0], layer.border_color[1], layer.border_color[2], layer.border_color[3],
                 layer.shadow_color[0], layer.shadow_color[1], layer.shadow_color[2], layer.shadow_color[3],
                 layer.grade[0], layer.grade[1], layer.grade[2], layer.grade[3],
+                layer.grade2[0], layer.grade2[1], layer.grade2[2], layer.grade2[3],
                 w, h, if self.srgb_target { 1.0 } else { 0.0 }, if has_texture { 1.0 } else { 0.0 },
                 layer.shape[0], layer.shape[1], layer.shape[2], layer.shape[3],
                 view[0], view[1], view[2], view[3],
             ]);
             for (i, b) in layer.blurs.iter().enumerate() {
                 // The shader keeps the four rects, then the four parameter sets.
-                u[48 + i * 4..52 + i * 4].copy_from_slice(&b[..4]);
-                u[64 + i * 4..68 + i * 4].copy_from_slice(&b[4..]);
+                u[52 + i * 4..56 + i * 4].copy_from_slice(&b[..4]);
+                u[68 + i * 4..72 + i * 4].copy_from_slice(&b[4..]);
+            }
+            for (i, m) in layer.masks.iter().enumerate() {
+                u[84 + i * 4..88 + i * 4].copy_from_slice(&m[..4]);
+                u[100 + i * 4..104 + i * 4].copy_from_slice(&m[4..]);
             }
             let offset = i as u64 * STRIDE;
             staging[offset as usize..(offset + UNIFORM_SIZE) as usize].copy_from_slice(bytemuck::cast_slice(&u));

@@ -9,8 +9,8 @@ usable by hand, with an optional AI assistant that edits through MCP. English an
 The Cargo workspace has one app:
 
 - **`studio/`** (binary `ai-video-studio`, "AI Video Studio", Iced 0.14 + wgpu). The original egui
-  app that used to live at the repo root was removed (it's in git history if ever needed).
-- `spikes/iced-ui/` — the throwaway prototype that picked Iced (its own workspace; ignore).
+  app that used to live at the repo root, and the throwaway `spikes/iced-ui/` prototype that picked
+  Iced, were both removed (they're in git history if ever needed).
 
 README.md is the user-facing setup guide (Windows + Linux), feature list and shortcuts — keep it
 in sync when adding features, shortcuts, env vars or file locations.
@@ -48,8 +48,9 @@ GNU toolchain + MinGW-w64 (WinLibs). Windows packaging:
 `cargo run -p studio -- project.aivp` with these env vars renders the real window to a PNG and exits:
 `STUDIO_SNAPSHOT=out.png`, `STUDIO_SNAPSHOT_DELAY` (seconds), `STUDIO_SNAPSHOT_TIME` (playhead),
 `STUDIO_SNAPSHOT_SCROLL`, `STUDIO_SNAPSHOT_SELECT=clip[,a,b]` (select a clip, optionally mark a range),
-`STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|settings|skills` (open the Connect AI dialog, the assistant
-panel, the Effects tab, Settings or the assistant's Skills manager), `STUDIO_SNAPSHOT_ZOOM=2` (preview zoom), `STUDIO_SNAPSHOT_CHAT=reply.md` (a sample
+`STUDIO_SNAPSHOT_OPEN=ai|assistant|effects|settings|skills|shortcuts|confirm|export` (open the Connect AI dialog, the
+assistant panel, the Effects tab, Settings, the assistant's Skills manager, the Keyboard shortcuts dialog, the
+unsaved-changes confirm dialog, or the Export dialog), `STUDIO_SNAPSHOT_ZOOM=2` (preview zoom), `STUDIO_SNAPSHOT_CHAT=reply.md` (a sample
 conversation with that Markdown reply, no AI needed), `STUDIO_SNAPSHOT_REOPEN=1` (switch to the
 assistant tab last), `STUDIO_SNAPSHOT_SEEK=seconds` (move the playhead), `STUDIO_SNAPSHOT_TEXT=start,end` (select those characters in, or `STUDIO_SNAPSHOT_TYPE=text` to type at the end of,
 the text box of a text clip selected with `STUDIO_SNAPSHOT_SELECT`). Set `APPDATA` to a scratch folder for test instances so they don't touch the
@@ -84,25 +85,39 @@ for export/snapshots (`render/export.rs::Offscreen`). A new visual effect must g
 compositor to appear anywhere. Crop shrinks the layer and its `uv`; zooms work inside the crop; a blur
 clip adds no pixels: `scene::evaluate` maps its box onto each media layer below it (through rotation,
 crop and zoom) as per-layer blur regions (up to 4; 9×9 Gaussian in `layer.wgsl`) and keeps an
-invisible layer for picking. The
-per-layer uniform is 320 bytes (stride 512) and carries a `view` transform: the preview can be
-zoomed past its pane, so `preview.rs` draws only the visible part of the canvas rectangle. `render/frames.rs` (FrameServer) runs one FFmpeg decoder per
+invisible layer for picking. A mask clip (`Content::Mask`) works the same way but restricts
+visibility instead of blurring: `scene::evaluate` maps its box onto each media layer below as
+per-layer mask regions (up to 4, feathered, optionally inverted to hide the box instead of
+showing only it) — keyframe the mask clip's X/Y (the same general per-clip keyframe system) to
+have it follow a moving subject by hand; there's no automatic tracking. The
+per-layer uniform is 464 bytes (stride 512) and carries a `view` transform: the preview can be
+zoomed past its pane, so `preview.rs` draws only the visible part of the canvas rectangle. Color grading
+(`clip::Grade`) is brightness/contrast/saturation/temperature plus a lift/gamma/gain three-way (shadows/mids/
+highlights), applied in `layer.wgsl::apply_grade` from the per-layer `grade`/`grade2` uniforms. `render/frames.rs` (FrameServer) runs one FFmpeg decoder per
 visible clip and caches images; `render/text.rs` rasterizes with cosmic-text (Bangla shaping);
-`render/audio.rs::mix_graph` builds the FFmpeg audio mix used by export and playback.
+`render/audio.rs::mix_graph` builds the FFmpeg audio mix used by export and playback, including each clip's
+EQ (`clip::Eq`, three fixed-band `equalizer` filters), compressor (`clip::Compressor`, `acompressor`) and
+denoise (`afftdn`), and — export only — a final `loudnorm` pass when `ExportSettings.loudness` is set.
 `playback.rs` plays audio with cpal; the audio clock is the master clock.
 
 **Editor UI** (`editor/`): `mod.rs` holds `Editor`, its `Message`s, keyboard shortcuts, dialogs,
 autosave (2 s) and the timeline layout; `timeline.rs` (ruler, lanes, zoom bands, volume envelope),
 `inspector.rs` (`Edit` enum → edits; `HexDraft` color inputs), `canvas_overlay.rs`
 (select/move/scale/rotate, zoom-focus editing), `library.rs` (media/text/shape/effect/sound
-presets), `assistant_panel.rs`, `export_dialog.rs`, `media_cache.rs` (thumbnails, filmstrips,
+presets), `assistant_panel.rs`, `export_dialog.rs` (delivery presets — Web/YouTube/Social/Archive/Custom,
+via `render::export::Preset` — cap resolution, audio bitrate and loudness target; "Also as …" queues
+further presets to export as a batch after the current one), `media_cache.rs` (thumbnails, filmstrips,
 waveforms). `ui/` is the design system: `tokens.rs`, `style.rs`, `widgets.rs`, Lucide `icons.rs`,
 `chrome.rs` (frameless title bar, motion logo). `icon.rs` rasterizes the same logo with plain std: the window icon, `build.rs` (embeds a
 `.ico` in the Windows exe through `windres`/`rc.exe`) and `--write-icons DIR` (packaging) all use it.
 Right-clicks on the lanes and the preview select what's under the cursor, then one `context_menu()`
-serves both. The inspector takes an `inspector::Ctx` (edit modes, range, collapsed sections, search);
-every section goes through `ctx.section(...)` so search and collapse work. Library effects are
-`library::Effect`s: click applies to the selection, drag drops on a clip (`Message::DropEffect`).
+serves both; it also has **Copy color / Paste color** (`Editor::color_clipboard`, a single `Grade`)
+to carry a clip's whole color grade over to others via `Doc::set_grade`. The inspector takes an
+`inspector::Ctx` (edit modes, range, collapsed sections, search); every section goes through
+`ctx.section(...)` so search and collapse work. Library effects are `library::Effect`s: click
+applies to the selection, drag drops on a clip (`Message::DropEffect`) — except `Effect::Transition`,
+which targets the seam between two touching clips instead of a clip's body (`timeline::Lanes::seam_hit`
+for the drop, `transition_hit` for the resize handle the applied transition shows at its leading edge).
 Packaging: `scripts/package-studio.ps1` (Windows) and `scripts/package-studio.sh` (Linux). The window never draws its own frame; on Windows
 it gets native rounded corners/shadow.
 
@@ -133,7 +148,15 @@ The audio mix must keep `apad=whole_dur=…`: an unbounded `apad` makes long exp
 `sfx.rs` (9 synthesized sounds written to the config dir), `fonts.rs` (bundled Inter, Poppins,
 Hind Siliguri), `ffmpeg.rs`, `platform.rs` (reveal/open in file manager), `main.rs` (on Linux,
 removes `WAYLAND_DISPLAY` to run under XWayland so drag and drop works — winit has no Wayland DnD;
-`STUDIO_WAYLAND=1` opts out).
+`STUDIO_WAYLAND=1` opts out), `shortcuts_dialog.rs` (read-only keyboard shortcuts reference, a
+modal layer in `App` like the Settings/Connect AI dialogs), `sample.rs` (`demo_project`: the
+"Try an example project" starter scene offered on the start screen, built from text/shape/callout
+clips so it needs no bundled media).
+
+**Unsaved changes.** `App::confirm` (a `PendingAction`) gates New/Close/Open/Quit on
+`doc.is_dirty()`: a dialog offers Save, Don't save (reverts to the last saved file via
+`Project::load`, or is a no-op if never saved) or Cancel before any of them proceeds. `persist()`
+surfaces a save failure as the error banner instead of discarding the change silently.
 
 ## Gotchas
 

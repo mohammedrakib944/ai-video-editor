@@ -17,9 +17,11 @@ mod model;
 mod platform;
 mod playback;
 mod render;
+mod sample;
 mod settings;
 mod settings_dialog;
 mod sfx;
+mod shortcuts_dialog;
 mod start;
 mod ui;
 

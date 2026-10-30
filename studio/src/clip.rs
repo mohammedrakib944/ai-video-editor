@@ -127,6 +127,32 @@ pub const BLUR_FADE: f64 = 0.15;
 /// Most blur boxes that can cover one layer at the same moment.
 pub const MAX_BLURS: usize = 4;
 
+/// A mask clip: restricts the video and images under it to only its box, while it's on
+/// the timeline — the opposite of a blur's "hide this", it's "show only this". `invert`
+/// flips it to hide the box instead and show everywhere else (a cutout/vignette). Position
+/// comes from the clip's transform, the box size is in canvas units; keyframe the clip's X/Y
+/// (the same general keyframe system every clip has) to have the mask follow a moving subject.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MaskLayer {
+    pub width: f64,
+    pub height: f64,
+    /// Edge softness, 0 (hard edge) to 100.
+    pub feather: f64,
+    #[serde(default)]
+    pub ellipse: bool,
+    #[serde(default)]
+    pub invert: bool,
+}
+
+impl Default for MaskLayer {
+    fn default() -> Self {
+        MaskLayer { width: 480.0, height: 480.0, feather: 15.0, ellipse: true, invert: false }
+    }
+}
+
+/// Most mask boxes that can cover one layer at the same moment.
+pub const MAX_MASKS: usize = 4;
+
 /// Which part of a video clip plays: after "Separate audio" the picture and the
 /// sound are two clips of the same media.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -171,7 +197,9 @@ impl Default for Look {
     }
 }
 
-/// Basic color grading. 0 means unchanged for every field.
+/// Basic color grading. 0 means unchanged for every field. Lift/gamma/gain target the
+/// shadows, midtones and highlights separately — the classic three-way color correction
+/// controls, layered on top of the simpler brightness/contrast/saturation/temperature knobs.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Grade {
@@ -179,11 +207,14 @@ pub struct Grade {
     pub contrast: f64,
     pub saturation: f64,
     pub temperature: f64,
+    pub lift: f64,
+    pub gamma: f64,
+    pub gain: f64,
 }
 
 impl Grade {
     const fn new(brightness: f64, contrast: f64, saturation: f64, temperature: f64) -> Self {
-        Grade { brightness, contrast, saturation, temperature }
+        Grade { brightness, contrast, saturation, temperature, lift: 0.0, gamma: 0.0, gain: 0.0 }
     }
 }
 
@@ -249,6 +280,37 @@ pub struct Gain {
 /// Length of the smooth ramp at each edge of a `Gain`, so changes don't click.
 pub const GAIN_RAMP: f64 = 0.06;
 
+/// A simple 3-band parametric EQ (low/mid/high shelf-ish bands), in dB. 0 on every
+/// band means flat — no filter is added to the mix for it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Eq {
+    pub low: f64,
+    pub mid: f64,
+    pub high: f64,
+}
+
+impl Eq {
+    pub fn is_flat(&self) -> bool {
+        self.low == 0.0 && self.mid == 0.0 && self.high == 0.0
+    }
+}
+
+/// A light compressor to even out a clip's level. `amount` (0–100%) scales a fixed
+/// threshold/ratio/attack/release curve; 0 or disabled adds no filter to the mix.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Compressor {
+    pub enabled: bool,
+    pub amount: f64,
+}
+
+impl Default for Compressor {
+    fn default() -> Self {
+        Compressor { enabled: false, amount: 50.0 }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Audio {
@@ -257,11 +319,15 @@ pub struct Audio {
     pub fade_in: f64,
     pub fade_out: f64,
     pub gains: Vec<Gain>,
+    pub eq: Eq,
+    pub compressor: Compressor,
+    /// Noise reduction strength, 0 (off) to 97.
+    pub denoise: f64,
 }
 
 impl Default for Audio {
     fn default() -> Self {
-        Audio { volume: 1.0, muted: false, fade_in: 0.0, fade_out: 0.0, gains: Vec::new() }
+        Audio { volume: 1.0, muted: false, fade_in: 0.0, fade_out: 0.0, gains: Vec::new(), eq: Eq::default(), compressor: Compressor::default(), denoise: 0.0 }
     }
 }
 
@@ -898,6 +964,7 @@ pub enum Content {
     Text(TextLayer),
     Shape(ShapeLayer),
     Blur(BlurLayer),
+    Mask(MaskLayer),
     Callout(CalloutLayer),
     Counter(CounterLayer),
 }
